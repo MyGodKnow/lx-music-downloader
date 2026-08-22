@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_all
 
-datas = [('lx_url_server.js', '.'), ('sources', 'sources'), ('_pack/node', 'node'), ('_pack/ffmpeg', 'ffmpeg')]
+datas = [('lx_url_server.js', '.'), ('sources', 'sources'), ('_pack', '.')]
 binaries = []
 hiddenimports = []
 tmp_ret = collect_all('mutagen')

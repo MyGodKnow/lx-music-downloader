@@ -13,6 +13,10 @@ __pycache__/
 *.pyc
 *.pyo
 
+# ============ PyInstaller 构建产物 ============
+lx-downloader/build/
+lx-downloader/_pack/
+
 # ============ 日志 / 探测报告（运行期产物，不入库） ============
 *.log
 _probe_sources_report.json
