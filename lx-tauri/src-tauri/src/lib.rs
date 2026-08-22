@@ -488,6 +488,76 @@ fn stop_task(state: State<'_, TaskState>) -> Result<(), String> {
     Ok(())
 }
 
+// ============ 音源管理 ============
+// 音源脚本由用户自行导入，统一存放于 %APPDATA%\lx-downloader-sources（与 Python 引擎
+// 的 USER_SOURCES_DIR 一致）。仓库与程序更新不会覆盖该目录，用户音源长期保留。
+
+fn user_sources_dir() -> std::path::PathBuf {
+    let base = std::env::var_os("APPDATA").unwrap_or_else(|| ".".into());
+    std::path::PathBuf::from(base).join("lx-downloader-sources")
+}
+
+/// 音源文件名校验：只保留 basename 并限定 .js/.json，防止目录穿越。
+fn validate_source_name(raw: &str) -> Result<String, String> {
+    let name = std::path::Path::new(raw)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    if name.is_empty() || name == "." || name == ".." {
+        return Err("音源文件名非法".to_string());
+    }
+    let lower = name.to_lowercase();
+    if !lower.ends_with(".js") && !lower.ends_with(".json") {
+        return Err("仅支持 .js / .json 音源文件".to_string());
+    }
+    Ok(name)
+}
+
+/// 返回用户音源目录（供界面展示）。
+#[tauri::command]
+fn get_sources_dir() -> String {
+    user_sources_dir().to_string_lossy().to_string()
+}
+
+/// 列出用户已导入的音源文件。
+#[tauri::command]
+fn list_sources() -> Vec<String> {
+    let dir = user_sources_dir();
+    let mut out: Vec<String> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        for entry in rd.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let lower = name.to_lowercase();
+            if lower.ends_with(".js") || lower.ends_with(".json") {
+                out.push(name);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// 导入音源：把前端传来的音源内容写入用户音源目录。
+#[tauri::command]
+fn import_source(file_name: String, content: String) -> Result<String, String> {
+    let name = validate_source_name(&file_name)?;
+    let dir = user_sources_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建音源目录失败: {e}"))?;
+    std::fs::write(dir.join(&name), content).map_err(|e| format!("写入音源失败: {e}"))?;
+    Ok(name)
+}
+
+/// 删除用户已导入的音源。
+#[tauri::command]
+fn remove_source(file_name: String) -> Result<(), String> {
+    let name = validate_source_name(&file_name)?;
+    let dest = user_sources_dir().join(&name);
+    if dest.exists() {
+        std::fs::remove_file(&dest).map_err(|e| format!("删除音源失败: {e}"))?;
+    }
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -496,7 +566,11 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             list_playlists,
             start_download,
-            stop_task
+            stop_task,
+            get_sources_dir,
+            list_sources,
+            import_source,
+            remove_source
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

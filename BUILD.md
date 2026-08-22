@@ -33,7 +33,7 @@ cd lx-downloader
 #   _pack/
 #   ├── node/node.exe
 #   ├── ffmpeg/ffmpeg.exe
-#   └── ... (音源相关)
+#   └── ... (其它运行依赖)
 
 # 2) 用 PyInstaller 冻结引擎（onedir，含 mutagen 与音源桥接）
 pyinstaller --onedir --collect-all mutagen ^
@@ -46,7 +46,9 @@ pyinstaller --onedir --collect-all mutagen ^
 #    覆盖写入 lx-tauri/src-tauri/engine/engine.zip
 ```
 
-> 注意：`engine.zip` 内容根级结构需与 `lib.rs::ensure_engine()` 的预期一致（即解压后直接得到 `lx_music_downloader.exe`、`lx_url_server.js`、`sources/`、`node/`、`ffmpeg/`）。
+> 注意：
+> - `engine.zip` 内容根级结构需与 `lib.rs::ensure_engine()` 的预期一致（即解压后直接得到 `lx_music_downloader.exe`、`lx_url_server.js`、`sources/`、`node/`、`ffmpeg/`）。
+> - **第三方音源不再随引擎捆绑**：引擎运行时默认从 `%APPDATA%\lx-downloader-sources\` 读取用户导入的音源。`sources/` 只是占位目录（含 `.gitkeep` 与 README），不包含任何音源脚本。
 
 ### 2. 编译 Tauri 发布版
 

@@ -46,7 +46,7 @@ def main():
     for s in songs:
         print(f"  [{s['source']}] {s['singer']} - {s['name']}")
     node = find_node()
-    api_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'sources')
+    api_dir = os.path.join(os.environ.get('APPDATA', os.path.dirname(os.path.abspath(__file__))), 'lx-downloader-sources')
     server = UrlServer(node, None, api_dir).start()
     payload = [{'name': s['name'], 'singer': s['singer'], 'source': s['source'],
                 'musicInfo': get_music_info(s), 'quality': '320k'} for s in songs]

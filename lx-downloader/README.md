@@ -51,21 +51,20 @@ python lx_music_downloader.py --playlist love --max 10
 | `--workers / -w` | 并发下载数 | 3 |
 | `--node` | Node.js 路径 | 自动检测 |
 | `--api` | 音源脚本路径 | - |
-| `--api-dir` | 按顺序加载目录内全部 JS/JSON 音源 | `./sources` |
+| `--api-dir` | 按顺序加载目录内全部 JS/JSON 音源 | `%APPDATA%\lx-downloader-sources` |
 | `--exclude` | 排除歌曲名或“歌手 - 歌名”，逗号分隔 | - |
-| `--lyrics` | 启用歌词配置（取决于音源能力） | 关闭 |
 | `--max` | 最多下载数量 | 全部 |
 
 ## 工作原理
 
 ```
 ┌─────────────────┐     ┌──────────────────┐     ┌──────────────┐
-│ 落雪音乐数据库   │     │ Node 音源桥接服务  │     │  音源脚本     │
-│ lx.data.db     │────▶│ lx_url_server.js │────▶│ sources/qdy.js│
-│ (歌单+歌曲信息)  │     │ (模拟 lx 环境)    │     │ (聚合多音源)  │
-└─────────────────┘     └──────────────────┘     └──────────────┘
-        │                         │                        │
-        │  读取歌单、解析歌曲ID     │  获取播放链接(多候选)    │  调用各平台API
+│ 落雪音乐数据库   │     │ Node 音源桥接服务  │     │  用户音源     │
+│ lx.data.db     │────▶│ lx_url_server.js │────▶│ %APPDATA%    │
+│ (歌单+歌曲信息)  │     │ (模拟 lx 环境)    │     │ lx-downloader│
+└─────────────────┘     └──────────────────┘     │ -sources/    │
+        │                         │              └──────────────┘
+        │  读取歌单、解析歌曲ID     │  获取播放链接(多候选)   │ 调用各平台API
         ▼                         ▼                        ▼
 ┌─────────────────────────────────────────────────────────────┐
 │  Python 主程序 lx_music_downloader.py                       │
@@ -79,18 +78,26 @@ python lx_music_downloader.py --playlist love --max 10
 | 文件 | 说明 |
 |------|------|
 | `lx_music_downloader.py` | Python 命令行主程序（唯一入口） |
-| `lx_url_server.js` | Node 音源桥接服务（获取播放链接、按名搜索兜底） |
-| `sources/qdy.js` | 内置聚合音源（全豆要 9.3，2026-08 更新） |
-| `sources/` | 全部启用音源（含新加入的 HYWmusic / K×H / 玉宁熙 / 墨澜 / 屿溪 / 星海 / 长青SVIP） |
-| `sources/disabled/` | 实测完全失效的音源（不加载，保留文件便于日后恢复） |
-| `scan_sources.py` | 音源健康检查工具（对歌单抽样，实测每个音源可用性） |
-| `verify_all.py` | 下载文件时长校验（防止下错歌） |
+| `lx_url_server.js` | Node 音源桥接服务（加载用户音源、取播放链接、按名搜索兜底） |
+| `sources/` | 音源占位目录（**不捆绑任何第三方音源**，见下方「音源管理」） |
+| `scan_sources.py` | 音源健康检查工具（对歌单抽样，逐个音源实测可用性） |
+| `analyze_quality.py` | 下载文件质量分析工具（按内容探测码率/格式） |
+| `_probe_sources_v2.py` | 音源探针（逐源跑 searchByName 全流程） |
 
-### 音源维护
+### 音源管理（用户自备）
 
-- 新音源放入 `sources/` 即可被自动加载；桥接会按优先级（qdy → 新聚合源 → 其余）逐个轮询，取第一个校验有效的链接。
-- 某个音源连续 3 次拿不到有效链接会自动冷却 10 分钟，避免死源拖慢下载。
-- 想临时停用某个音源，移入 `sources/disabled/` 即可（不在加载范围）。
+本工具**不内置、不分发任何第三方音源脚本**。音源由使用者自行导入，统一保存在：
+
+```text
+%APPDATA%\lx-downloader-sources\
+```
+
+- GUI「音源」页可导入/删除音源文件（.js / .json / user_api.json）
+- 也可以直接把音源 JS 或落雪桌面版导出的 `user_api.json` 放进该目录
+- 引擎默认从该目录加载全部音源；目录为空时提示「请先导入音源」并中止
+- 某个音源连续拿不到有效链接会自动冷却（默认 3 分钟），避免死源拖慢下载
+- 命令行可用 `--api <文件>` 指定单个音源，或用 `--api-dir <目录>` 指定其它目录
+- 健康检查：`python scan_sources.py` / `python _probe_sources_v2.py`（同样读取用户音源目录）
 
 ## EXE 打包
 

@@ -6,8 +6,22 @@ import json, subprocess, time, os, sys, threading
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 URL_SERVER = os.path.join(HERE, 'lx_url_server.js')
-NODE = r'C:\Users\God Know\.workbuddy\binaries\node\versions\22.22.2\node.exe'
-SRC_DIR = os.path.join(HERE, 'sources')
+SRC_DIR = os.path.join(os.environ.get('APPDATA', HERE), 'lx-downloader-sources')
+
+
+def find_node():
+    """定位 Node.js：优先系统 PATH，再试常见安装位置。"""
+    import shutil
+    exe = shutil.which('node')
+    if exe:
+        return exe
+    for cand in [
+        os.path.join(os.environ.get('LOCALAPPDATA', ''), 'Programs', 'nodejs', 'node.exe'),
+        os.path.join(os.environ.get('ProgramFiles', ''), 'nodejs', 'node.exe'),
+    ]:
+        if cand and os.path.isfile(cand):
+            return cand
+    return 'node'
 
 
 def _readline_thread(pipe, out):
@@ -23,7 +37,7 @@ def probe_file(fname, song, singer, interval):
     t0 = time.time()
     try:
         proc = subprocess.Popen(
-            [NODE, URL_SERVER, '--api', fpath],
+            [find_node(), URL_SERVER, '--api', fpath],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL, text=True, encoding='utf-8', bufsize=1,
             creationflags=subprocess.CREATE_NO_WINDOW,

@@ -61,6 +61,10 @@ else:
     DOWNLOAD_DIR = os.path.join(APP_DIR, 'downloads')
 BUNDLED_NODE = os.path.join(RESOURCE_DIR, 'node', 'node.exe')
 
+# 用户音源目录：音源脚本由用户自行导入，存到 APPDATA 下（不随程序/仓库分发），
+# GUI「音源」页的导入/删除也操作此目录；引擎默认从这里加载音源。
+USER_SOURCES_DIR = os.path.join(os.environ.get('APPDATA', APP_DIR), 'lx-downloader-sources')
+
 # 落雪音乐数据库候选路径：官方版 / 便携版 / 不同 fork / 历史版本，
 # 保证不同安装方式的用户都能自动识别到歌单。
 DB_PATH_CANDIDATES = [
@@ -1140,7 +1144,7 @@ def load_config():
         'workers': max(4, min(12, cpu_count * 2)),  # 默认按 CPU 核数×2，至少 4
         'node': '',
         'api': '',
-        'api_dir': os.path.join(RESOURCE_DIR, 'sources'),
+        'api_dir': USER_SOURCES_DIR,
     }
     try:
         with CONFIG_PATH.open('r', encoding='utf-8') as f:
@@ -1148,11 +1152,16 @@ def load_config():
         defaults.update({k: v for k, v in saved.items() if k in defaults})
     except (OSError, ValueError, TypeError):
         pass
+    # 确保用户音源目录存在（空目录时由前置校验给出“请先导入音源”的清晰提示）。
+    try:
+        os.makedirs(USER_SOURCES_DIR, exist_ok=True)
+    except OSError:
+        pass
     # 单文件 EXE 的 _MEIPASS 是每次启动都会变化的临时目录，不能持久化使用；
-    # 同理，若保存的 api_dir 已不存在（如临时目录残留），自动回退到内置 sources 目录。
+    # 同理，若保存的 api_dir 已不存在（如临时目录残留），自动回退到用户音源目录。
     saved_api_dir = str(defaults.get('api_dir') or '')
     if not saved_api_dir or '_MEI' in saved_api_dir or not os.path.isdir(saved_api_dir):
-        defaults['api_dir'] = os.path.join(RESOURCE_DIR, 'sources')
+        defaults['api_dir'] = USER_SOURCES_DIR
     defaults['fallback_quality'] = bool(defaults.get('fallback_quality', False))
     return defaults
 
@@ -1217,7 +1226,7 @@ def settings_menu(config):
                 print('并发数无效，保留原设置。'); continue
         config[key] = answer
     if getattr(sys, 'frozen', False) and '_MEI' in str(config.get('api_dir', '')):
-        config['api_dir'] = os.path.join(RESOURCE_DIR, 'sources')
+        config['api_dir'] = USER_SOURCES_DIR
     save_config(config)
     print(f'设置已保存：{CONFIG_PATH}')
     return config
@@ -1277,6 +1286,22 @@ def convert_menu(config):
                 pass
         print(f'已将 {moved} 个原文件移入 {keep_dir}')
     return config
+
+
+def check_sources(api_file, api_dir):
+    """音源前置校验：返回缺失说明（None 表示可用）。
+
+    音源必须存在（单文件模式）或目录非空（目录模式），否则下载必然全部失败，
+    提前给出“请先导入音源”的清晰指引，而不是让每首歌都报一遍错。
+    """
+    if api_file:
+        return None if Path(api_file).is_file() else f'[错误] 音源文件不存在: {api_file}'
+    d = Path(api_dir)
+    if not d.is_dir():
+        return f'[错误] 音源目录不存在: {api_dir}'
+    if not any(f.suffix.lower() in ('.js', '.json') for f in d.iterdir()):
+        return f'[错误] 音源目录为空: {api_dir}'
+    return None
 
 
 def main_menu():
@@ -1349,9 +1374,9 @@ def run():
     parser.add_argument('--workers', '-w', type=int, default=config['workers'], help='同时下载歌曲数（默认使用设置值）')
     parser.add_argument('--node', default=config['node'] or None, help='Node.js 可执行文件路径（EXE 已内置）')
     parser.add_argument('--api', default=config['api'] or None, help='音源脚本路径（JS 文件或 user_api.json）')
-    parser.add_argument('--api-dir', default=config['api_dir'], help='音源目录（EXE 默认使用内置 sources）')
+    parser.add_argument('--api-dir', default=config['api_dir'], help=f'音源目录（默认 {USER_SOURCES_DIR}，可在 GUI「音源」页导入）')
     parser.add_argument('--allow-untrusted-sources', action='store_true',
-                        help='允许加载哈希白名单之外的第三方音源（默认只加载内置经验证的音源）')
+                        help='兼容保留：当前版本导入的音源默认全部加载，无需该开关')
     parser.add_argument('--exclude', default='', help='排除歌曲，使用逗号分隔的歌名或“歌手 - 歌名”')
     parser.add_argument('--max', type=int, default=0, help='最多下载数量（0=全部，用于测试）')
     parser.add_argument('--convert', action='store_true', help='转换目录内音频为 MP3（配合 --dir 指定目录）')
@@ -1459,6 +1484,13 @@ def run():
     node_exe = args.node or find_node()
     if not node_exe:
         print('[错误] 未找到 Node.js，请安装或用 --node 指定路径')
+        sys.exit(1)
+    # 音源前置检查：没有可用音源时直接给出清晰指引，而不是让每个歌曲都报错
+    missing = check_sources(args.api, args.api_dir)
+    if missing:
+        print(missing)
+        print('提示：请在 GUI「音源」页导入音源脚本（.js / .json，或落雪导出的 user_api.json），')
+        print('      或用 --api / --api-dir 指定音源。导入后音源保存在 %APPDATA%\\lx-downloader-sources。')
         sys.exit(1)
     print(f'正在启动 {args.workers} 个并行音源服务...')
     # 每个工作线程使用独立 JSON-RPC 管道，避免单个全局锁把 URL 请求串行化。

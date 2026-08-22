@@ -14,7 +14,7 @@ interface LogLine {
   data: string;
 }
 
-type Tab = "playlists" | "download" | "settings";
+type Tab = "playlists" | "download" | "sources" | "settings";
 
 const QUALITY_OPTIONS = [
   { value: "flac24bit", label: "Hi-Res 无损", hint: "FLAC 24bit" },
@@ -53,9 +53,15 @@ function App() {
   const [progress, setProgress] = useState<Progress | null>(null);
   const logEndRef = useRef<HTMLDivElement>(null);
 
+  // 音源管理：用户自行导入的音源脚本（.js / .json）
+  const [sourceFiles, setSourceFiles] = useState<string[]>([]);
+  const [sourcesDir, setSourcesDir] = useState("");
+  const sourceInputRef = useRef<HTMLInputElement>(null);
+
   // 首页自动加载歌单
   useEffect(() => {
     loadPlaylists();
+    refreshSources();
   }, []);
 
   useEffect(() => {
@@ -161,6 +167,51 @@ function App() {
     }
   }
 
+  async function refreshSources() {
+    try {
+      const [files, dir] = await Promise.all([
+        invoke<string[]>("list_sources"),
+        invoke<string>("get_sources_dir"),
+      ]);
+      setSourceFiles(files);
+      setSourcesDir(dir);
+    } catch (err) {
+      addLog("error", String(err));
+    }
+  }
+
+  async function onPickSource(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    e.target.value = ""; // 允许重复选择同一文件
+    if (!file) return;
+    try {
+      const text = await new Promise<string>((resolve, reject) => {
+        const r = new FileReader();
+        r.onload = () => resolve(String(r.result));
+        r.onerror = () => reject(new Error("读取音源文件失败"));
+        r.readAsText(file);
+      });
+      const name = await invoke<string>("import_source", {
+        fileName: file.name,
+        content: text,
+      });
+      addLog("ok", `已导入音源: ${name}`);
+      await refreshSources();
+    } catch (err) {
+      addLog("error", String(err));
+    }
+  }
+
+  async function removeSource(name: string) {
+    try {
+      await invoke("remove_source", { fileName: name });
+      addLog("info", `已删除音源: ${name}`);
+      await refreshSources();
+    } catch (err) {
+      addLog("error", String(err));
+    }
+  }
+
   const logCount = logs.filter((l) => l.kind === "ok").length;
 
   return (
@@ -178,6 +229,7 @@ function App() {
             [
               ["playlists", "我的歌单"],
               ["download", "下载歌曲"],
+              ["sources", "音源"],
               ["settings", "设置"],
             ] as [Tab, string][]
           ).map(([key, label]) => (
@@ -390,6 +442,49 @@ function App() {
             </section>
           )}
 
+          {tab === "sources" && (
+            <section className="panel">
+              <div className="settings-grid">
+                <label className="field">
+                  <span>音源目录（导入的音源保存在这里，不随程序更新丢失）</span>
+                  <code className="sources-dir">{sourcesDir || "…"}</code>
+                </label>
+              </div>
+              <div className="sources-toolbar">
+                <button className="primary-btn" onClick={() => sourceInputRef.current?.click()}>
+                  导入音源
+                </button>
+                <button className="ghost-btn" onClick={refreshSources}>
+                  刷新
+                </button>
+                <input
+                  ref={sourceInputRef}
+                  type="file"
+                  accept=".js,.json"
+                  style={{ display: "none" }}
+                  onChange={onPickSource}
+                />
+              </div>
+              <div className="source-list">
+                {sourceFiles.length === 0 ? (
+                  <p className="hint">
+                    尚未导入音源。下载前请先导入音源脚本（.js / .json，如落雪音源或导出的
+                    user_api.json），否则下载会提示“未找到音源”。
+                  </p>
+                ) : (
+                  sourceFiles.map((name) => (
+                    <div key={name} className="source-item">
+                      <span className="source-name">♪ {name}</span>
+                      <button className="danger-btn" onClick={() => removeSource(name)}>
+                        删除
+                      </button>
+                    </div>
+                  ))
+                )}
+              </div>
+            </section>
+          )}
+
           {tab === "settings" && (
             <section className="panel">
               <div className="settings-grid">
@@ -432,6 +527,7 @@ function tabTitle(tab: Tab): string {
   const map: Record<Tab, string> = {
     playlists: "我的歌单",
     download: "下载歌曲",
+    sources: "音源",
     settings: "设置",
   };
   return map[tab];

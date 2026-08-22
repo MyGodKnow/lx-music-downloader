@@ -3,7 +3,8 @@
  * lx_url_server.js - 落雪音乐音源桥接服务（常驻模式）
  *
  * 架构：
- *   本进程在 Node 中模拟 lx-music 音源运行环境，加载 sources/ 目录下的音源脚本，
+ *   本进程在 Node 中模拟 lx-music 音源运行环境，加载用户提供的音源脚本
+ *   （--api 单文件 / --api-dir 目录，默认 %APPDATA%\lx-downloader-sources），
  *   通过 stdin/stdout 的 JSON-RPC 协议为 Python 主程序（lx_music_downloader.py）服务。
  *
  * 协议（每行一个 JSON）：
@@ -13,7 +14,7 @@
  *            scanSources（调试：逐源健康检查）、searchList（调试：多平台候选枚举）、ping。
  *
  * 文件结构（自上而下）：
- *   1. 参数解析与音源脚本加载（--api 单文件 / --api-dir 目录）
+ *   1. 参数解析与音源脚本加载（--api 单文件 / --api-dir 目录，缺省报错并给出导入指引）
  *   2. HTTP 基础设施（doRequest / checkUrl 链接验证）
  *   3. lx 环境模拟（buildLx）与音源初始化（init）
  *   4. 歌曲字段规范化与匹配工具（normKw / nameMatch / singerMatch / intervalMatch…）
@@ -53,15 +54,13 @@ const readline = require('readline');
 const args = process.argv.slice(2);
 let apiFile = null;
 let apiDir = null;
-let allowUntrusted = false;
 for (let i = 0; i < args.length; i++) {
   if (args[i] === '--api' || args[i] === '-a') apiFile = args[++i];
   if (args[i] === '--api-dir') apiDir = args[++i];
-  if (args[i] === '--allow-untrusted' || args[i] === '-u') allowUntrusted = true;
 }
 
-// 默认音源：优先加载内置 sources/ 目录（只保留经探测可用的音源），
-// 目录为空时再退回落雪桌面版导出的 user_api.json。
+// 默认音源：脚本目录旁无 sources/ 时，退回落雪桌面版导出的 user_api.json
+// （用户在落雪 App 内自加的音源，间接复用其取链能力）。
 function findDefaultApi() {
   const userApi = path.join(process.env.APPDATA || '', 'lx-music-desktop', 'LxDatas', 'user_api.json');
   return fs.existsSync(userApi) ? userApi : null;
@@ -82,32 +81,10 @@ if (apiFile && !fs.existsSync(apiFile)) {
   process.exit(1);
 }
 
-// ========== 音源信任白名单（哈希固定） ==========
-// 内置 5 个音源经全流程实测验证，SHA-256 固定。loadScripts 加载时会逐文件校验：
-// 文件哈希不在白名单内的音源默认拒绝加载，需显式传 --allow-untrusted 才放行，
-// 防止畸形/被篡改/来路不明的第三方音源在 vm 中执行（vm 不是强安全边界）。
-const ALLOWED_SOURCE_HASHES = new Set([
-  '5c0fd239110e4835533d7f289ad895cae2ded3917af501db0650f08f592265ea', // K×H测试 v1.7.17
-  '9ddcc32f55ba1981166f16bf55c03c43165b098932208a5fb4c9c64192650f0c', // lx-玉宁熙-Pro v1.2.2
-  'd6c7cabaeb77c4231092b0d8f9f8b9bf9f0e0511215669631957aceb4bf34eb2', // 墨澜聚合音源 v2.2.0
-  'b45e05b8c043f0e715f9856ea400707bdf131b9c05b5014e1de9d0821a9972a7', // 屿溪-终章 v0.0.0
-  '48d5fed8b46344e9298d55427382ce573485a264a2ae287ed829e2f2548223e8', // 长青SVIP音源(二改修复版) v1.2.0
-]);
-function isTrustedFile(file) {
-  try {
-    const h = crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
-    return ALLOWED_SOURCE_HASHES.has(h);
-  } catch (_) { return false; }
-}
-
 // ========== 读取音源脚本 ==========
+// 音源全部由用户主动导入/提供（--api / --api-dir），视为用户已确认可信，一律加载。
+// 注意：vm 不是强安全边界，导入来源不明的音源脚本前请自行确认其内容。
 function loadScripts(file) {
-  // 信任校验：默认只加载白名单音源；非白名单需显式 --allow-untrusted
-  if (!allowUntrusted && !isTrustedFile(file)) {
-    process.stderr.write('[lx-url-server] 跳过不受信任的音源: ' + file
-      + '（如需加载请加 --allow-untrusted）\n');
-    return [];
-  }
   const raw = fs.readFileSync(file, 'utf-8');
   // 判断是 user_api.json 还是单个 JS
   try {
@@ -139,10 +116,22 @@ function sourceRank(name) {
   return SOURCE_PRIORITY.length;
 }
 
+// 音源缺失/为空时的统一出口：打印清晰指引后退出，避免后续取链接全部失败、用户一头雾水。
+function failNoSources(msg) {
+  process.stderr.write('[错误] ' + msg + '\n');
+  process.stderr.write('提示：请在 GUI「音源」页导入音源脚本（.js / .json），或用 --api / --api-dir 指定。\n');
+  process.exit(1);
+}
+
 function loadScriptSet() {
-  if (apiFile) return loadScripts(apiFile);
+  if (apiFile) {
+    if (!fs.existsSync(apiFile)) failNoSources('音源文件不存在: ' + apiFile);
+    return loadScripts(apiFile);
+  }
   const dir = apiDir || path.join(__dirname, 'sources');
+  if (!fs.existsSync(dir)) failNoSources('未找到音源目录: ' + dir);
   const files = fs.readdirSync(dir).filter(name => /\.(js|json)$/i.test(name));
+  if (!files.length) failNoSources('音源目录为空: ' + dir);
   files.sort((a, b) => (sourceRank(a) - sourceRank(b)) || a.localeCompare(b));
   return files.flatMap(name => loadScripts(path.join(dir, name)));
 }
@@ -245,8 +234,8 @@ async function init() {
   // 注意：音源脚本是不可信第三方代码，但现实中的落雪音源大量依赖
   // globalThis.lx、new Function/eval 等能力，过度加固会直接加载失败
   // （实测禁用 codeGeneration / 遮蔽 globalThis 会令全部源注册失败）。
-  // 因此这里仅做白名单式的最小暴露，并把“vm 不是强安全边界”作为已知约束：
-  // 生产上应仅加载经校验/哈希固定的可信音源，而非依赖 vm 隔离。
+  // 因此这里只做最小暴露；音源均由用户主动导入，导入前请自行确认来源可信，
+  // vm 不是强安全边界，不要加载来源不明的脚本。
   for (const api of scripts) {
     const { lx, handlers } = buildLx(api);
     const context = {
