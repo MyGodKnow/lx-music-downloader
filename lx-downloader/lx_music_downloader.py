@@ -7,7 +7,6 @@ lx_music_downloader.py - 落雪音乐歌单一键下载器
   1. 读取落雪音乐本地数据库（lx.data.db）或导出歌单（.lxmc/.json）
   2. 通过 Node 桥接服务（lx_url_server.js）+ 音源脚本实时获取播放链接
   3. 并发下载所有歌曲到指定目录，每首都过四重校验
-  4. 可选：把 FLAC 等格式并行转换为 320k MP3，集中到 mp3/ 子目录
 
 单首歌的下载管线（process_song，由外到内逐级兜底）：
   1. 已存在检查   下载目录里已有“歌手 - 歌名”文件则直接跳过
@@ -29,7 +28,6 @@ lx_music_downloader.py - 落雪音乐歌单一键下载器
   python lx_music_downloader.py --list               # 列出歌单
   python lx_music_downloader.py --playlist <id>      # 下载指定歌单
   python lx_music_downloader.py --playlist <id> --quality flac --dir D:/Music --workers 4
-  python lx_music_downloader.py --convert --dir D:/Music   # 目录内音频转 MP3
 """
 import argparse
 import json
@@ -46,6 +44,15 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
+
+# 强制 stdout/stderr 以 UTF-8 输出（errors='replace'）：中文 Windows 下默认用 GBK，
+# 打印含 GBK 外字符（如日文「・」U+30FB）会抛 UnicodeEncodeError 使整个程序崩溃。
+# 输出由 Tauri 前端优先按 UTF-8 解码（decode_line），强制 UTF-8 不会产生乱码。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding='utf-8', errors='replace')
+    except (AttributeError, ValueError):
+        pass
 
 # ============ 配置 ============
 DEFAULT_DB = os.path.join(os.environ.get('APPDATA', ''), 'lx-music-desktop', 'LxDatas', 'lx.data.db')
@@ -196,192 +203,6 @@ def find_node():
         except Exception:
             continue
     return None
-
-
-# ============ 格式转换（FLAC/其他 → MP3） ============
-BUNDLED_FFMPEG = os.path.join(RESOURCE_DIR, 'ffmpeg', 'ffmpeg.exe')
-CONVERT_SUFFIXES = ('.flac', '.m4a', '.aac', '.ogg', '.wav', '.ape', '.mp3')
-
-
-def find_ffmpeg():
-    """查找 ffmpeg 可执行文件：内置 → 常见安装路径 → PATH"""
-    candidates = [
-        BUNDLED_FFMPEG,
-        r'C:\Program Files\格式工厂\ffmpeg.exe',
-        r'C:\Program Files\Red Giant\Trapcode Suite\Tools\ffmpeg.exe',
-        r'C:\ffmpeg\bin\ffmpeg.exe',
-        'ffmpeg',  # PATH
-    ]
-    for c in candidates:
-        try:
-            r = subprocess.run([c, '-version'], capture_output=True, timeout=10)
-            if r.returncode == 0:
-                return c
-        except Exception:
-            continue
-    return None
-
-
-def convert_one_to_mp3(src_path, ffmpeg, bitrate='320k', stop_event=None):
-    """把单个音频文件转成 MP3（320k 起，兼容 ffmpeg）。
-    返回 (成功, 目标mp3路径, 错误信息)。转换不删除原文件。"""
-    src = Path(src_path)
-    if src.suffix.lower() == '.mp3':
-        return True, str(src), None  # 已是 MP3，跳过
-    dest = src.with_suffix('.mp3')
-    cmd = [ffmpeg, '-y', '-i', str(src), '-codec:a', 'libmp3lame', '-b:a', bitrate, '-map_metadata', '0', str(dest)]
-    try:
-        r = subprocess.run(cmd, capture_output=True, timeout=600)
-        if r.returncode == 0 and dest.exists() and dest.stat().st_size > 1024:
-            return True, str(dest), None
-        err = (r.stderr or b'').decode('utf-8', 'ignore')[-300:]
-        return False, str(dest), err or f'ffmpeg 返回码 {r.returncode}'
-    except Exception as e:
-        return False, str(dest), str(e)
-
-
-def convert_folder_to_mp3(folder, bitrate='320k', keep_original=True, stop_event=None, workers=None, move_mp3=False):
-    """并行转换文件夹内所有 FLAC/其他格式为 MP3（每个 ffmpeg 独立子进程，线程并行安全）。
-    keep_original=False 时转换成功后删除原文件；默认保留。
-    move_mp3=True 时转换完成后把所有 .mp3 文件（含已存在的）移入 <folder>/mp3 子目录。
-    workers 为 None 时按 CPU 核数-1 自动确定（至少 2，最多 16）。
-    返回统计 {ok, fail, skip, converted: [路径], moved: [路径]}。"""
-    if workers is None:
-        workers = max(2, min(16, (os.cpu_count() or 4) - 1))
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    folder = Path(folder)
-    if not folder.is_dir():
-        raise RuntimeError(f'目录不存在: {folder}')
-    ffmpeg = find_ffmpeg()
-    if not ffmpeg:
-        raise RuntimeError('未找到 ffmpeg，无法转换。请安装 ffmpeg 或放到常见路径。')
-    stats = {'ok': 0, 'fail': 0, 'skip': 0, 'converted': [], 'failed': [], 'moved': []}
-    files = sorted([f for f in folder.iterdir() if f.is_file() and f.suffix.lower() in CONVERT_SUFFIXES])
-    # 伪 MP3 修正：扩展名 .mp3 但内容是其他格式（如 FLAC 换壳，多为无扩展名代理链接
-    # 误存所致）→ 改回真实扩展名，交给下方正常流程重新生成真 320k MP3。
-    for f in files:
-        if f.suffix.lower() == '.mp3' and detect_audio_ext(f) != '.mp3':
-            real = detect_audio_ext(f)
-            target = f.parent / (f.stem + real)
-            if target.exists():
-                continue  # 已有同名的真实格式文件，不动
-            try:
-                f.rename(target)
-                print(f'  [修正] {f.name} 实为 {real[1:].upper()} 内容，已改回真实扩展名', flush=True)
-            except Exception:
-                pass
-    files = sorted([f for f in folder.iterdir() if f.is_file() and f.suffix.lower() in CONVERT_SUFFIXES])
-    todo = [f for f in files if f.suffix.lower() != '.mp3']
-
-    if stop_event is not None and stop_event.is_set():
-        print('[停止] 转换未开始。', flush=True)
-        return stats
-
-    print_lock = threading.Lock()
-
-    def _work(f):
-        if stop_event is not None and stop_event.is_set():
-            return f, 'stopped', None, None
-        # 目标 MP3 已存在且大于 1KB 时直接跳过（避免重复转）
-        dest = f.with_suffix('.mp3')
-        if dest.exists() and dest.stat().st_size > 1024:
-            return f, 'skip', dest, None
-        ok, d, err = convert_one_to_mp3(f, ffmpeg, bitrate, stop_event)
-        return f, ('ok' if ok else 'fail'), Path(d), err
-
-    if workers > 1 and len(todo) > 1:
-        with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
-            futs = [pool.submit(_work, f) for f in todo]
-            _done = 0
-            for fut in as_completed(futs):
-                src, status, dest, err = fut.result()
-                _done += 1
-                if status == 'stopped':
-                    print('[停止] 转换已中止。', flush=True)
-                    break
-                with print_lock:
-                    if status == 'ok':
-                        stats['ok'] += 1
-                        stats['converted'].append(str(dest))
-                        print(f'  [转换] {src.name} -> MP3 {bitrate}', flush=True)
-                        if not keep_original:
-                            try:
-                                src.unlink()
-                                print(f'  [删除原文件] {src.name}', flush=True)
-                            except Exception:
-                                print(f'  [警告] 原文件删除失败: {src.name}', flush=True)
-                    elif status == 'skip':
-                        stats['skip'] += 1
-                    else:
-                        stats['fail'] += 1
-                        stats['failed'].append((str(src), err))
-                        print(f'  [失败] {src.name}: {err}', flush=True)
-                _emit_convert_progress(_done, len(todo), stats)
-    else:
-        _done = 0
-        for f in todo:
-            if stop_event is not None and stop_event.is_set():
-                print('[停止] 转换已中止。', flush=True)
-                break
-            src, status, dest, err = _work(f)
-            if status == 'ok':
-                stats['ok'] += 1
-                stats['converted'].append(str(dest))
-                print(f'  [转换] {src.name} -> MP3 {bitrate}', flush=True)
-                if not keep_original:
-                    try:
-                        src.unlink()
-                        print(f'  [删除原文件] {src.name}', flush=True)
-                    except Exception:
-                        print(f'  [警告] 原文件删除失败: {src.name}', flush=True)
-            elif status == 'skip':
-                stats['skip'] += 1
-            else:
-                stats['fail'] += 1
-                stats['failed'].append((str(src), err))
-                print(f'  [失败] {src.name}: {err}', flush=True)
-            _done += 1
-            _emit_convert_progress(_done, len(todo), stats)
-
-    # 转换完成后：把目录下所有 MP3 集中到 <folder>/mp3 子目录
-    if move_mp3:
-        stats['moved'] = move_mp3_to_subdir(folder)
-    return stats
-
-
-def _emit_convert_progress(done, total, stats):
-    """输出结构化转换进度事件（前端识别 ##PROGRESS## 渲染进度条）。"""
-    try:
-        _p = {'done': done, 'total': total,
-              'success': stats['ok'], 'fail': stats['fail'], 'skip': stats['skip']}
-        print('##PROGRESS## ' + json.dumps(_p, ensure_ascii=False), flush=True)
-    except Exception:
-        pass
-
-
-def move_mp3_to_subdir(folder):
-    """把文件夹内所有 .mp3 文件移入 <folder>/mp3 子目录，返回移动数量。"""
-    folder = Path(folder)
-    target = folder / 'mp3'
-    target.mkdir(parents=True, exist_ok=True)
-    moved = []
-    for f in sorted(folder.glob('*.mp3')):
-        if not f.is_file():
-            continue
-        dest = target / f.name
-        try:
-            if dest.exists():
-                dest.unlink()
-            f.rename(dest)
-            moved.append(str(dest))
-        except Exception:
-            try:
-                import shutil
-                shutil.move(str(f), str(dest))
-                moved.append(str(dest))
-            except Exception:
-                pass
-    return moved
 
 
 # ============ Node 音源桥接客户端 ============
@@ -1232,62 +1053,6 @@ def settings_menu(config):
     return config
 
 
-def convert_menu(config):
-    """格式转换子菜单：并行转换，完成后自动把所有 MP3 集中到 mp3 子文件夹。"""
-    print('\n========== 格式转换（→ MP3） ==========')
-    print('把下载目录内 FLAC / M4A / OGG / WAV 等格式转换为 MP3 320kbps。')
-    print('转换完成后自动把所有 MP3 文件移入 mp3 子文件夹。')
-    folder = input(f'转换目录\n[当前 {config["dir"]}] > ').strip() or config['dir']
-    if not Path(folder).is_dir():
-        print(f'[错误] 目录不存在: {folder}')
-        return config
-    while True:
-        print('1=保留原文件  2=转换后删除原文件  3=移入原文件子目录')
-        answer = input('[当前 1] > ').strip() or '1'
-        if answer in ('1', '2', '3'):
-            break
-        print('输入无效，请输入 1、2 或 3。')
-    auto_workers = max(2, min(16, (os.cpu_count() or 4) - 1))
-    workers_input = input(f'并行数（0=按CPU核数自动={auto_workers}，直接回车自动）\n[当前 0] > ').strip()
-    workers = None
-    if workers_input.isdigit():
-        workers = max(1, min(16, int(workers_input))) if int(workers_input) > 0 else None
-    ffmpeg = find_ffmpeg()
-    if not ffmpeg:
-        print('[错误] 未找到 ffmpeg，无法转换。')
-        print('请安装 ffmpeg 并加入 PATH，或放到以下位置之一：')
-        print('  C:\\Program Files\\格式工厂\\ffmpeg.exe')
-        print('  C:\\ffmpeg\\bin\\ffmpeg.exe')
-        return config
-    print(f'使用 ffmpeg: {ffmpeg}')
-    target_count = len([f for f in Path(folder).iterdir() if f.is_file() and f.suffix.lower() in CONVERT_SUFFIXES and f.suffix.lower() != '.mp3'])
-    existing_mp3 = len(list(Path(folder).glob('*.mp3')))
-    print(f'待转换 {target_count} 个文件，已存在 {existing_mp3} 个 MP3，并行 {workers or auto_workers} 路。')
-    stats = convert_folder_to_mp3(folder, '320k', keep_original=(answer == '1'), stop_event=DOWNLOAD_STOP_EVENT,
-                                  workers=workers, move_mp3=True)
-    print(f'\n转换完成：成功 {stats["ok"]}，失败 {stats["fail"]}，跳过 {stats["skip"]}。')
-    print(f'共 {len(stats["moved"])} 个 MP3 已移入 {Path(folder) / "mp3"} 文件夹。')
-    if stats['failed']:
-        print('失败文件：')
-        for name, err in stats['failed'][:10]:
-            print(f'  {name}: {err}')
-    if answer == '3':
-        # 移入原文件子目录
-        keep_dir = Path(folder) / 'mp3_原文件'
-        keep_dir.mkdir(parents=True, exist_ok=True)
-        srcs = sorted([f for f in Path(folder).iterdir()
-                       if f.is_file() and f.suffix.lower() in CONVERT_SUFFIXES and f.suffix.lower() != '.mp3'])
-        moved = 0
-        for src in srcs:
-            try:
-                src.rename(keep_dir / src.name)
-                moved += 1
-            except Exception:
-                pass
-        print(f'已将 {moved} 个原文件移入 {keep_dir}')
-    return config
-
-
 def check_sources(api_file, api_dir):
     """音源前置校验：返回缺失说明（None 表示可用）。
 
@@ -1313,29 +1078,25 @@ def main_menu():
     print('1. 下载歌曲')
     print('2. 设置')
     print('3. 重置设置')
-    print('4. 格式转换（FLAC等 → MP3）')
     print('0. 退出')
     while True:
-        choice = input('\n请选择 [1/2/3/4/0]: ').strip()
+        choice = input('\n请选择 [1/2/3/0]: ').strip()
         if choice == '1':
             return config
         if choice == '2':
             config = settings_menu(config)
-            print('\n1. 下载歌曲\n2. 设置\n3. 重置设置\n4. 格式转换（FLAC等 → MP3）\n0. 退出')
+            print('\n1. 下载歌曲\n2. 设置\n3. 重置设置\n0. 退出')
         elif choice == '3':
             confirm = input('确定重置所有设置吗？输入 yes 确认：').strip().lower()
             if confirm == 'yes':
                 config = reset_config()
             else:
                 print('已取消重置。')
-            print('\n1. 下载歌曲\n2. 设置\n3. 重置设置\n4. 格式转换（FLAC等 → MP3）\n0. 退出')
-        elif choice == '4':
-            config = convert_menu(config)
-            print('\n1. 下载歌曲\n2. 设置\n3. 重置设置\n4. 格式转换（FLAC等 → MP3）\n0. 退出')
+            print('\n1. 下载歌曲\n2. 设置\n3. 重置设置\n0. 退出')
         elif choice == '0':
             return None
         else:
-            print('输入无效，请选择 1、2、3、4 或 0。')
+            print('输入无效，请选择 1、2、3 或 0。')
 
 
 def request_stop(signum=None, frame=None):
@@ -1379,43 +1140,7 @@ def run():
                         help='兼容保留：当前版本导入的音源默认全部加载，无需该开关')
     parser.add_argument('--exclude', default='', help='排除歌曲，使用逗号分隔的歌名或“歌手 - 歌名”')
     parser.add_argument('--max', type=int, default=0, help='最多下载数量（0=全部，用于测试）')
-    parser.add_argument('--convert', action='store_true', help='转换目录内音频为 MP3（配合 --dir 指定目录）')
-    parser.add_argument('--convert-bitrate', default='320k', help='MP3 码率（默认 320k）')
-    parser.add_argument('--convert-keep', choices=['keep', 'delete', 'move'], default='keep',
-                        help='原文件处理：keep 保留 / delete 删除 / move 移入子目录（默认 keep）')
-    parser.add_argument('--convert-workers', type=int, default=0, help='并行转换进程数（0=按CPU核数自动，默认）')
-    parser.add_argument('--convert-move-mp3', action='store_true', default=True,
-                        help='转换完成后把所有 MP3 移入 <目录>/mp3 子文件夹（默认开启）')
     args = parser.parse_args()
-
-    # 纯转换模式：不进数据库流程
-    if args.convert:
-        convert_keep = {'keep': True, 'delete': False, 'move': 'move'}[args.convert_keep]
-        convert_workers = args.convert_workers or None  # 0/未传 → 按 CPU 核数自动
-        print(f'开始转换目录 {args.dir} → MP3（{args.convert_bitrate}，并行 {convert_workers or "自动"}）…')
-        stats = convert_folder_to_mp3(args.dir, args.convert_bitrate,
-                                      keep_original=(convert_keep is True), stop_event=DOWNLOAD_STOP_EVENT,
-                                      workers=convert_workers, move_mp3=args.convert_move_mp3)
-        print(f'\n转换完成：成功 {stats["ok"]}，失败 {stats["fail"]}，跳过 {stats["skip"]}。')
-        if args.convert_move_mp3:
-            print(f'已把 {len(stats["moved"])} 个 MP3 移入 {Path(args.dir) / "mp3"}')
-        if stats['failed']:
-            print('失败文件：')
-            for name, err in stats['failed'][:10]:
-                print(f'  {name}: {err}')
-        if convert_keep == 'move':
-            keep_dir = Path(args.dir) / 'mp3_原文件'
-            keep_dir.mkdir(parents=True, exist_ok=True)
-            moved = 0
-            for src in [f for f in Path(args.dir).iterdir()
-                        if f.is_file() and f.suffix.lower() in CONVERT_SUFFIXES and f.suffix.lower() != '.mp3']:
-                try:
-                    src.rename(keep_dir / src.name)
-                    moved += 1
-                except Exception:
-                    pass
-            print(f'已将 {moved} 个原文件移入 {keep_dir}')
-        return
 
     # 自动探测数据库（支持官方版/便携版/fork/扩展名差异）；也支持导入 .lxmc 导出歌单
     db_path = detect_database(args.db)

@@ -8,7 +8,6 @@
 |------|------|------|
 | Python | 3.13 | 引擎本体，需能运行 `lx_music_downloader.py` |
 | Node.js | 22+ | 音源桥接运行环境，需含 `node.exe` |
-| ffmpeg | 任意新版本 | 用于格式转换/质量探测，需含 `ffmpeg.exe` 及其 DLL |
 | Rust | stable | Tauri 后端 |
 | VS 2022 Build Tools | - | Rust 的 MSVC 链接器（含 WebView2） |
 
@@ -20,7 +19,7 @@
 
 ## 单文件 EXE 构建流程
 
-> 引擎 = PyInstaller 冻结的 `lx_music_downloader`（内含 Python 运行时、Node、音源脚本、ffmpeg），整体打 zip 后由 Rust `include_bytes!` 编译期内嵌进 EXE；首次运行释放到 `%LOCALAPPDATA%\落雪下载\engine\` 并执行，免安装 Python/Node。
+> 引擎 = PyInstaller 冻结的 `lx_music_downloader`（内含 Python 运行时、Node、音源桥接），整体打 zip 后由 Rust `include_bytes!` 编译期内嵌进 EXE；首次运行释放到 `%LOCALAPPDATA%\落雪下载\engine\` 并执行，免安装 Python/Node。
 
 ### 1. 重建下载引擎（engine.zip）
 
@@ -28,12 +27,10 @@
 cd lx-downloader
 
 # 1) 暂存运行依赖到 _pack（PyInstaller 打包后需要）
-#    node/ffmpeg 及其 DLL 放入 _pack/（按需保留，打包后可删除）
+#    node.exe 放入 _pack/（按需保留，打包后可删除）
 #    目录结构参考：
 #   _pack/
-#   ├── node/node.exe
-#   ├── ffmpeg/ffmpeg.exe
-#   └── ... (其它运行依赖)
+#   └── node/node.exe
 
 # 2) 用 PyInstaller 冻结引擎（onedir，含 mutagen 与音源桥接）
 pyinstaller --onedir --collect-all mutagen ^
@@ -47,8 +44,9 @@ pyinstaller --onedir --collect-all mutagen ^
 ```
 
 > 注意：
-> - `engine.zip` 内容根级结构需与 `lib.rs::ensure_engine()` 的预期一致（即解压后直接得到 `lx_music_downloader.exe`、`lx_url_server.js`、`sources/`、`node/`、`ffmpeg/`）。
+> - `engine.zip` 内容根级结构需与 `lib.rs::ensure_engine()` 的预期一致（即解压后直接得到 `lx_music_downloader.exe`、`lx_url_server.js`、`sources/`、`node/`）。
 > - **第三方音源不再随引擎捆绑**：引擎运行时默认从 `%APPDATA%\lx-downloader-sources\` 读取用户导入的音源。`sources/` 只是占位目录（含 `.gitkeep` 与 README），不包含任何音源脚本。
+> - 已移除 MP3 转换功能，引擎不再打包 ffmpeg。
 
 ### 2. 编译 Tauri 发布版
 
