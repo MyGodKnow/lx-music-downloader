@@ -1,6 +1,6 @@
 # 落雪音乐下载器 (lx-music-downloader)
 
-> 自动读取落雪音乐（lx-music-desktop）本地歌单，多音源批量无损下载 + 图形界面（Tauri）的 Windows 音乐下载工具。
+> 自动读取落雪音乐（lx-music-desktop）本地歌单，多音源批量无损下载的 Windows 音乐下载工具（Tauri 图形界面 + Python 引擎）。
 
 ![platform](https://img.shields.io/badge/platform-Windows-0078d6) ![license](https://img.shields.io/badge/license-GPL--3.0-blue)
 
@@ -19,26 +19,21 @@
 
 ## 功能特性
 
-- **一键下载**：自动探测本机落雪音乐数据库（官方版/便携版/多种 fork），列出歌单（默认列表、我的收藏、自定义）
+- **一键下载**：自动探测本机落雪音乐数据库，列出歌单（默认列表、我的收藏、自定义）
 - **多平台支持**：酷我(kw)、网易云(wy)、腾讯(tx)、酷狗(kg)、咪咕(mg)
-- **无损优先**：默认目标音质 FLAC/FLAC 24bit，最高不低于 320k，绝不降级到 128k 以下
-- **自定义音源**：不捆绑任何第三方音源，在「音源」页导入你自己的音源脚本（.js / .json / user_api.json），保存在 `%APPDATA%\lx-downloader-sources\`，可随时增删
-- **多级兜底**：原源直查 → 替代平台直查 → 按「歌手+歌名」全网搜索
-- **四重校验**（下载防错核心）：
-  1. 时长校验（±15s，防下错歌）
-  2. 版本拦截（伴奏/翻唱/卡拉OK/remix/纯音乐 等关键词）
-  3. 歌手校验（artist 标签与目标一致，防翻唱冒充原唱）
-  4. 音质校验（**按文件内容探测**，不是看扩展名，拦截“假 FLAC”）
-- **失败重试与清单**：全部失败的歌曲二次重试，仍失败写入 `failed.txt`，可稍后重跑自动补下
-- **MP3 转换**：可将无损/高码率文件并行转换为 320k MP3，集中到 `mp3/` 子目录
-- **图形界面（GUI）**：Tauri 2 + React 暗色主题，歌单 / 下载 / 转换 / 设置四个页面，实时日志与进度
-- **单文件 EXE 分发**：内置 Python 引擎 + Node.js + 音源 + ffmpeg，免安装运行
-
----
+- **无损优先**：默认目标音质 FLAC / FLAC 24bit，绝不低于 320k
+- **自定义音源**：在「音源」页导入你自己的音源脚本，保存在 `%APPDATA%\lx-downloader-sources\`
+- **四重校验**：时长 / 版本词 / 歌手标签 / 音质（按文件内容探测，非扩展名）
+- **失败重试**：全部失败歌曲二次重试，仍失败写入 `failed.txt`，可重跑补下
+- **免安装 EXE**：内置 Python 引擎 + Node.js + ffmpeg，双击即用
 
 ## 快速开始
 
 ### 方式一：图形界面（推荐）
+
+**直接下载 EXE**：从 [GitHub Releases](https://github.com/MyGodKnow/lx-music-downloader/releases) 下载最新 `lx-music-downloader-*.exe`，双击即用（首次运行自动释放内置引擎，免装 Python / Node）。
+
+**源码运行**（开发者）：
 
 ```bash
 cd lx-tauri
@@ -46,7 +41,7 @@ npm install
 npm run tauri dev        # 开发模式运行
 ```
 
-启动后先到「音源」页**导入你自己的音源脚本**（.js / .json / user_api.json），再点「刷新歌单」自动探测落雪数据库；若未安装落雪音乐，可手动导入 `.lxmc` / `.json` 歌单文件。
+使用前先在「音源」页**导入你自己的音源脚本**（.js / .json / user_api.json），再点「刷新歌单」自动探测落雪数据库；若未安装落雪音乐，可手动导入 `.lxmc` / `.json` 歌单文件。
 
 ### 方式二：命令行引擎
 
@@ -56,72 +51,13 @@ python lx_music_downloader.py --list                  # 列出歌单
 python lx_music_downloader.py --playlist love --quality flac --dir D:/Music --workers 4
 ```
 
-命令行同样默认从 `%APPDATA%\lx-downloader-sources\` 加载音源；未导入音源时会提示「请先导入音源」。
-完整参数与说明见 [lx-downloader/README.md](lx-downloader/README.md)。
-
----
-
-## 项目结构
-
-```
-.
-├── lx-downloader/                  # Python 下载引擎（核心）
-│   ├── lx_music_downloader.py      # 主程序：歌单解析→取链接→四重校验→并发下载
-│   ├── lx_url_server.js            # Node 桥接服务：加载用户音源、取播放链接、按名搜索
-│   ├── sources/                    # 音源占位目录（不捆绑第三方音源，见 README 说明）
-│   ├── _probe_sources_v2.py        # 音源健康检查工具（逐源跑 searchByName 全流程）
-│   ├── scan_sources.py             # 音源实测工具（歌单抽样逐源验证）
-│   ├── analyze_quality.py          # 下载文件质量分析工具
-│   └── README.md                   # 引擎详细文档
-├── lx-tauri/                       # Tauri 2 图形界面（Rust 后端 + React 前端）
-│   ├── src/                        # React 前端（暗色主题，歌单/下载/音源/设置页）
-│   └── src-tauri/
-│       ├── src/lib.rs              # 命令：list_playlists / start_download / stop_task / 音源管理
-│       ├── engine/                 # 内置下载引擎压缩包（构建产物，不入库，见 BUILD.md）
-│       └── tauri.conf.json         # 应用配置
-├── BUILD.md                        # 打包 / 构建 / 引擎更新流程
-├── LICENSE                         # GPL-3.0
-└── README.md
-```
-
----
-
-## 质量保证（硬性约束）
-
-- 所有下载文件必须达到 **无损（FLAC/ALAC/APE/WAV）** 或 **≥320k** 标准
-- 音质以**文件内容**（mutagen 探测）而非扩展名为准，防止假 FLAC
-- 标题含 `伴奏/カラオケ/karaoke/Instrumental/off vocal/翻唱/cover/remix/纯音乐` 一律拒绝
-- artist 标签必须与目标歌手一致
-- 低质量文件会被移入 `low_quality/` 子目录，失败记录写入 `failed.txt`
-
----
+命令行同样默认从 `%APPDATA%\lx-downloader-sources\` 加载音源；未导入音源时会提示「请先导入音源」。完整参数与说明见 [lx-downloader/README.md](lx-downloader/README.md)。
 
 ## 音源管理（用户自备）
 
 - 本仓库**不捆绑任何第三方音源**。请在 GUI「音源」页导入你自己的音源脚本（.js / .json / user_api.json），导入后保存在 `%APPDATA%\lx-downloader-sources\`，可随时增删，不随程序更新丢失
 - 也可直接把音源文件放进该目录，或把落雪音乐桌面版导出的 `user_api.json` 放进去
 - 引擎默认从该目录加载全部音源；未导入任何音源时，下载会提示「请先导入音源」并中止
-- 拿不到有效链接的音源会自动冷却（默认 3 分钟），避免拖慢下载
-- 健康检查：`python _probe_sources_v2.py` / `python scan_sources.py`（同样读取用户音源目录）
-
----
-
-## 构建与打包
-
-完整的 EXE 打包、内置引擎重建、版本更新流程见 **[BUILD.md](BUILD.md)**。
-
----
-
-## 技术栈
-
-| 层 | 技术 |
-|----|------|
-| 下载引擎 | Python 3.13（标准库 + mutagen）+ Node.js 22 音源桥接 |
-| 图形界面 | Tauri 2（Rust）+ React 19 + Vite + TypeScript |
-| 音质校验 | mutagen（按文件内容探测码率/格式） |
-| 打包分发 | PyInstaller（onedir）+ include_bytes 内嵌引擎 + 单文件 EXE |
-
----
 
 ## 免责声明
 
