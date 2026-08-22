@@ -1,0 +1,44 @@
+# ============ 系统 / 编辑器 ============
+Thumbs.db
+Desktop.ini
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.suo
+*.sw?
+
+# ============ Python ============
+__pycache__/
+*.pyc
+*.pyo
+
+# ============ 日志 / 探测报告（运行期产物，不入库） ============
+*.log
+_probe_sources_report.json
+lx-downloader-crash.log
+
+# ============ 下载的音乐文件 / 测试产物（版权内容，严禁入库） ============
+lx-downloader/downloads/
+lx-downloader/dist/
+lx-downloader/test_dl*/
+lx-downloader/test_fix/
+
+# ============ Node / 前端构建 ============
+node_modules/
+lx-tauri/dist/
+
+# ============ Rust / Tauri 构建产物 ============
+lx-tauri/src-tauri/target/
+lx-tauri/src-tauri/gen/schemas/
+
+# ============ 内置引擎压缩包（83MB 构建产物，按 BUILD.md 重新生成） ============
+lx-tauri/src-tauri/engine/engine.zip
+
+# ============ 发布二进制 ============
+落雪音乐下载器.exe
+LXMusicDownloader.exe
+
+# ============ 内部工作区（AI 记忆 / 设计系统，不属于项目本体） ============
+.workbuddy/
+design-system/

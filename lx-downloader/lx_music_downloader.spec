@@ -1,0 +1,51 @@
+# -*- mode: python ; coding: utf-8 -*-
+from PyInstaller.utils.hooks import collect_all
+
+datas = [('lx_url_server.js', '.'), ('sources', 'sources'), ('_pack/node', 'node'), ('_pack/ffmpeg', 'ffmpeg')]
+binaries = []
+hiddenimports = []
+tmp_ret = collect_all('mutagen')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+
+
+a = Analysis(
+    ['lx_music_downloader.py'],
+    pathex=[],
+    binaries=binaries,
+    datas=datas,
+    hiddenimports=hiddenimports,
+    hookspath=[],
+    hooksconfig={},
+    runtime_hooks=[],
+    excludes=[],
+    noarchive=False,
+    optimize=0,
+)
+pyz = PYZ(a.pure)
+
+exe = EXE(
+    pyz,
+    a.scripts,
+    [],
+    exclude_binaries=True,
+    name='lx_music_downloader',
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=True,
+    console=True,
+    disable_windowed_traceback=False,
+    argv_emulation=False,
+    target_arch=None,
+    codesign_identity=None,
+    entitlements_file=None,
+)
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.datas,
+    strip=False,
+    upx=True,
+    upx_exclude=[],
+    name='lx_music_downloader',
+)
