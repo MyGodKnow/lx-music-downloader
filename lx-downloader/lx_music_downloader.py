@@ -213,14 +213,13 @@ def find_node():
 class UrlServer:
     """与 Node 音源桥接服务通信（常驻子进程）"""
 
-    def __init__(self, node_exe, api_file=None, api_dir=None, allow_untrusted=False):
+    def __init__(self, node_exe, api_file=None, api_dir=None):
         self.proc = None
         self.lock = threading.Lock()
         self.counter = 0
         self.node_exe = node_exe
         self.api_file = api_file
         self.api_dir = api_dir
-        self.allow_untrusted = allow_untrusted
 
     def start(self):
         cmd = [self.node_exe, URL_SERVER]
@@ -228,8 +227,6 @@ class UrlServer:
             cmd += ['--api', self.api_file]
         elif self.api_dir:
             cmd += ['--api-dir', self.api_dir]
-        if self.allow_untrusted:
-            cmd += ['--allow-untrusted']
         self.proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
@@ -1136,8 +1133,6 @@ def run():
     parser.add_argument('--node', default=config['node'] or None, help='Node.js 可执行文件路径（EXE 已内置）')
     parser.add_argument('--api', default=config['api'] or None, help='音源脚本路径（JS 文件或 user_api.json）')
     parser.add_argument('--api-dir', default=config['api_dir'], help=f'音源目录（默认 {USER_SOURCES_DIR}，可在 GUI「音源」页导入）')
-    parser.add_argument('--allow-untrusted-sources', action='store_true',
-                        help='兼容保留：当前版本导入的音源默认全部加载，无需该开关')
     parser.add_argument('--exclude', default='', help='排除歌曲，使用逗号分隔的歌名或“歌手 - 歌名”')
     parser.add_argument('--max', type=int, default=0, help='最多下载数量（0=全部，用于测试）')
     args = parser.parse_args()
@@ -1226,7 +1221,7 @@ def run():
     def get_worker_server():
         server = getattr(server_local, 'server', None)
         if server is None:
-            server = UrlServer(node_exe, args.api, args.api_dir, getattr(args, 'allow_untrusted_sources', False)).start()
+            server = UrlServer(node_exe, args.api, args.api_dir).start()
             server_local.server = server
             with servers_lock:
                 servers.append(server)
@@ -1396,7 +1391,7 @@ def run():
         def get_retry_server():
             server = getattr(retry_local, 'server', None)
             if server is None:
-                server = UrlServer(node_exe, args.api, args.api_dir, getattr(args, 'allow_untrusted_sources', False)).start()
+                server = UrlServer(node_exe, args.api, args.api_dir).start()
                 retry_local.server = server
                 with servers_lock:
                     retry_servers.append(server)
