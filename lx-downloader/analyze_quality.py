@@ -9,9 +9,9 @@ import shutil
 from mutagen import File as MFile
 from mutagen.flac import FLAC
 
-# 下载目录默认取脚本同级的 dist/downloads（与该脚本位置无关的描述性路径，
-# 不在源码里写死本地绝对路径，避免泄露本机用户名/工作目录）。
-DL = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dist', 'downloads')
+# 与 lx_music_downloader.py 开发模式的 DOWNLOAD_DIR 对齐（同为脚本目录下 downloads/），
+# 避免维护工具扫错目录（冻结版引擎则输出到 ~/Music/落雪音乐下载）。
+DL = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'downloads')
 MIN_BR = 320000
 DO_MOVE = '--move' in sys.argv
 
