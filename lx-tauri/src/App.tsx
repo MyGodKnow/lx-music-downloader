@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { save } from "@tauri-apps/plugin-dialog";
 import "./App.css";
 
 interface Playlist {
@@ -14,7 +15,7 @@ interface LogLine {
   data: string;
 }
 
-type Tab = "playlists" | "download" | "sources" | "settings";
+type Tab = "playlists" | "download" | "export" | "sources" | "settings";
 
 const QUALITY_OPTIONS = [
   { value: "flac24bit", label: "Hi-Res 无损", hint: "FLAC 24bit" },
@@ -57,6 +58,11 @@ function App() {
   const [sourceFiles, setSourceFiles] = useState<string[]>([]);
   const [sourcesDir, setSourcesDir] = useState("");
   const sourceInputRef = useRef<HTMLInputElement>(null);
+
+  // 导出歌单：歌曲清单（“歌手 - 歌名”每行一条）
+  const [exportLines, setExportLines] = useState<string[]>([]);
+  const [exporting, setExporting] = useState(false);
+  const exportText = exportLines.join("\n");
 
   // 首页自动加载歌单
   useEffect(() => {
@@ -212,6 +218,71 @@ function App() {
     }
   }
 
+  // ===== 导出歌单：生成“歌手 - 歌名”清单（去重、歌单原顺序，由引擎完成） =====
+  async function doExport() {
+    if (!selected) {
+      addLog("error", "请先选择一个歌单");
+      return;
+    }
+    setExporting(true);
+    setExportLines([]);
+    try {
+      const lines = await invoke<string[]>("export_songs", {
+        playlist: selected,
+        db: dbPath || null,
+        python: pythonPath || null,
+      });
+      setExportLines(lines);
+      const pl = playlists.find((p) => p.id === selected);
+      addLog("ok", `已导出歌单「${pl?.name ?? selected}」，共 ${lines.length} 首`);
+    } catch (err) {
+      addLog("error", String(err));
+    } finally {
+      setExporting(false);
+    }
+  }
+
+  async function copyExport() {
+    if (!exportText) return;
+    try {
+      await navigator.clipboard.writeText(exportText);
+      addLog("ok", "清单已复制到剪贴板");
+      return;
+    } catch {
+      // 开发模式（http://localhost）不是安全上下文，clipboard API 可能不可用，退回 DOM 方案
+      try {
+        const ta = document.createElement("textarea");
+        ta.value = exportText;
+        ta.style.position = "fixed";
+        ta.style.opacity = "0";
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand("copy");
+        document.body.removeChild(ta);
+        addLog("ok", "清单已复制到剪贴板");
+      } catch {
+        addLog("error", "复制失败，请手动全选复制");
+      }
+    }
+  }
+
+  async function saveExport() {
+    if (!exportText) return;
+    const pl = playlists.find((p) => p.id === selected);
+    const path = await save({
+      title: "另存歌单歌曲清单",
+      defaultPath: `${pl?.name || "歌单"}.txt`,
+      filters: [{ name: "文本文件", extensions: ["txt"] }],
+    });
+    if (!path) return; // 用户取消
+    try {
+      await invoke("save_text_file", { path, content: exportText + "\n" });
+      addLog("ok", `已保存: ${path}`);
+    } catch (err) {
+      addLog("error", String(err));
+    }
+  }
+
   const logCount = logs.filter((l) => l.kind === "ok").length;
 
   return (
@@ -229,6 +300,7 @@ function App() {
             [
               ["playlists", "我的歌单"],
               ["download", "下载歌曲"],
+              ["export", "导出歌单"],
               ["sources", "音源"],
               ["settings", "设置"],
             ] as [Tab, string][]
@@ -442,6 +514,68 @@ function App() {
             </section>
           )}
 
+          {tab === "export" && (
+            <section className="panel">
+              <div className="panel-row">
+                <label className="field grow">
+                  <span>选择歌单</span>
+                  <select value={selected} onChange={(e) => setSelected(e.target.value)}>
+                    {playlists.map((p) => (
+                      <option key={p.id} value={p.id}>
+                        {p.name}（{p.cnt} 首）
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <button
+                  className="primary-btn"
+                  onClick={doExport}
+                  disabled={exporting || playlists.length === 0}
+                >
+                  {exporting ? "导出中…" : "导出歌单txt"}
+                </button>
+                <button className="ghost-btn" onClick={loadPlaylists}>
+                  刷新歌单
+                </button>
+              </div>
+
+              <p className="hint">
+                导出为「歌手 - 歌名」清单，按歌单原顺序，同一首歌多平台记录只保留一行。
+              </p>
+
+              {exportLines.length > 0 ? (
+                <>
+                  <div className="export-toolbar">
+                    <span className="export-count">
+                      共 {exportLines.length} 首
+                      {exportLines.length < (playlists.find((p) => p.id === selected)?.cnt ?? 0) &&
+                        "（已按歌手+歌名去重）"}
+                    </span>
+                    <button className="ghost-btn" onClick={copyExport}>
+                      复制
+                    </button>
+                    <button className="ghost-btn" onClick={saveExport}>
+                      另存为 .txt
+                    </button>
+                  </div>
+                  <textarea
+                    className="export-box"
+                    readOnly
+                    value={exportText}
+                    spellCheck={false}
+                  />
+                </>
+              ) : (
+                <div className="empty">
+                  <div className="empty-icon">📄</div>
+                  <p>点击「导出歌单txt」生成歌曲清单</p>
+                </div>
+              )}
+
+              <LogView logs={logs} logEndRef={logEndRef} />
+            </section>
+          )}
+
           {tab === "sources" && (
             <section className="panel">
               <div className="settings-grid">
@@ -527,6 +661,7 @@ function tabTitle(tab: Tab): string {
   const map: Record<Tab, string> = {
     playlists: "我的歌单",
     download: "下载歌曲",
+    export: "导出歌单",
     sources: "音源",
     settings: "设置",
   };

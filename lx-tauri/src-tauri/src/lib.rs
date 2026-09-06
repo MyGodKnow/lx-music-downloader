@@ -558,10 +558,72 @@ fn remove_source(file_name: String) -> Result<(), String> {
     Ok(())
 }
 
+/// 导出歌单为“歌手 - 歌名”清单（去重、按歌单原顺序）。
+#[tauri::command]
+fn export_songs(
+    playlist: String,
+    db: Option<String>,
+    python: Option<String>,
+) -> Result<Vec<String>, String> {
+    validate_python(python.as_ref())?;
+    let playlist = playlist.trim();
+    if playlist.is_empty() {
+        return Err("歌单不能为空".to_string());
+    }
+    reject_flag_prefix("歌单 id", playlist)?;
+    if let Some(d) = &db {
+        let t = d.trim();
+        if !t.is_empty() {
+            reject_flag_prefix("数据库路径", t)?;
+        }
+    }
+    let mut args: Vec<String> = vec!["--playlist".into(), playlist.to_string(), "--export-songs".into()];
+    if let Some(d) = db {
+        if !d.trim().is_empty() {
+            args.push("--db".into());
+            args.push(d.trim().into());
+        }
+    }
+    let (program, prefix) = resolve_engine(python.as_ref());
+    let mut cmd = Command::new(&program);
+    cmd.args(&prefix).args(&args);
+    let out = match run_command_output(&mut cmd, 60) {
+        Ok(Some(o)) => o,
+        Ok(None) => {
+            return Err("导出歌单超时（60s），请检查 python 与数据库后重试".to_string());
+        }
+        Err(e) => return Err(e),
+    };
+    let text = decode_line(&out.stdout);
+    if !out.status.success() {
+        let msg = if text.contains("未找到") {
+            "未找到落雪音乐数据库或歌单，请先导入/确认歌单。".to_string()
+        } else {
+            text
+        };
+        return Err(msg);
+    }
+    Ok(text
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect())
+}
+
+/// 把文本以 UTF-8 写入用户选择的文件（配合前端保存对话框“另存为”）。
+#[tauri::command]
+fn save_text_file(path: String, content: String) -> Result<(), String> {
+    if path.trim().is_empty() {
+        return Err("保存路径为空".to_string());
+    }
+    std::fs::write(&path, content.as_bytes()).map_err(|e| format!("写入文件失败: {e}"))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(TaskState::default())
         .invoke_handler(tauri::generate_handler![
             list_playlists,
@@ -570,7 +632,9 @@ pub fn run() {
             get_sources_dir,
             list_sources,
             import_source,
-            remove_source
+            remove_source,
+            export_songs,
+            save_text_file
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

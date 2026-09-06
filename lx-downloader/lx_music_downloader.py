@@ -1135,6 +1135,8 @@ def run():
     parser.add_argument('--api-dir', default=config['api_dir'], help=f'音源目录（默认 {USER_SOURCES_DIR}，可在 GUI「音源」页导入）')
     parser.add_argument('--exclude', default='', help='排除歌曲，使用逗号分隔的歌名或“歌手 - 歌名”')
     parser.add_argument('--max', type=int, default=0, help='最多下载数量（0=全部，用于测试）')
+    parser.add_argument('--export-songs', action='store_true',
+                        help='导出歌单歌曲清单为“歌手 - 歌名”（与 --playlist/-p 搭配；去重、按歌单原顺序）')
     args = parser.parse_args()
 
     # 自动探测数据库（支持官方版/便携版/fork/扩展名差异）；也支持导入 .lxmc 导出歌单
@@ -1189,6 +1191,25 @@ def run():
         songs = load_lxmc_songs(db_path, playlist_id)
     else:
         songs = get_songs(db_path, playlist_id)
+
+    # ---- 导出模式：直接输出“歌手 - 歌名”清单（去重、歌单原顺序），不进入下载流程 ----
+    if args.export_songs:
+        lines = []
+        seen = set()
+        for s in songs:
+            name = str(s.get('name', '') or '').strip()
+            if not name:
+                continue
+            singer = str(s.get('singer', '') or '').strip()
+            key = (norm_song_key(singer), norm_song_key(name))
+            if key in seen:
+                continue
+            seen.add(key)
+            lines.append(f'{singer} - {name}' if singer else name)
+        for line in lines:
+            print(line, flush=True)
+        return
+
     excluded = {x.strip().casefold() for x in args.exclude.split(',') if x.strip()}
     if excluded:
         songs = [s for s in songs if s['name'].casefold() not in excluded and f"{s['singer']} - {s['name']}".casefold() not in excluded]

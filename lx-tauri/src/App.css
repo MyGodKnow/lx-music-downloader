@@ -634,6 +634,40 @@ nav {
   word-break: break-all;
 }
 
+/* ===== 导出歌单页 ===== */
+.export-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.export-count {
+  font-size: 13px;
+  color: var(--text-dim);
+  margin-right: auto;
+}
+
+.export-box {
+  width: 100%;
+  min-height: 260px;
+  flex: 1;
+  resize: vertical;
+  background: var(--panel);
+  border: 1px solid var(--panel-border);
+  border-radius: var(--radius);
+  color: var(--text);
+  font-family: "Consolas", "Courier New", monospace;
+  font-size: 13px;
+  line-height: 1.7;
+  padding: 14px;
+  outline: none;
+}
+
+.export-box:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
 /* ===== 进度条 ===== */
 .progressbar-wrap {
   padding: 16px 30px 0;
