@@ -1,7 +1,22 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { save } from "@tauri-apps/plugin-dialog";
+import { open as openDialog, save } from "@tauri-apps/plugin-dialog";
+import { openUrl } from "@tauri-apps/plugin-opener";
+import {
+  BrandMark,
+  CopyIcon,
+  DiscIcon,
+  DownloadIcon,
+  ExportIcon,
+  ExternalLinkIcon,
+  FileTextIcon,
+  InfoIcon,
+  ListIcon,
+  PlugIcon,
+  SearchIcon,
+  SettingsIcon,
+} from "./icons";
 import "./App.css";
 
 interface Playlist {
@@ -15,7 +30,14 @@ interface LogLine {
   data: string;
 }
 
-type Tab = "playlists" | "download" | "export" | "sources" | "settings";
+type Tab =
+  | "playlists"
+  | "search"
+  | "download"
+  | "export"
+  | "sources"
+  | "settings"
+  | "about";
 
 const QUALITY_OPTIONS = [
   { value: "flac24bit", label: "Hi-Res 无损", hint: "FLAC 24bit" },
@@ -25,6 +47,19 @@ const QUALITY_OPTIONS = [
   { value: "128k", label: "标准", hint: "128k MP3" },
 ];
 
+/** 引擎 --search / --list-songs 返回的歌曲结构 */
+interface Song {
+  name: string;
+  singer: string;
+  source: string;
+  interval?: number | string | null;
+  id: string;
+  songmid?: string | null;
+  via?: string;
+  album?: string;
+  qualitys?: string[];
+}
+
 interface Progress {
   done: number;
   total: number;
@@ -33,6 +68,39 @@ interface Progress {
   skip: number;
   active?: number;
   speed?: number;
+}
+
+const AUTHOR = {
+  name: "MyGodKnow",
+  qq: "1973490065",
+  email: "114514woguizhidaoya@gmail.com",
+  repo: "https://github.com/MyGodKnow/lx-music-downloader",
+  issues: "https://github.com/MyGodKnow/lx-music-downloader/issues",
+};
+
+const SOURCE_LABELS: Record<string, string> = {
+  kw: "酷我",
+  wy: "网易云",
+  tx: "QQ音乐",
+  kg: "酷狗",
+  mg: "咪咕",
+};
+
+function sourceLabel(src: string) {
+  return SOURCE_LABELS[src] || src || "未知";
+}
+
+/** 把引擎返回的 interval（秒数或 mm:ss）统一成 mm:ss 展示 */
+function formatInterval(v: number | string | null | undefined): string {
+  if (v == null || v === "") return "—";
+  if (typeof v === "number" || /^\d+(\.\d+)?$/.test(String(v))) {
+    const total = Math.round(Number(v));
+    if (!total) return "—";
+    const m = Math.floor(total / 60);
+    const s = total % 60;
+    return `${m}:${String(s).padStart(2, "0")}`;
+  }
+  return String(v);
 }
 
 function App() {
@@ -54,21 +122,81 @@ function App() {
   const [progress, setProgress] = useState<Progress | null>(null);
   const logEndRef = useRef<HTMLDivElement>(null);
 
-  // 音源管理：用户自行导入的音源脚本（.js / .json）
+  // ===== 单曲搜索 =====
+  const [keyword, setKeyword] = useState("");
+  const [searching, setSearching] = useState(false);
+  const [results, setResults] = useState<Song[]>([]);
+  const [picked, setPicked] = useState<Set<string>>(new Set());
+  const [searchHint, setSearchHint] = useState("");
+
+  // ===== 歌单歌曲展开 =====
+  const [songs, setSongs] = useState<Song[]>([]);
+  const [songsOf, setSongsOf] = useState<string>("");
+  const [loadingSongs, setLoadingSongs] = useState(false);
+
+  // ===== 音源管理 =====
   const [sourceFiles, setSourceFiles] = useState<string[]>([]);
   const [sourcesDir, setSourcesDir] = useState("");
+  const [lxApiPath, setLxApiPath] = useState<string | null>(null);
+  const [importingLx, setImportingLx] = useState(false);
   const sourceInputRef = useRef<HTMLInputElement>(null);
 
-  // 导出歌单：歌曲清单（“歌手 - 歌名”每行一条）
+  // ===== 导出 =====
   const [exportLines, setExportLines] = useState<string[]>([]);
   const [exporting, setExporting] = useState(false);
   const exportText = exportLines.join("\n");
 
-  // 首页自动加载歌单
+  const addLog = useCallback((kind: LogLine["kind"], data: string) => {
+    setLogs((prev) => [...prev, { kind, data }]);
+    if (kind === "done") setRunning(false);
+  }, []);
+
+  const handleLog = useCallback(
+    (line: LogLine) => {
+      setLogs((prev) => [...prev, line]);
+      if (line.kind === "done") setRunning(false);
+    },
+    [],
+  );
+
+  const loadPlaylists = useCallback(async () => {
+    setLoadingPl(true);
+    try {
+      const pls = await invoke<Playlist[]>("list_playlists", {
+        db: dbPath || null,
+        python: pythonPath || null,
+      });
+      setPlaylists(pls);
+      setSelected((cur) => (cur && pls.some((p) => p.id === cur) ? cur : pls[0]?.id ?? ""));
+      addLog("info", `成功读取 ${pls.length} 个歌单`);
+    } catch (err) {
+      setPlaylists([]);
+      addLog("error", String(err));
+    } finally {
+      setLoadingPl(false);
+    }
+  }, [dbPath, pythonPath, addLog]);
+
+  const refreshSources = useCallback(async () => {
+    try {
+      const [files, dirPath, lxPath] = await Promise.all([
+        invoke<string[]>("list_sources"),
+        invoke<string>("get_sources_dir"),
+        invoke<string | null>("find_lx_desktop_api"),
+      ]);
+      setSourceFiles(files);
+      setSourcesDir(dirPath);
+      setLxApiPath(lxPath);
+    } catch (err) {
+      addLog("error", String(err));
+    }
+  }, [addLog]);
+
+  // 首页自动加载
   useEffect(() => {
     loadPlaylists();
     refreshSources();
-  }, []);
+  }, [loadPlaylists, refreshSources]);
 
   useEffect(() => {
     logEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -78,16 +206,14 @@ function App() {
   useEffect(() => {
     let unH: (() => void) | undefined;
     (async () => {
-      unH = await listen<LogLine>("download-log", (e) => {
-        handleLog(e.payload);
-      });
+      unH = await listen<LogLine>("download-log", (e) => handleLog(e.payload));
     })();
     return () => {
       unH?.();
     };
-  }, []);
+  }, [handleLog]);
 
-  // 订阅进度事件（下载用）
+  // 订阅进度
   useEffect(() => {
     let unH: (() => void) | undefined;
     (async () => {
@@ -106,56 +232,61 @@ function App() {
     };
   }, []);
 
-  function handleLog(line: LogLine) {
-    setLogs((prev) => [...prev, line]);
-    if (line.kind === "done") setRunning(false);
-  }
-
-  async function loadPlaylists() {
-    setLoadingPl(true);
-    setLogs([]);
-    try {
-      const pls = await invoke<Playlist[]>("list_playlists", {
-        db: dbPath || null,
-        python: pythonPath || null,
-      });
-      setPlaylists(pls);
-      if (pls.length > 0) setSelected(pls[0].id);
-      addLog("info", `成功读取 ${pls.length} 个歌单`);
-    } catch (err) {
-      setPlaylists([]);
-      addLog("error", String(err));
-    } finally {
-      setLoadingPl(false);
-    }
-  }
-
-  function addLog(kind: LogLine["kind"], data: string) {
-    setLogs((prev) => [...prev, { kind, data }]);
-  }
-
   function clearLogs() {
     setLogs([]);
   }
 
-  async function startDownload() {
+  // ===================== 下载动作 =====================
+
+  function downloadArgs() {
+    return {
+      quality,
+      dir: dir || null,
+      workers,
+      fallback,
+      minQuality,
+      python: pythonPath || null,
+    };
+  }
+
+  async function startPlaylistDownload() {
     if (!selected) {
       addLog("error", "请先选择一个歌单");
       return;
     }
     setRunning(true);
     setProgress({ done: 0, total: 0, success: 0, fail: 0, skip: 0 });
-    addLog("info", `开始下载歌单…（音质 ${quality}，${workers > 0 ? workers + " 并发" : "自动并发"}）`);
+    const pl = playlists.find((p) => p.id === selected);
+    addLog("info", `开始下载歌单「${pl?.name ?? selected}」…（音质 ${quality}）`);
     try {
       await invoke("start_download", {
         playlist: selected,
-        quality,
-        dir: dir || null,
-        workers,
-        fallback,
-        minQuality,
         db: dbPath || null,
-        python: pythonPath || null,
+        ...downloadArgs(),
+      });
+    } catch (err) {
+      addLog("error", String(err));
+      setRunning(false);
+    }
+  }
+
+  /** 下载一组歌曲（搜索结果 / 歌单内单曲都走这里） */
+  async function downloadSongs(list: Song[], label: string) {
+    if (list.length === 0) return;
+    setRunning(true);
+    setProgress({ done: 0, total: 0, success: 0, fail: 0, skip: 0 });
+    addLog("info", `开始下载 ${list.length} 首（${label}），音质 ${quality}`);
+    try {
+      await invoke("download_songs", {
+        songs: list.map((s) => ({
+          name: s.name,
+          singer: s.singer,
+          source: s.source,
+          interval: s.interval ?? null,
+          id: s.id,
+          songmid: s.songmid ?? s.id,
+        })),
+        ...downloadArgs(),
       });
     } catch (err) {
       addLog("error", String(err));
@@ -165,30 +296,97 @@ function App() {
 
   async function stop() {
     try {
-      await invoke("stop_task");
-      addLog("info", "已请求停止当前任务");
+      addLog("info", "已请求停止，正在等待在途任务收尾…");
+      const mode = await invoke<string>("stop_task");
+      if (mode === "graceful") {
+        addLog("info", "任务已优雅停止：已完成的文件已保留，未完成的不写入正式文件");
+      } else if (mode === "killed") {
+        addLog("error", "引擎未在超时内退出，已强制结束进程（可能残留 .part 临时文件）");
+      }
       setRunning(false);
     } catch (err) {
       addLog("error", String(err));
     }
   }
 
-  async function refreshSources() {
+  // ===================== 搜索 =====================
+
+  async function doSearch() {
+    const kw = keyword.trim();
+    if (!kw) {
+      addLog("error", "请输入歌名或「歌手 歌名」");
+      return;
+    }
+    setSearching(true);
+    setResults([]);
+    setPicked(new Set());
+    setSearchHint("");
+    addLog("info", `搜索「${kw}」…`);
     try {
-      const [files, dir] = await Promise.all([
-        invoke<string[]>("list_sources"),
-        invoke<string>("get_sources_dir"),
-      ]);
-      setSourceFiles(files);
-      setSourcesDir(dir);
+      const list = await invoke<Song[]>("search_songs", {
+        keyword: kw,
+        limit: 30,
+        python: pythonPath || null,
+      });
+      setResults(list);
+      if (list.length === 0) {
+        setSearchHint("没有找到结果，换个关键词试试（可用「歌手 歌名」）");
+        addLog("info", "搜索完成，没有匹配结果");
+      } else {
+        addLog("ok", `搜索完成，共 ${list.length} 个结果`);
+      }
     } catch (err) {
+      setSearchHint(String(err));
       addLog("error", String(err));
+    } finally {
+      setSearching(false);
     }
   }
 
+  function togglePick(key: string) {
+    setPicked((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  }
+
+  const songKey = (s: Song) => `${s.source}|${s.id}|${s.name}|${s.singer}`;
+
+  // ===================== 歌单歌曲 =====================
+
+  async function toggleSongs(playlistId: string) {
+    if (songsOf === playlistId) {
+      setSongsOf("");
+      setSongs([]);
+      return;
+    }
+    setLoadingSongs(true);
+    setSongs([]);
+    setSongsOf(playlistId);
+    try {
+      const list = await invoke<Song[]>("list_songs", {
+        playlist: playlistId,
+        db: dbPath || null,
+        python: pythonPath || null,
+      });
+      setSongs(list);
+      const pl = playlists.find((p) => p.id === playlistId);
+      addLog("info", `歌单「${pl?.name ?? playlistId}」共 ${list.length} 首`);
+    } catch (err) {
+      addLog("error", String(err));
+      setSongsOf("");
+    } finally {
+      setLoadingSongs(false);
+    }
+  }
+
+  // ===================== 音源 =====================
+
   async function onPickSource(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
-    e.target.value = ""; // 允许重复选择同一文件
+    e.target.value = "";
     if (!file) return;
     try {
       const text = await new Promise<string>((resolve, reject) => {
@@ -218,7 +416,35 @@ function App() {
     }
   }
 
-  // ===== 导出歌单：生成“歌手 - 歌名”清单（去重、歌单原顺序，由引擎完成） =====
+  /** 从落雪音乐桌面端导入音源（自动探测 user_api.json，也可手动选文件） */
+  async function importFromLxDesktop(manualPath?: string) {
+    setImportingLx(true);
+    try {
+      const names = await invoke<string[]>("import_lx_desktop_sources", {
+        path: manualPath ?? null,
+      });
+      addLog("ok", `已从落雪音乐导入 ${names.length} 个音源：${names.join("、")}`);
+      await refreshSources();
+    } catch (err) {
+      addLog("error", String(err));
+    } finally {
+      setImportingLx(false);
+    }
+  }
+
+  async function pickLxApiFile() {
+    const picked = await openDialog({
+      title: "选择落雪音乐的 user_api.json",
+      multiple: false,
+      filters: [{ name: "落雪音源", extensions: ["json"] }],
+    });
+    if (typeof picked === "string") {
+      await importFromLxDesktop(picked);
+    }
+  }
+
+  // ===================== 导出 =====================
+
   async function doExport() {
     if (!selected) {
       addLog("error", "请先选择一个歌单");
@@ -249,7 +475,6 @@ function App() {
       addLog("ok", "清单已复制到剪贴板");
       return;
     } catch {
-      // 开发模式（http://localhost）不是安全上下文，clipboard API 可能不可用，退回 DOM 方案
       try {
         const ta = document.createElement("textarea");
         ta.value = exportText;
@@ -274,7 +499,7 @@ function App() {
       defaultPath: `${pl?.name || "歌单"}.txt`,
       filters: [{ name: "文本文件", extensions: ["txt"] }],
     });
-    if (!path) return; // 用户取消
+    if (!path) return;
     try {
       await invoke("save_text_file", { path, content: exportText + "\n" });
       addLog("ok", `已保存: ${path}`);
@@ -283,34 +508,56 @@ function App() {
     }
   }
 
-  const logCount = logs.filter((l) => l.kind === "ok").length;
+  async function copyText(text: string, okMsg: string) {
+    try {
+      await navigator.clipboard.writeText(text);
+      addLog("ok", okMsg);
+    } catch {
+      addLog("error", "复制失败，请手动选择复制");
+    }
+  }
+
+  async function openExternal(url: string) {
+    try {
+      await openUrl(url);
+    } catch (err) {
+      addLog("error", `打开链接失败: ${err}`);
+    }
+  }
+
+  const okCount = logs.filter((l) => l.kind === "ok").length;
+  const pickedSongs = results.filter((s) => picked.has(songKey(s)));
+
+  const NAV: [Tab, string, React.ReactNode][] = [
+    ["playlists", "我的歌单", <ListIcon size={17} />],
+    ["search", "搜索单曲", <SearchIcon size={17} />],
+    ["download", "下载歌曲", <DownloadIcon size={17} />],
+    ["export", "导出歌单", <ExportIcon size={17} />],
+    ["sources", "音源", <PlugIcon size={17} />],
+    ["settings", "设置", <SettingsIcon size={17} />],
+    ["about", "关于", <InfoIcon size={17} />],
+  ];
 
   return (
     <div className="shell">
       <aside className="sidebar">
         <div className="brand">
-          <div className="brand-icon">♫</div>
+          <div className="brand-icon">
+            <BrandMark size={44} />
+          </div>
           <div className="brand-text">
             <h1>落雪下载</h1>
             <span>Lossless · 320k</span>
           </div>
         </div>
         <nav>
-          {(
-            [
-              ["playlists", "我的歌单"],
-              ["download", "下载歌曲"],
-              ["export", "导出歌单"],
-              ["sources", "音源"],
-              ["settings", "设置"],
-            ] as [Tab, string][]
-          ).map(([key, label]) => (
+          {NAV.map(([key, label, icon]) => (
             <button
               key={key}
               className={`nav-item ${tab === key ? "active" : ""}`}
               onClick={() => setTab(key)}
             >
-              <span className="nav-dot" />
+              <span className="nav-icon">{icon}</span>
               {label}
             </button>
           ))}
@@ -347,8 +594,8 @@ function App() {
                   : "准备中…"}
               </span>
               <span className="progress-stats">
-                <em className="st-ok">✓ {progress.success}</em>
-                <em className="st-fail">✗ {progress.fail}</em>
+                <em className="st-ok">成功 {progress.success}</em>
+                <em className="st-fail">失败 {progress.fail}</em>
                 <em className="st-skip">跳过 {progress.skip}</em>
                 {progress.active != null && progress.active > 0 && (
                   <em className="st-active">· 进行中 {progress.active}</em>
@@ -368,6 +615,7 @@ function App() {
         )}
 
         <div className="page">
+          {/* ==================== 我的歌单 ==================== */}
           {tab === "playlists" && (
             <section className="panel">
               <div className="panel-row">
@@ -386,7 +634,7 @@ function App() {
 
               <p className="hint">
                 也可以直接填入落雪导出的 <code>.lxmc</code> / <code>.json</code>{" "}
-                歌单文件路径读取。
+                歌单文件路径读取。点歌单卡片可展开歌曲列表，逐首下载。
               </p>
 
               {playlists.length > 0 && (
@@ -397,7 +645,7 @@ function App() {
                       className={`playlist-card ${selected === p.id ? "selected" : ""}`}
                       onClick={() => {
                         setSelected(p.id);
-                        setTab("download");
+                        toggleSongs(p.id);
                       }}
                     >
                       <div className="pl-art">{p.name.charAt(0)}</div>
@@ -413,9 +661,64 @@ function App() {
 
               {playlists.length === 0 && !loadingPl && (
                 <div className="empty">
-                  <div className="empty-icon">🎵</div>
+                  <div className="empty-icon">
+                    <DiscIcon size={44} />
+                  </div>
                   <p>暂时没有读取到歌单</p>
                   <p className="hint">请确认落雪音乐桌面版已运行，或手动填入数据库 / 歌单路径</p>
+                </div>
+              )}
+
+              {songsOf && (
+                <div className="song-panel">
+                  <div className="song-panel-head">
+                    <strong>
+                      {playlists.find((p) => p.id === songsOf)?.name ?? songsOf}
+                    </strong>
+                    <span className="hint">共 {songs.length} 首</span>
+                    <button
+                      className="primary-btn small"
+                      disabled={running || songs.length === 0}
+                      onClick={() =>
+                        downloadSongs(
+                          songs,
+                          `歌单「${playlists.find((p) => p.id === songsOf)?.name ?? songsOf}」`,
+                        )
+                      }
+                    >
+                      下载整张歌单
+                    </button>
+                    <button className="ghost-btn" onClick={() => setSongsOf("")}>
+                      收起
+                    </button>
+                  </div>
+                  {loadingSongs ? (
+                    <p className="hint">正在读取歌曲…</p>
+                  ) : (
+                    <div className="song-table">
+                      {songs.map((s, i) => (
+                        <div className="song-row" key={`${s.id}-${i}`}>
+                          <span className="song-idx">{i + 1}</span>
+                          <span className="song-name" title={s.name}>
+                            {s.name}
+                          </span>
+                          <span className="song-singer" title={s.singer}>
+                            {s.singer || "—"}
+                          </span>
+                          <span className="song-src">{sourceLabel(s.source)}</span>
+                          <span className="song-time">{formatInterval(s.interval)}</span>
+                          <button
+                            className="icon-btn"
+                            title="下载这首"
+                            disabled={running}
+                            onClick={() => downloadSongs([s], `单曲「${s.name}」`)}
+                          >
+                            <DownloadIcon size={16} />
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
                 </div>
               )}
 
@@ -423,6 +726,105 @@ function App() {
             </section>
           )}
 
+          {/* ==================== 搜索单曲 ==================== */}
+          {tab === "search" && (
+            <section className="panel">
+              <div className="panel-row">
+                <label className="field grow">
+                  <span>搜索歌曲（支持「歌手 歌名」，也可只输歌名）</span>
+                  <input
+                    value={keyword}
+                    onChange={(e) => setKeyword(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" && !searching) doSearch();
+                    }}
+                    placeholder="例如：周杰伦 晴天"
+                  />
+                </label>
+                <button className="primary-btn" onClick={doSearch} disabled={searching}>
+                  {searching ? "搜索中…" : "搜索"}
+                </button>
+                {picked.size > 0 && (
+                  <button
+                    className="primary-btn"
+                    disabled={running}
+                    onClick={() => downloadSongs(pickedSongs, "搜索结果选中项")}
+                  >
+                    下载选中 {picked.size} 首
+                  </button>
+                )}
+              </div>
+
+              <p className="hint">
+                搜索结果来自各平台音源；勾选后可批量下载，或直接点单曲右侧的下载按钮。
+                下载同样经过时长 / 版本词 / 歌手 / 音质四重校验。
+              </p>
+
+              {searchHint && <p className="hint">{searchHint}</p>}
+
+              {results.length > 0 && (
+                <div className="song-table">
+                  <div className="song-row song-row-head">
+                    <span className="song-idx" />
+                    <span className="song-name">歌名</span>
+                    <span className="song-singer">歌手</span>
+                    <span className="song-src">平台</span>
+                    <span className="song-time">时长</span>
+                    <span className="song-act">操作</span>
+                  </div>
+                  {results.map((s) => {
+                    const k = songKey(s);
+                    return (
+                      <div className="song-row" key={k}>
+                        <span className="song-idx">
+                          <input
+                            type="checkbox"
+                            checked={picked.has(k)}
+                            onChange={() => togglePick(k)}
+                            aria-label={`选择 ${s.name}`}
+                          />
+                        </span>
+                        <span className="song-name" title={s.name}>
+                          {s.name}
+                          {s.album ? <em className="song-album"> · {s.album}</em> : null}
+                        </span>
+                        <span className="song-singer" title={s.singer}>
+                          {s.singer || "—"}
+                        </span>
+                        <span className="song-src" title={s.via}>
+                          {sourceLabel(s.source)}
+                        </span>
+                        <span className="song-time">{formatInterval(s.interval)}</span>
+                        <span className="song-act">
+                          <button
+                            className="icon-btn"
+                            title="下载这首"
+                            disabled={running}
+                            onClick={() => downloadSongs([s], `单曲「${s.name}」`)}
+                          >
+                            <DownloadIcon size={16} />
+                          </button>
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+
+              {!searching && results.length === 0 && !searchHint && (
+                <div className="empty">
+                  <div className="empty-icon">
+                    <SearchIcon size={40} />
+                  </div>
+                  <p>输入歌名或「歌手 歌名」开始搜索</p>
+                </div>
+              )}
+
+              <LogView logs={logs} logEndRef={logEndRef} />
+            </section>
+          )}
+
+          {/* ==================== 下载歌曲（歌单） ==================== */}
           {tab === "download" && (
             <section className="panel">
               <div className="panel-row">
@@ -480,6 +882,8 @@ function App() {
                     onChange={(e) => setMinQuality(e.target.value)}
                     disabled={!fallback}
                   >
+                    <option value="128k">128k (标准)</option>
+                    <option value="192k">192k (较高)</option>
                     <option value="320k">320k (高品质)</option>
                     <option value="flac">flac (无损)</option>
                     <option value="flac24bit">flac24bit (Hi-Res)</option>
@@ -500,7 +904,7 @@ function App() {
               <div className="panel-row">
                 <button
                   className="primary-btn big"
-                  onClick={startDownload}
+                  onClick={startPlaylistDownload}
                   disabled={running || playlists.length === 0}
                 >
                   {running ? "正在下载…" : "开始下载"}
@@ -514,6 +918,7 @@ function App() {
             </section>
           )}
 
+          {/* ==================== 导出 ==================== */}
           {tab === "export" && (
             <section className="panel">
               <div className="panel-row">
@@ -548,7 +953,8 @@ function App() {
                   <div className="export-toolbar">
                     <span className="export-count">
                       共 {exportLines.length} 首
-                      {exportLines.length < (playlists.find((p) => p.id === selected)?.cnt ?? 0) &&
+                      {exportLines.length <
+                        (playlists.find((p) => p.id === selected)?.cnt ?? 0) &&
                         "（已按歌手+歌名去重）"}
                     </span>
                     <button className="ghost-btn" onClick={copyExport}>
@@ -567,7 +973,9 @@ function App() {
                 </>
               ) : (
                 <div className="empty">
-                  <div className="empty-icon">📄</div>
+                  <div className="empty-icon">
+                    <FileTextIcon size={44} />
+                  </div>
                   <p>点击「导出歌单txt」生成歌曲清单</p>
                 </div>
               )}
@@ -576,17 +984,49 @@ function App() {
             </section>
           )}
 
+          {/* ==================== 音源 ==================== */}
           {tab === "sources" && (
             <section className="panel">
+              <div className="lx-import-card">
+                <div className="lx-import-main">
+                  <div className="lx-import-title">
+                    <PlugIcon size={18} />
+                    从落雪音乐桌面端导入
+                  </div>
+                  <p className="hint">
+                    自动读取落雪音乐 App 里已添加的音源（
+                    <code>user_api.json</code>
+                    ），逐个解码后存入本程序音源目录，无需手工复制。
+                  </p>
+                  <code className="sources-dir">
+                    {lxApiPath ?? "未检测到落雪音乐的音源文件"}
+                  </code>
+                </div>
+                <div className="lx-import-actions">
+                  <button
+                    className="primary-btn"
+                    onClick={() => importFromLxDesktop()}
+                    disabled={importingLx || !lxApiPath}
+                    title={lxApiPath ? "从检测到的文件导入" : "未检测到落雪音源文件"}
+                  >
+                    {importingLx ? "导入中…" : "一键导入"}
+                  </button>
+                  <button className="ghost-btn" onClick={pickLxApiFile} disabled={importingLx}>
+                    手动选择文件
+                  </button>
+                </div>
+              </div>
+
               <div className="settings-grid">
                 <label className="field">
                   <span>音源目录（导入的音源保存在这里，不随程序更新丢失）</span>
                   <code className="sources-dir">{sourcesDir || "…"}</code>
                 </label>
               </div>
+
               <div className="sources-toolbar">
                 <button className="primary-btn" onClick={() => sourceInputRef.current?.click()}>
-                  导入音源
+                  导入音源文件
                 </button>
                 <button className="ghost-btn" onClick={refreshSources}>
                   刷新
@@ -599,16 +1039,17 @@ function App() {
                   onChange={onPickSource}
                 />
               </div>
+
               <div className="source-list">
                 {sourceFiles.length === 0 ? (
                   <p className="hint">
-                    尚未导入音源。下载前请先导入音源脚本（.js / .json，如落雪音源或导出的
-                    user_api.json），否则下载会提示“未找到音源”。
+                    尚未导入音源。可点上方「一键导入」从落雪音乐读取，或手动导入 .js / .json
+                    音源文件。没有音源时下载会提示「请先导入音源」。
                   </p>
                 ) : (
                   sourceFiles.map((name) => (
                     <div key={name} className="source-item">
-                      <span className="source-name">♪ {name}</span>
+                      <span className="source-name">{name}</span>
                       <button className="danger-btn" onClick={() => removeSource(name)}>
                         删除
                       </button>
@@ -619,11 +1060,12 @@ function App() {
             </section>
           )}
 
+          {/* ==================== 设置 ==================== */}
           {tab === "settings" && (
             <section className="panel">
               <div className="settings-grid">
                 <label className="field">
-                  <span>Python 可执行路径（默认使用系统 python）</span>
+                  <span>Python 可执行路径（默认使用内置引擎，一般无需填写）</span>
                   <input
                     value={pythonPath}
                     onChange={(e) => setPythonPath(e.target.value)}
@@ -637,17 +1079,108 @@ function App() {
                   <div className="stat-label">已加载歌单</div>
                 </div>
                 <div className="stat">
-                  <div className="stat-num">{logCount}</div>
-                  <div className="stat-label">成功条目</div>
+                  <div className="stat-num">{sourceFiles.length}</div>
+                  <div className="stat-label">已导入音源</div>
                 </div>
                 <div className="stat">
-                  <div className="stat-num">{logs.length}</div>
-                  <div className="stat-label">日志行数</div>
+                  <div className="stat-num">{okCount}</div>
+                  <div className="stat-label">成功条目</div>
                 </div>
               </div>
               <p className="hint">
-                本应用复用已验证的 Python 下载引擎：多源搜索桥接、下载内容音质校验（无损/320k+）、
-                版本词与歌手校验等能力均保留。
+                本应用复用已验证的 Python 下载引擎：多源搜索桥接、下载内容音质校验、
+                版本词与歌手校验等能力均保留。下载目录留空时使用引擎默认目录。
+              </p>
+            </section>
+          )}
+
+          {/* ==================== 关于 ==================== */}
+          {tab === "about" && (
+            <section className="panel">
+              <div className="about-hero">
+                <div className="about-avatar-wrap">
+                  <img
+                    className="about-avatar"
+                    src="/avatar/author-460.jpg"
+                    alt="作者头像"
+                    width={96}
+                    height={96}
+                    loading="lazy"
+                  />
+                  <BrandMark size={34} className="about-avatar-badge" />
+                </div>
+                <div>
+                  <h3>落雪下载</h3>
+                  <p className="hint">
+                    读取落雪音乐歌单，多音源批量下载无损音乐。个人学习与研究用途。
+                  </p>
+                  <span className="about-version">v0.2.0</span>
+                </div>
+              </div>
+
+              <div className="about-grid">
+                <div className="about-card">
+                  <div className="about-card-title">作者</div>
+                  <div className="about-card-body">{AUTHOR.name}</div>
+                </div>
+                <div className="about-card">
+                  <div className="about-card-title">QQ</div>
+                  <div className="about-card-body about-row">
+                    <span>{AUTHOR.qq}</span>
+                    <button
+                      className="icon-btn"
+                      title="复制 QQ 号"
+                      onClick={() => copyText(AUTHOR.qq, "QQ 号已复制")}
+                    >
+                      <CopyIcon size={15} />
+                    </button>
+                  </div>
+                </div>
+                <div className="about-card wide">
+                  <div className="about-card-title">反馈邮箱</div>
+                  <div className="about-card-body about-row">
+                    <a href={`mailto:${AUTHOR.email}`} className="about-link">
+                      {AUTHOR.email}
+                    </a>
+                    <button
+                      className="icon-btn"
+                      title="复制邮箱"
+                      onClick={() => copyText(AUTHOR.email, "邮箱已复制")}
+                    >
+                      <CopyIcon size={15} />
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              <div className="about-feedback">
+                <p>
+                  遇到问题或有建议，欢迎通过<strong>邮箱</strong>或
+                  <strong>GitHub Issues</strong> 反馈。提交问题时请附上：操作步骤、
+                  日志区的报错内容、以及使用的音源名称。
+                </p>
+                <div className="about-actions">
+                  <button
+                    className="primary-btn"
+                    onClick={() => openExternal(AUTHOR.issues)}
+                  >
+                    <ExternalLinkIcon size={15} /> 打开 GitHub Issues
+                  </button>
+                  <button
+                    className="ghost-btn"
+                    onClick={() => openExternal(`mailto:${AUTHOR.email}`)}
+                  >
+                    发送邮件
+                  </button>
+                  <button className="ghost-btn" onClick={() => openExternal(AUTHOR.repo)}>
+                    项目仓库
+                  </button>
+                </div>
+              </div>
+
+              <p className="hint about-legal">
+                本工具不包含任何音乐内容，也不分发第三方音源脚本。请自行确认所用音源的
+                授权与合规性，下载内容仅限个人试听，请勿传播或用于商业用途，并支持正版。
               </p>
             </section>
           )}
@@ -660,15 +1193,23 @@ function App() {
 function tabTitle(tab: Tab): string {
   const map: Record<Tab, string> = {
     playlists: "我的歌单",
+    search: "搜索单曲",
     download: "下载歌曲",
     export: "导出歌单",
     sources: "音源",
     settings: "设置",
+    about: "关于",
   };
   return map[tab];
 }
 
-function LogView({ logs, logEndRef }: { logs: LogLine[]; logEndRef: React.RefObject<HTMLDivElement | null> }) {
+function LogView({
+  logs,
+  logEndRef,
+}: {
+  logs: LogLine[];
+  logEndRef: React.RefObject<HTMLDivElement | null>;
+}) {
   return (
     <div className="logbox">
       {logs.length === 0 ? (
