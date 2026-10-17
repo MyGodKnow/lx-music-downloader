@@ -112,6 +112,31 @@ QUALITY_OPTIONS = {
 }
 QUALITY_LABELS = {value[0]: value[1] for value in QUALITY_OPTIONS.values()}
 DOWNLOAD_STOP_EVENT = threading.Event()
+# GUI 优雅停止：Rust 侧写入该信号文件，本进程轮询到后走与 Ctrl+C 相同的收尾流程
+# （停止派发新任务 → 在途任务落盘 → 写 failed.txt），避免被直接强杀而留下 .part。
+STOP_FILE = None
+
+
+def watch_stop_file(path, interval=0.5):
+    """后台线程：轮询停止信号文件，出现即置位 DOWNLOAD_STOP_EVENT 并删除该文件。"""
+    global STOP_FILE
+    STOP_FILE = str(path)
+    stop_path = Path(STOP_FILE)
+
+    def _loop():
+        while not DOWNLOAD_STOP_EVENT.is_set():
+            try:
+                if stop_path.exists():
+                    safe_unlink(stop_path)
+                    request_stop()
+                    return
+            except OSError:
+                pass
+            time.sleep(interval)
+
+    t = threading.Thread(target=_loop, name='stop-file-watcher', daemon=True)
+    t.start()
+    return t
 
 
 # ============ 歌单导入（.lxmc / JSON） ============
@@ -289,6 +314,14 @@ class UrlServer:
         resp = self.request('searchByName', name=name, singer=singer, interval=interval)
         if resp.get('ok'):
             return resp.get('candidates', []) or []
+        raise RuntimeError(resp.get('error', '未知错误'))
+
+    def search_songs(self, keyword, limit=30):
+        """单曲搜索：返回歌曲元数据列表（不含直链）。
+        GUI「搜索」页用它列出候选，用户点某首时再走 get_urls 取链。"""
+        resp = self.request('searchSongs', keyword=keyword, limit=limit)
+        if resp.get('ok'):
+            return resp.get('songs', []) or []
         raise RuntimeError(resp.get('error', '未知错误'))
 
     def close(self):
@@ -665,9 +698,11 @@ def song_exists_in_dir(download_dir, singer, name):
     return None
 
 
-def download_with_candidates(candidates, dest_base, expected_interval=None, expected_singer=None):
+def download_with_candidates(candidates, dest_base, expected_interval=None, expected_singer=None,
+                             requested_quality='320k'):
     """尝试多个候选 URL；每个候选都独立临时文件，避免坏链接污染下一个候选。
     可传 expected_singer 做歌手标签校验，防止翻唱版冒充原唱。
+    requested_quality 决定音质校验门槛（请求 128k 就按 128k 验收，请求无损就必须真无损）。
     dest_base 为不含扩展名的目标路径；四重校验通过后按文件内容确定真实扩展名
     再落盘（URL 扩展名不可靠，避免把 FLAC 存成假 .mp3）。
     返回 (音质标签, 实际保存路径)。"""
@@ -686,12 +721,16 @@ def download_with_candidates(candidates, dest_base, expected_interval=None, expe
             if not artist_matches_downloaded(part_path, expected_singer):
                 safe_unlink(part_path)
                 raise RuntimeError('歌手不符(疑似翻唱版)')
-            if not verify_quality(part_path):
+            if not verify_quality(part_path, requested_quality):
                 safe_unlink(part_path)
-                raise RuntimeError('音质不达标(非无损且<320k)')
+                raise RuntimeError(f'音质不达标(低于 {requested_quality})')
             final_path = _path_with_ext(dest_base, detect_audio_ext(part_path))
             part_path.rename(final_path)
             return cand.get('quality', ''), str(final_path)
+        except InterruptedError:
+            # 用户停止：立刻放弃剩余候选并清掉半成品，不要继续试下一条链接。
+            safe_unlink(part_path)
+            raise
         except Exception as e:
             errors.append(f"{cand.get('quality', '?')}: {e}")
     # 清理残留 .part
@@ -700,9 +739,10 @@ def download_with_candidates(candidates, dest_base, expected_interval=None, expe
 
 
 def lower_quality_options(quality, min_quality='320k'):
-    """返回当前音质及其以下音质，按优先级从高到低排列；最低不降到 min_quality 以下（默认 320k，
-    绝不降级到 192k/128k）。min_quality 可取值 320k/flac/flac24bit，表示允许的最低档位。"""
-    ordered = ['320k', 'flac', 'flac24bit']  # 低 -> 高
+    """返回当前音质及其以下音质，按优先级从高到低排列；最低不降到 min_quality 以下。
+    min_quality 可取任意档位（128k/192k/320k/flac/flac24bit），表示允许的最低档位。
+    例：quality=flac, min_quality=192k → [flac, 320k, 192k]"""
+    ordered = ['128k', '192k', '320k', 'flac', 'flac24bit']  # 低 -> 高
     try:
         start = ordered.index(quality)
     except ValueError:
@@ -720,22 +760,63 @@ def lower_quality_options(quality, min_quality='320k'):
 # 伪 flac（低码率 MP3 换壳）、伴奏版、翻唱版在这里被统一拦截。
 
 
-def verify_quality(path):
-    """校验音频真实格式（按内容而非扩展名）：无损(FLAC/ALAC/APE/WAV)或码率>=320k 才通过。
-    伪 flac（实际是低码率 MP3/MP4）或无法解析的一律视为不达标。"""
+# 音质档位 → 要求的最低码率（bps）；None 表示必须是真无损。
+QUALITY_MIN_BITRATE = {
+    '128k': 128000,
+    '192k': 192000,
+    '320k': 320000,
+    'flac': None,
+    'flac24bit': None,
+}
+# 码率判定容差：VBR/V0 编码的实际平均码率常略低于标称 320k，放宽 5% 避免误杀。
+_BITRATE_TOLERANCE = 0.95
+# mutagen 中代表真无损的解析类型（小写类名）。
+_LOSSLESS_TYPE_NAMES = {
+    'flac', 'wave', 'aiff', 'monkeysaudio', 'wavpack', 'tak', 'trueaudio',
+    'dsf', 'dsdiff', 'als',
+}
+
+
+def quality_min_bitrate(quality):
+    """返回该音质档位要求的最低码率；None 表示必须是真无损。
+    未知档位按 320k 处理，避免拼写错误把门槛放低。"""
+    return QUALITY_MIN_BITRATE.get(str(quality or '').lower(), 320000)
+
+
+def is_lossless_audio(mf):
+    """按 mutagen 解析结果判断是否为真无损（FLAC/ALAC/APE/WAV/AIFF/WavPack…）。"""
+    if mf is None or getattr(mf, 'info', None) is None:
+        return False
+    from mutagen.flac import FLAC
+    if isinstance(mf, FLAC):
+        return True
+    codec = str(getattr(mf.info, 'codec', '') or '').lower()
+    if 'alac' in codec or 'flac' in codec or 'pcm' in codec:
+        return True
+    return type(mf).__name__.lower() in _LOSSLESS_TYPE_NAMES
+
+
+def verify_quality(path, quality='320k'):
+    """校验音频真实音质（按内容而非扩展名）。
+
+    规则：
+      - 请求 flac / flac24bit → 必须是真无损（伪 flac、低码率 MP3 一律拒绝）
+      - 请求 128k / 192k / 320k → 码率不低于对应档位（含 5% 容差）；
+        更高音质（含无损）同样通过，绝不因为“比要求的更好”而拒收
+    无法解析的文件一律视为不达标。
+    """
     try:
         from mutagen import File as MFile
-        from mutagen.flac import FLAC
         mf = MFile(path)
         if mf is None or mf.info is None:
             return False
-        if isinstance(mf, FLAC):
+        if is_lossless_audio(mf):
             return True
-        codec = getattr(mf.info, 'codec', None)
-        if codec and 'alac' in str(codec).lower():
-            return True
+        min_br = quality_min_bitrate(quality)
+        if min_br is None:
+            return False
         br = int(getattr(mf.info, 'bitrate', 0) or 0)
-        return br >= 320000
+        return br >= int(min_br * _BITRATE_TOLERANCE)
     except Exception:
         return False
 
@@ -951,8 +1032,60 @@ def artist_matches_downloaded(path, expected_singer):
 CONFIG_PATH = Path(os.environ.get('APPDATA', APP_DIR)) / 'lx-downloader-config.json'
 
 
+def _looks_mojibake(text):
+    """判断字符串是否像被错误编码过的乱码路径。
+
+    典型来源：中文路径经 GBK→UTF-8 双向误解码后残留「钀介洩闊充箰」这类生僻字串。
+    这类目录名不是用户有意创建的，出现即说明配置已被污染。
+    """
+    s = str(text or '')
+    if not s:
+        return False
+    # 中文 Windows 上被误解码的 UTF-8 字节常落在「钀 洩 闊 充 箰 涓 嬭 浇」这类生僻字区间；
+    # 用高密度生僻字 + 常见乱码字做判定，避免误伤正常中文目录。
+    mojibake_chars = '钀洩闊箰涓嬭浇鏂囦欢澶归煶涔愪笅杞戒腑鏂囦贡鐮佺殑鍒楄〃'
+    hits = sum(1 for ch in s if ch in mojibake_chars)
+    return hits >= 2
+
+
+def _dir_is_usable(path):
+    """判断下载目录是否可用。
+
+    判定顺序很重要：
+      1. 空值 → 不可用
+      2. 乱码路径 → 不可用。必须先于任何文件系统操作：乱码目录往往能被成功创建，
+         一旦先 mkdir，就会把“脏配置”误判成“可用目录”，并真的建出一个乱码目录
+      3. 已存在且可写 → 可用
+      4. 不存在但能创建（父目录存在或可逐级创建）→ 可用（首次下载允许自动创建）
+    """
+    text = str(path or '').strip()
+    if not text:
+        return False
+    if _looks_mojibake(text):
+        return False
+    try:
+        p = Path(text)
+        if p.exists():
+            if not p.is_dir():
+                return False
+            probe = p / '.lx-write-probe'
+            probe.write_bytes(b'')
+            safe_unlink(probe)
+            return True
+        # 尚未创建：尝试创建并写探针（父目录可逐级创建时才成功，
+        # 不存在的盘符 / 无权限路径会抛 OSError → 判为不可用）
+        p.mkdir(parents=True, exist_ok=True)
+        probe = p / '.lx-write-probe'
+        probe.write_bytes(b'')
+        safe_unlink(probe)
+        return True
+    except OSError:
+        return False
+
+
 def load_config():
-    """读取命令行菜单保存的设置；损坏或不存在时使用默认值。"""
+    """读取命令行菜单保存的设置；损坏或不存在时使用默认值。
+    读取时会自愈两类历史脏数据：乱码路径、指向已失效临时目录的音源目录。"""
     cpu_count = os.cpu_count() or 4
     defaults = {
         'db': DEFAULT_DB,
@@ -981,6 +1114,14 @@ def load_config():
     if not saved_api_dir or '_MEI' in saved_api_dir or not os.path.isdir(saved_api_dir):
         defaults['api_dir'] = USER_SOURCES_DIR
     defaults['fallback_quality'] = bool(defaults.get('fallback_quality', False))
+    # 下载目录自愈：早期版本曾把 GBK 乱码路径或临时目录写进配置，会导致
+    # 首次下载时凭空建出一个乱码目录。这里统一回落到默认下载目录并回写配置。
+    if not _dir_is_usable(defaults.get('dir')):
+        defaults['dir'] = DOWNLOAD_DIR
+        try:
+            save_config(defaults)
+        except OSError:
+            pass
     return defaults
 
 
@@ -1137,7 +1278,37 @@ def run():
     parser.add_argument('--max', type=int, default=0, help='最多下载数量（0=全部，用于测试）')
     parser.add_argument('--export-songs', action='store_true',
                         help='导出歌单歌曲清单为“歌手 - 歌名”（与 --playlist/-p 搭配；去重、按歌单原顺序）')
+    parser.add_argument('--stop-file', default=None,
+                        help='优雅停止信号文件（GUI 使用：该文件出现即收尾退出，不直接强杀进程）')
+    parser.add_argument('--search', default=None,
+                        help='单曲搜索：按关键词搜索歌曲，以 JSON 输出候选列表（不下载）')
+    parser.add_argument('--search-limit', type=int, default=30, help='单曲搜索返回条数上限（默认 30）')
+    parser.add_argument('--list-songs', action='store_true',
+                        help='以 JSON 输出指定歌单的歌曲列表（与 --playlist 搭配）')
+    parser.add_argument('--song-file', default=None,
+                        help='从 JSON 文件读取待下载歌曲列表（GUI 单曲下载用；绕过数据库/歌单）')
     args = parser.parse_args()
+
+    # GUI 优雅停止：先挂上信号文件监听，再做后续耗时操作。
+    if args.stop_file:
+        watch_stop_file(args.stop_file)
+
+    # ---- 单曲搜索模式：不需要数据库，先于一切数据库探测处理 ----
+    if args.search is not None:
+        return run_search(args)
+
+    # ---- 单曲下载模式：歌曲来自 --song-file，不需要数据库与歌单 ----
+    if args.song_file:
+        try:
+            songs = load_song_file(args.song_file)
+        except Exception as exc:
+            print(f'[错误] 读取歌曲文件失败: {exc}')
+            return 1
+        if not songs:
+            print('[错误] 歌曲文件里没有可下载的歌曲')
+            return 1
+        print(f'\n单曲下载：共 {len(songs)} 首歌曲')
+        return run_download(args, songs, db_path=None, title=None)
 
     # 自动探测数据库（支持官方版/便携版/fork/扩展名差异）；也支持导入 .lxmc 导出歌单
     db_path = detect_database(args.db)
@@ -1161,6 +1332,25 @@ def run():
         print('落雪音乐中的歌单：')
         for p in playlists:
             print(f'  [{p["id"]}] {p["name"]} ({p["cnt"]} 首)')
+        return
+
+    # ---- 列歌模式：以 JSON 输出指定歌单的歌曲（GUI 歌单页展开用） ----
+    if args.list_songs:
+        if not args.playlist:
+            print('[错误] --list-songs 需要搭配 --playlist', flush=True)
+            sys.exit(1)
+        songs = get_songs(db_path, args.playlist) if not is_lxmc_file(db_path) \
+            else load_lxmc_songs(db_path, args.playlist)
+        out = []
+        for s in songs:
+            out.append({
+                'name': s.get('name', ''),
+                'singer': s.get('singer', ''),
+                'source': s.get('source', ''),
+                'interval': s.get('interval', ''),
+                'id': str(s.get('id', '')),
+            })
+        print(json.dumps(out, ensure_ascii=False), flush=True)
         return
 
     # 选择歌单
@@ -1210,12 +1400,26 @@ def run():
             print(line, flush=True)
         return
 
+    if DOWNLOAD_STOP_EVENT.is_set():
+        print('[停止] 启动阶段收到停止请求，已退出。', flush=True)
+        return
+
     excluded = {x.strip().casefold() for x in args.exclude.split(',') if x.strip()}
     if excluded:
         songs = [s for s in songs if s['name'].casefold() not in excluded and f"{s['singer']} - {s['name']}".casefold() not in excluded]
     if args.max > 0:
         songs = songs[:args.max]
-    print(f'\n歌单「{pl["name"]}」共 {len(songs)} 首歌曲')
+    return run_download(args, songs, db_path=db_path, title=pl['name'])
+
+
+def run_download(args, songs, db_path=None, title=None):
+    """下载一批歌曲（歌单下载与单曲下载共用）。
+
+    songs: 与 get_songs() 同构的歌曲列表
+    db_path: 落雪数据库路径（用于查同名替代源）；单曲下载传 None
+    title: 歌单名（仅用于日志展示）；单曲下载传 None
+    """
+    print(f'\n歌单「{title}」共 {len(songs)} 首歌曲' if title else f'\n共 {len(songs)} 首歌曲')
     fallback_text = f"开启（最低降到 {args.min_quality}）" if args.fallback_quality else '关闭'
     print(f'音质: {args.quality} ({QUALITY_LABELS.get(args.quality, "")})  下载目录: {args.dir}')
     print(f'失败后自动降低音质（最低 {args.min_quality}）: {fallback_text}')
@@ -1234,6 +1438,9 @@ def run():
         print('      或用 --api / --api-dir 指定音源。导入后音源保存在 %APPDATA%\\lx-downloader-sources。')
         sys.exit(1)
     print(f'正在启动 {args.workers} 个并行音源服务...')
+    if DOWNLOAD_STOP_EVENT.is_set():
+        print('[停止] 启动阶段收到停止请求，已退出。', flush=True)
+        return
     # 每个工作线程使用独立 JSON-RPC 管道，避免单个全局锁把 URL 请求串行化。
     server_local = threading.local()
     servers = []
@@ -1267,6 +1474,7 @@ def run():
             if DOWNLOAD_STOP_EVENT.is_set():
                 return 'stopped'
             # 优先：按 歌手-歌名 匹配任意扩展名的已存在文件，存在则跳过
+            # （放在取音源服务之前：已下载的歌不该再拉起 Node 子进程）
             existing = song_exists_in_dir(download_dir, song['singer'], song['name'])
             if existing and existing.stat().st_size > 1024:
                 with print_lock:
@@ -1279,7 +1487,9 @@ def run():
             dest_base = download_dir / sanitize_filename(f"{song['singer']} - {song['name']}")
             # 尝试原源 + 替代源
             candidates_queue = [song]
-            candidates_queue += get_alternative_sources(db_path, song)
+            # 只有歌单下载（有数据库）才查同名替代源；单曲下载没有数据库上下文
+            if db_path:
+                candidates_queue += get_alternative_sources(db_path, song)
             if retry:
                 candidates_queue.reverse()
             tried_sources = set()
@@ -1304,7 +1514,9 @@ def run():
                             if not cands:
                                 raise RuntimeError('音源未返回任何链接')
                             _td = time.time()
-                            actual_q, _saved = download_with_candidates(cands, dest_base, song.get('interval'), song.get('singer'))
+                            actual_q, _saved = download_with_candidates(
+                                cands, dest_base, song.get('interval'), song.get('singer'),
+                                requested_quality=requested_quality)
                             _dl_cost += time.time() - _td
                             with print_lock:
                                 downgrade_note = f'，自动降级至 {requested_quality}' if requested_quality != args.quality else ''
@@ -1327,7 +1539,9 @@ def run():
                 if not cands:
                     raise RuntimeError('按名搜索无候选')
                 _td = time.time()
-                actual_q, _saved = download_with_candidates(cands, dest_base, song.get('interval'), song.get('singer'))
+                actual_q, _saved = download_with_candidates(
+                    cands, dest_base, song.get('interval'), song.get('singer'),
+                    requested_quality=args.quality)
                 _dl_cost += time.time() - _td
                 with print_lock:
                     print(f'[成功] {song["name"]} - {song["singer"]} [{actual_q}] (按名搜索)')
@@ -1349,6 +1563,7 @@ def run():
     with ThreadPoolExecutor(max_workers=worker_count) as pool:
         futures = {pool.submit(process_song, i, s): s for i, s in enumerate(songs)}
         total = len(songs)
+        stopped_early = False
         for i, fut in enumerate(as_completed(futures), 1):
             try:
                 result = fut.result()
@@ -1360,6 +1575,7 @@ def run():
                 for pending in futures:
                     if not pending.done():
                         pending.cancel()
+                stopped_early = True
                 break
             if result == 'success':
                 stats['success'] += 1
@@ -1398,6 +1614,11 @@ def run():
                 print(f'\r进度: {done}/{total} | 成功 {stats["success"]} | 失败 {stats["fail"]} | '
                       f'跳过 {stats["skip"]} | 进行中 {active} | 速率 {speed:.1f}首/秒', end='', flush=True)
     print()
+
+    # 停止时等待在途任务收尾：ThreadPoolExecutor 退出时会 join 所有运行中的任务，
+    # 这期间它们看到 STOP_EVENT 会立刻放弃剩余候选，把已下完的文件正常落盘。
+    if stopped_early and DOWNLOAD_STOP_EVENT.is_set():
+        print('[停止] 正在等待在途任务收尾（已下载的文件会保留）……', flush=True)
 
     for worker_server in servers:
         worker_server.close()
@@ -1468,6 +1689,84 @@ def run():
                 f.write(line + '\n')
         print(f'\n失败清单已追加到: {report_path}')
         print('提示：失败可能是音源临时不可用，稍后可重新运行本程序重试。')
+
+
+def run_search(args):
+    """单曲搜索模式：按关键词搜索歌曲，以 JSON 输出候选列表（不下载）。
+
+    输出为单行 JSON 数组，字段与 GUI 搜索结果表对应：
+      [{name, singer, source, interval, id, via, album, qualitys}]
+    出错时以 [错误] 前缀输出到 stderr 并返回非零码。
+    """
+    node_exe = args.node or find_node()
+    if not node_exe:
+        print('[错误] 未找到 Node.js，请安装或用 --node 指定路径')
+        return 1
+    missing = check_sources(args.api, args.api_dir)
+    if missing:
+        print(missing)
+        print('提示：请在 GUI「音源」页导入音源脚本后再搜索。')
+        return 1
+    server = None
+    try:
+        server = UrlServer(node_exe, args.api, args.api_dir).start()
+        songs = server.search_songs(args.search, max(1, args.search_limit))
+        print(json.dumps(songs, ensure_ascii=False), flush=True)
+        return 0
+    except Exception as exc:
+        print(f'[错误] 搜索失败: {exc}')
+        return 1
+    finally:
+        if server is not None:
+            server.close()
+
+
+def load_song_file(path):
+    """读取 GUI 传入的待下载歌曲 JSON（单曲下载用）。
+
+    支持两种形态：
+      - 单首：{"name": "...", "singer": "...", "source": "kw", ...}
+      - 多首：{"songs": [ {...}, {...} ]} 或直接 [...]
+    返回与 get_songs() 同构的歌曲列表（含 meta 字段）。
+    """
+    raw = Path(path).read_text(encoding='utf-8')
+    data = json.loads(raw)
+    if isinstance(data, dict) and 'songs' in data:
+        items = data['songs']
+    elif isinstance(data, dict):
+        items = [data]
+    elif isinstance(data, list):
+        items = data
+    else:
+        raise RuntimeError('歌曲文件格式无法识别')
+    songs = []
+    for s in items:
+        if not isinstance(s, dict):
+            continue
+        name = str(s.get('name', '') or '').strip()
+        if not name:
+            continue
+        singer = str(s.get('singer', '') or '').strip()
+        meta = {k: v for k, v in s.items()
+                if k not in ('name', 'singer', 'source', 'interval', 'meta') and v is not None}
+        if isinstance(s.get('meta'), dict):
+            meta.update(s['meta'])
+        # 兼容音源期望的 ID 字段名
+        sid = s.get('id') or s.get('songId') or s.get('songmid')
+        if sid is not None:
+            meta.setdefault('id', sid)
+            meta.setdefault('songId', sid)
+            if s.get('source') == 'tx':
+                meta.setdefault('songmid', str(sid))
+        songs.append({
+            'id': str(sid or ''),
+            'name': name,
+            'singer': singer,
+            'source': str(s.get('source', '') or ''),
+            'interval': s.get('interval', '') or '',
+            'meta': json.dumps(meta, ensure_ascii=False),
+        })
+    return songs
 
 
 def _write_crash_log(exc):

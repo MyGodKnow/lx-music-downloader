@@ -1,0 +1,100 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ===== 下载引擎（Python + Node 桥接）=====
+  engine:
+    name: 引擎测试
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: lx-downloader
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: 安装测试依赖
+        run: python -m pip install --upgrade pip mutagen
+
+      - name: Python 语法检查
+        run: python -m py_compile lx_music_downloader.py
+
+      - name: Node 桥接语法检查
+        run: node --check lx_url_server.js
+
+      - name: 单元测试
+        run: python -m unittest discover -s tests -v
+
+  # ===== 前端（React + TS）=====
+  frontend:
+    name: 前端构建
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: lx-tauri
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: lx-tauri/package-lock.json
+
+      - name: 安装依赖
+        run: npm ci
+
+      - name: 类型检查
+        run: npx tsc --noEmit
+
+      - name: 构建
+        run: npm run build
+
+  # ===== Rust 后端 =====
+  backend:
+    name: 后端测试
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: lx-tauri/src-tauri
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: lx-tauri/src-tauri
+
+      # engine.zip 是构建产物（gitignore），lib.rs 里 include_bytes! 需要它存在。
+      # CI 不验证打包，这里放一个占位 zip 让编译与测试可跑。
+      - name: 准备占位引擎包
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path engine | Out-Null
+          if (-not (Test-Path engine/engine.zip)) {
+            Set-Content -Path engine/engine.zip -Value "placeholder" -NoNewline -Encoding Byte
+          }
+
+      - name: 测试
+        run: cargo test --all-targets
+
+      - name: 静态检查
+        run: cargo clippy --all-targets -- -D warnings

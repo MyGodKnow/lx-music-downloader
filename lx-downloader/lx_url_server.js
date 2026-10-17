@@ -667,6 +667,245 @@ async function searchByName(name, singer, interval) {
   return { url: top[0].url, quality: top[0].quality || '320k', via: top[0].via, candidates: top };
 }
 
+// ========== 单曲搜索（GUI 搜索页） ==========
+// 只返回歌曲元数据，不预先取直链：搜索阶段追求「快 + 广」，
+// 取链交给用户点击下载时按所选歌曲精确进行（更省配额、也更准）。
+// 返回字段与 Python 端 get_music_info() 期望的 musicInfo 对齐，
+// 下载时可直接作为候选歌曲传给音源的 musicUrl。
+async function searchSongs(keyword, limit = 30) {
+  const kw = String(keyword || '').trim();
+  if (!kw) return [];
+  // 关键词里带空格时，第一段常是歌手（如「周杰伦 晴天」）
+  const parts = kw.split(/\s+/).filter(Boolean);
+  const guessSinger = parts.length > 1 ? parts[0] : '';
+  const guessName = parts.length > 1 ? parts.slice(1).join(' ') : kw;
+
+  const out = [];
+  const seen = new Set();
+  const keyOf = (s) => `${s.source}|${s.id}|${normKw(s.name)}|${normKw(s.singer)}`;
+  const deadline = Date.now() + 20000;
+
+  const push = (song, platform, via) => {
+    const name = songTitle(song);
+    const singer = songSinger(song);
+    if (!name) return;
+    const src = song.source || song.platform || song.from || platform;
+    const id = String(song.id || song.songId || song.songmid || song.hash || '');
+    const item = {
+      name,
+      singer,
+      source: src,
+      interval: songIntervalSeconds(song),
+      id,
+      songmid: song.songmid ? String(song.songmid) : id,
+      via: via || '',
+      album: song.albumName || song.album || '',
+      qualitys: (() => {
+        const qs = song.quality || song.qualitys || song._qualitys || {};
+        if (Array.isArray(qs)) return qs;
+        if (typeof qs === 'object' && qs) return Object.keys(qs);
+        return [];
+      })(),
+    };
+    const k = keyOf(item);
+    if (seen.has(k)) return;
+    seen.add(k);
+    out.push(item);
+  };
+
+  // 依次尝试各平台的 musicSearch（并发 3 个平台，避免 30 个音源串行太慢）
+  const platforms = ['kw', 'tx', 'wy', 'kg', 'mg'];
+  for (const platform of platforms) {
+    if (Date.now() > deadline) break;
+    if (out.length >= limit) break;
+    const entries = rankedHandlers().filter((e) => !sourceBlocked(e.name));
+    // 每个平台最多问前 4 个音源，够用且不拖慢
+    const batch = entries.slice(0, 4);
+    const results = await Promise.allSettled(batch.map(async (entry) => {
+      try {
+        const r = await callHandler(
+          entry, platform, 'musicSearch',
+          { musicInfo: { name: guessName, singer: guessSinger }, page: 1, type: 'song' },
+          6000,
+        );
+        const list = extractSongList(r);
+        if (list.length) noteSourceOk(entry.name);
+        return list.map((s) => ({ s, entry: entry.name }));
+      } catch (e) {
+        noteSourceFail(entry.name, true);
+        return [];
+      }
+    }));
+    for (const r of results) {
+      if (r.status !== 'fulfilled') continue;
+      for (const { s, entry } of r.value) {
+        // 关键词过滤：歌名或歌手命中即可（搜索页允许模糊）
+        const n = normKw(songTitle(s));
+        const sg = normKw(songSinger(s));
+        const k = normKw(kw);
+        const matched = !k
+          || n.includes(k) || k.includes(n)
+          || sg.includes(k) || k.includes(sg)
+          || n.includes(normKw(guessName))
+          || (guessSinger && sg.includes(normKw(guessSinger)));
+        if (!matched) continue;
+        push(s, platform, entry);
+        if (out.length >= limit) break;
+      }
+      if (out.length >= limit) break;
+    }
+  }
+
+  // 兜底：音源脚本的 musicSearch 常常失效（第三方接口易变），
+  // 这里改用不依赖音源脚本的直连搜索补齐结果，保证搜索页始终可用。
+  if (out.length < limit) {
+    try {
+      for (const s of await kuwoSearch(kw, limit)) {
+        push(s, 'kw', '酷我搜索');
+        if (out.length >= limit) break;
+      }
+    } catch (e) { /* 继续下一个源 */ }
+  }
+  if (out.length < limit) {
+    try {
+      for (const s of await neteaseSearch(kw)) {
+        push(s, 'wy', '网易云搜索');
+      }
+    } catch (e) { /* 继续 */ }
+  }
+  if (out.length === 0) {
+    try {
+      const list = await qqSearch(kw);
+      for (const hit of list) {
+        const name = hit.songname || hit.songName || '';
+        const singer = (hit.singer || []).map((x) => x.name || '').join('、');
+        if (!name) continue;
+        push({
+          name,
+          singer,
+          source: 'tx',
+          id: hit.songmid || '',
+          songmid: hit.songmid || '',
+          interval: hit.interval,
+          albumName: hit.albumname || '',
+        }, 'tx', 'QQ音乐搜索');
+        if (out.length >= limit) break;
+      }
+    } catch (e) { /* 兜底失败就返回已有结果 */ }
+  }
+
+  // 相关度排序：搜索接口常返回大量“翻唱/伴奏/无关”结果，
+  // 先按「歌名命中 + 歌手命中 + 时长合理」打分，再按平台交错，
+  // 保证用户一眼看到的就是最匹配的条目。
+  const kwNorm = normKw(kw);
+  const nameNorm = normKw(guessName);
+  const singerNorm = normKw(guessSinger);
+  const scoreOf = (s) => {
+    const n = normKw(s.name);
+    const sg = normKw(s.singer);
+    let score = 0;
+    if (n === nameNorm) score += 100;
+    else if (n.startsWith(nameNorm) || nameNorm.startsWith(n)) score += 70;
+    else if (n.includes(nameNorm)) score += 50;
+    else if (kwNorm && (n.includes(kwNorm) || kwNorm.includes(n))) score += 30;
+    if (singerNorm) {
+      if (sg === singerNorm) score += 60;
+      else if (sg.includes(singerNorm) || singerNorm.includes(sg)) score += 40;
+      else score -= 30; // 歌手不符，大幅劣后
+    }
+    // 明显的非原版标记：降权但不丢弃（用户可能确实想下伴奏/现场）
+    if (/伴奏|karaoke|カラオケ|instrument|off\s*vocal|纯音乐/i.test(s.name)) score -= 45;
+    if (/翻唱|cover|\(.*版\)|（.*版）/i.test(s.name)) score -= 20;
+    return score;
+  };
+  const ranked = out.map((s) => ({ s, score: scoreOf(s) }))
+    .sort((a, b) => b.score - a.score)
+    .map((x) => x.s);
+
+  // 平台交错排序：避免结果被某一个平台垄断（在相关度相近的头部结果之间交错）
+  const head = ranked.slice(0, 10);
+  const tail = ranked.slice(10);
+  const byPlatform = new Map();
+  for (const s of head) {
+    if (!byPlatform.has(s.source)) byPlatform.set(s.source, []);
+    byPlatform.get(s.source).push(s);
+  }
+  const interleaved = [];
+  const lists = [...byPlatform.values()];
+  for (let i = 0; interleaved.length < head.length; i++) {
+    let added = false;
+    for (const l of lists) {
+      if (i < l.length) { interleaved.push(l[i]); added = true; }
+    }
+    if (!added) break;
+  }
+  return interleaved.concat(tail).slice(0, limit);
+}
+
+// 酷我搜索（不依赖音源脚本的直连接口）：返回 {name,singer,id,interval,album}
+// 老接口返回单引号 JSON，且大量字段带 &nbsp; 实体，需要清洗。
+async function kuwoSearch(kw, limit = 20) {
+  const url = 'http://search.kuwo.cn/r.s?all=' + encodeURIComponent(kw)
+    + `&ft=music&itemset=web_2013&client=kt&pn=0&rn=${Math.max(1, limit)}&rformat=json&encoding=utf8`;
+  try {
+    const r = await doRequest(url, { method: 'GET' }, 12000);
+    const text = typeof r.body === 'string' ? r.body : String(r.body || '');
+    if (!text) return [];
+    // 单引号 JSON → 双引号；注意不要把内容里的引号也换掉
+    const norm = text.replace(/'/g, '"');
+    let data;
+    try { data = JSON.parse(norm); } catch (e) { return []; }
+    const list = Array.isArray(data.abslist) ? data.abslist : [];
+    const clean = (s) => String(s || '')
+      .replace(/&nbsp;/g, ' ')
+      .replace(/\\u0026/gi, '&')      // 酷我接口用 JSON 转义表示 &
+      .replace(/\\&/g, '&')           // 已解码但残留反斜杠的 &
+      .replace(/&amp;/g, '&')
+      .replace(/&apos;/g, "'")
+      .replace(/&quot;/g, '"')
+      .replace(/\s+/g, ' ')
+      .trim();
+    return list.map((s) => {
+      const rid = String(s.MUSICRID || s.DC_TARGETID || '').replace(/^MUSIC_/, '');
+      return {
+        name: clean(s.SONGNAME),
+        singer: clean(s.ARTIST),
+        source: 'kw',
+        id: rid,
+        songId: rid,
+        interval: Number(s.DURATION) || null,
+        album: clean(s.ALBUM),
+      };
+    }).filter((s) => s.name && s.id);
+  } catch (e) {
+    return [];
+  }
+}
+
+// 网易云搜索（oiapi 代理，不依赖音源脚本）：一次只返回一首，作为补充
+async function neteaseSearch(kw) {
+  try {
+    const r = await doRequest(
+      'https://oiapi.net/api/Music_163?name=' + encodeURIComponent(kw) + '&n=1&br=5',
+      { method: 'GET' }, 12000,
+    );
+    const d = r.body && r.body.data;
+    if (!d || !d.name) return [];
+    const singer = Array.isArray(d.singers) ? d.singers.map((x) => x.name || '').join('、') : '';
+    return [{
+      name: String(d.name),
+      singer,
+      source: 'wy',
+      id: String(d.id || ''),
+      songId: String(d.id || ''),
+      interval: Number(d.duration) || null,
+      album: d.album || '',
+    }];
+  } catch (e) {
+    return [];
+  }
+}
+
 // ========== 获取播放链接（多候选，带音源级冷却） ==========
 // 某个音源连续多次拿不到有效链接时，暂时跳过它（冷却），避免死源反复拖慢整体。
 const sourceCooldown = new Map(); // name -> { fails, until }
@@ -706,6 +945,13 @@ function bumpSource(name, delta) {
   sourceScore.set(name, Math.min(10, Math.max(-5, cur + delta)));
 }
 
+// 音质档位排序：用户明确请求 128k 时不应再把 128k 结果丢掉。
+const QUALITY_RANK = { '128k': 0, '192k': 1, '320k': 2, 'flac': 3, 'flac24bit': 4 };
+function qualityRank(q) {
+  const key = String(q || '').toLowerCase();
+  return Object.prototype.hasOwnProperty.call(QUALITY_RANK, key) ? QUALITY_RANK[key] : 2;
+}
+
 async function getMusicUrls(source, musicInfo, qualities) {
   if (!requestHandlers.length) throw new Error('音源未初始化: ' + (initError || 'unknown'));
   // 尝试目标音质，按"音源成功榜"优先尝试，拿够候选即停止（避免试满全部音源直到超时）
@@ -718,6 +964,7 @@ async function getMusicUrls(source, musicInfo, qualities) {
   const dlDeadline = Date.now() + 12000;
   const overDl = () => Date.now() > dlDeadline;
   for (const q of qList) {
+    const wantRank = qualityRank(q);
     for (const entry of rankedHandlers()) {
       if (overDl()) break;
       if (sourceBlocked(entry.name)) continue;
@@ -730,12 +977,16 @@ async function getMusicUrls(source, musicInfo, qualities) {
           url = result.url || (result.data && result.data.url) || (result.url && result.url.url);
         }
         if (url && /^https?:\/\//.test(url) && !seen.has(url)) {
-          // 下载器明确禁止 128k，忽略音源脚本内部回退出的 128k 结果。
+          // 只丢弃“比用户请求更低”的音源回退结果（例如请求无损却回退成 128k）；
+          // 用户明确请求 128k 时，128k 就是目标音质，不能拦。
           const resultQuality = result && typeof result === 'object'
             ? String(result.quality || result.level || result.br || '')
             : '';
-          if (q === '128k' || resultQuality.toLowerCase() === '128k' || resultQuality === '128') {
-            lastErr = new Error('已忽略 128k 音源结果');
+          const resultRank = resultQuality
+            ? qualityRank(resultQuality.replace(/\s*k$/i, 'k'))
+            : null;
+          if (wantRank > 0 && resultRank === 0) {
+            lastErr = new Error('已忽略低于请求档位的 128k 音源结果');
             continue;
           }
           seen.add(url);
@@ -857,6 +1108,11 @@ async function getMusicUrls(source, musicInfo, qualities) {
           }
         }
         process.stdout.write(JSON.stringify({ id: msg.id, ok: true, hits }) + '\n');
+      } else if (msg.cmd === 'searchSongs') {
+        // 单曲搜索：返回歌曲元数据列表（不取直链，取链在下载时按所选歌曲再做），
+        // 供 GUI「搜索」页展示与逐首下载。结果按 平台 → 音源 去重合并。
+        const songs = await searchSongs(msg.keyword || '', msg.limit || 30);
+        process.stdout.write(JSON.stringify({ id: msg.id, ok: true, songs }) + '\n');
       } else if (msg.cmd === 'ping') {
         process.stdout.write(JSON.stringify({ id: msg.id, ok: true, pong: true }) + '\n');
       } else {
