@@ -2038,12 +2038,15 @@ checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
 name = "lx-tauri"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
+ "base64 0.22.1",
  "encoding_rs",
+ "flate2",
  "regex",
  "serde",
  "serde_json",
+ "sha2",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",

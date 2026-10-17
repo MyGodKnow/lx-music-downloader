@@ -8,6 +8,8 @@ use tauri::{AppHandle, Emitter, State};
 #[derive(Default)]
 struct TaskState {
     child: Mutex<Option<Child>>,
+    /// 当前任务的“优雅停止”信号文件路径；停止时先写该文件让引擎自行收尾。
+    stop_file: Mutex<Option<std::path::PathBuf>>,
 }
 
 /// App 退出（窗口关闭）时也清理仍在运行的子进程树，避免遗留 python/node/ffmpeg。
@@ -71,13 +73,23 @@ fn engine_home() -> Option<std::path::PathBuf> {
     })
 }
 
-/// 确保内置引擎已释放到本地；版本变化（内嵌 zip 长度不同）时重新释放。
-/// 返回引擎 EXE 的完整路径。
+/// 内嵌引擎包的版本标识：用内容哈希而非 zip 长度。
+/// 长度只在“碰巧变了”时才变，内容微调（例如只改了 lx_url_server.js）可能长度不变，
+/// 会导致用户一直跑旧引擎；哈希则任何字节变化都会触发重新释放。
+fn engine_version() -> String {
+    let mut hasher = <sha2::Sha256 as sha2::Digest>::new();
+    sha2::Digest::update(&mut hasher, ENGINE_ZIP);
+    format!("{:x}", sha2::Digest::finalize(hasher))
+}
+
+/// 确保内置引擎已释放到本地；版本变化（内容哈希不同）时重新释放。
+/// 升级采用「解压到临时目录 → 目录交换」的方式：正在运行的旧引擎文件被占用时
+/// 也能完成升级，不会因为删不掉旧目录而卡在旧版本。
 fn ensure_engine() -> Result<std::path::PathBuf, String> {
     let dir = engine_home().ok_or_else(|| "无法定位 LOCALAPPDATA".to_string())?;
     let exe = dir.join("lx_music_downloader.exe");
-    let marker = dir.join(".engine_size");
-    let ver = ENGINE_ZIP.len().to_string();
+    let marker = dir.join(".engine_hash");
+    let ver = engine_version();
     let fresh = exe.is_file()
         && std::fs::read_to_string(&marker)
             .map(|v| v.trim() == ver)
@@ -85,13 +97,34 @@ fn ensure_engine() -> Result<std::path::PathBuf, String> {
     if fresh {
         return Ok(exe);
     }
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).map_err(|e| format!("创建引擎目录失败: {e}"))?;
+
+    // 解压到同级临时目录，成功后再替换正式目录
+    let staging = dir.with_extension("staging");
+    let backup = dir.with_extension("old");
+    let _ = std::fs::remove_dir_all(&staging);
+    std::fs::create_dir_all(&staging).map_err(|e| format!("创建引擎目录失败: {e}"))?;
     let cursor = std::io::Cursor::new(ENGINE_ZIP);
     let mut archive = zip::ZipArchive::new(cursor).map_err(|e| format!("内置引擎包损坏: {e}"))?;
-    archive.extract(&dir).map_err(|e| format!("释放内置引擎失败: {e}"))?;
-    std::fs::write(&marker, &ver).map_err(|e| format!("写入引擎版本标记失败: {e}"))?;
-    Ok(exe)
+    archive
+        .extract(&staging)
+        .map_err(|e| format!("释放内置引擎失败: {e}"))?;
+    std::fs::write(staging.join(".engine_hash"), &ver)
+        .map_err(|e| format!("写入引擎版本标记失败: {e}"))?;
+
+    // 目录交换：旧目录先挪开，再把新目录改名到位；最后尽力清理旧目录。
+    let _ = std::fs::remove_dir_all(&backup);
+    if dir.exists() {
+        std::fs::rename(&dir, &backup).map_err(|e| format!("替换引擎目录失败: {e}"))?;
+    }
+    std::fs::rename(&staging, &dir).map_err(|e| {
+        // 换名失败时尽量把旧目录挪回来，保证下次仍可启动
+        let _ = std::fs::rename(&backup, &dir);
+        format!("启用新引擎失败: {e}")
+    })?;
+    // 旧引擎可能仍被正在运行的进程占用，删不掉也无妨（下次启动会再试）
+    let _ = std::fs::remove_dir_all(&backup);
+
+    Ok(dir.join("lx_music_downloader.exe"))
 }
 
 /// 解析下载引擎命令，返回 (程序, 前置参数)：
@@ -277,6 +310,16 @@ fn run_command_output(
     }))
 }
 
+/// 优雅停止信号文件：GUI 点「停止」时由本进程写入，引擎侧轮询到后自行收尾
+/// （停止派发新任务 → 在途任务落盘 → 写 failed.txt → 正常退出）。
+/// 只有超过等待上限仍未退出时才强制杀进程树。
+fn stop_signal_path() -> std::path::PathBuf {
+    std::env::temp_dir().join("lx-downloader-stop.flag")
+}
+
+/// 等待引擎优雅退出的上限（秒）。超过则强制结束整棵进程树。
+const GRACEFUL_STOP_WAIT_SECS: u64 = 20;
+
 /// 组装命令行，启动子进程并起读取线程推日志。
 /// engine = (程序, 前置参数)：内置引擎直接执行 EXE；开发模式为 python + 脚本。
 fn spawn_task(
@@ -293,8 +336,15 @@ fn spawn_task(
         }
     }
 
+    // 清理上一次运行残留的停止信号，避免新任务一启动就被当成“停止”。
+    let stop_path = stop_signal_path();
+    let _ = std::fs::remove_file(&stop_path);
+
     let mut cmd = Command::new(&engine.0);
-    cmd.args(&engine.1).args(&args);
+    cmd.args(&engine.1)
+        .args(&args)
+        .arg("--stop-file")
+        .arg(&stop_path);
     cmd.stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .stdin(Stdio::null());
@@ -311,6 +361,9 @@ fn spawn_task(
     let stderr = child.stderr.take().expect("no stderr");
     if let Ok(mut guard) = state.child.lock() {
         *guard = Some(child);
+    }
+    if let Ok(mut guard) = state.stop_file.lock() {
+        *guard = Some(stop_path);
     }
 
     // stdout（任务日志，流结束推 done）+ stderr（诊断）统一走分行读取线程
@@ -419,6 +472,8 @@ fn parse_playlists(stdout: &str) -> Result<Vec<Playlist>, String> {
 }
 
 /// 开始下载歌单。
+/// 参数较多是 Tauri 命令的固有形态（前端按名字逐个传），不宜合并成结构体。
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 fn start_download(
     _app: AppHandle,
@@ -478,14 +533,45 @@ fn start_download(
     spawn_task(_app, &state, "download-log", args, engine)
 }
 
-/// 停止当前任务。
+/// 停止当前任务：优先“优雅停止”（写信号文件让引擎自行收尾），超时才强杀进程树。
+/// 返回 "graceful" 或 "killed"，前端据此提示。
 #[tauri::command]
-fn stop_task(state: State<'_, TaskState>) -> Result<(), String> {
+fn stop_task(state: State<'_, TaskState>) -> Result<String, String> {
+    let stop_path = state
+        .stop_file
+        .lock()
+        .ok()
+        .and_then(|g| g.clone())
+        .unwrap_or_else(stop_signal_path);
+
     let mut guard = state.child.lock().map_err(|_| "状态锁失效".to_string())?;
-    if let Some(mut child) = guard.take() {
-        kill_process_tree(&mut child);
+    let Some(mut child) = guard.take() else {
+        return Ok("idle".to_string());
+    };
+
+    // 1) 写停止信号，交给引擎自己收尾（落盘 + 写失败清单 + 清理 .part）
+    let graceful = std::fs::write(&stop_path, b"stop\n").is_ok();
+
+    // 2) 等待引擎退出；期间持续 try_wait，退出即视为优雅停止成功
+    if graceful {
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(GRACEFUL_STOP_WAIT_SECS);
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => return Ok("graceful".to_string()),
+                Ok(None) => {}
+                Err(_) => break,
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(150));
+        }
     }
-    Ok(())
+
+    // 3) 兜底：超时仍未退出，强杀整棵进程树
+    kill_process_tree(&mut child);
+    Ok("killed".to_string())
 }
 
 // ============ 音源管理 ============
@@ -558,6 +644,140 @@ fn remove_source(file_name: String) -> Result<(), String> {
     Ok(())
 }
 
+// ============ 从落雪音乐桌面端导入音源 ============
+// 落雪桌面版把用户在 App 内添加的音源存在 %APPDATA%\lx-music-desktop\LxDatas\user_api.json，
+// 结构为 {"userApis":[{"name","version","author","script":"gz_<base64(zlib)>"|"<js>"}]}。
+// 这里把其中每个音源拆成独立的 .js 文件写入本程序的音源目录，
+// 这样引擎就能直接加载，无需用户手工复制。
+
+/// 落雪桌面版 user_api.json 的候选路径（官方版 / 便携版 / 中文目录名）。
+fn lx_desktop_api_candidates() -> Vec<std::path::PathBuf> {
+    let appdata = std::env::var_os("APPDATA").map(std::path::PathBuf::from);
+    let mut out = Vec::new();
+    if let Some(base) = appdata {
+        out.push(base.join("lx-music-desktop").join("LxDatas").join("user_api.json"));
+        out.push(base.join("lx-music-desktop").join("user_api.json"));
+        out.push(base.join("洛雪音乐").join("LxDatas").join("user_api.json"));
+    }
+    out
+}
+
+/// 探测落雪桌面版音源文件，返回存在的第一个路径。
+#[tauri::command]
+fn find_lx_desktop_api() -> Option<String> {
+    lx_desktop_api_candidates()
+        .into_iter()
+        .find(|p| p.is_file())
+        .map(|p| p.to_string_lossy().to_string())
+}
+
+/// 解码落雪音源脚本：gz_ 前缀是 base64(zlib(deflate))，其余为明文 JS。
+fn decode_lx_script(script: &str) -> Result<String, String> {
+    if let Some(rest) = script.strip_prefix("gz_") {
+        use base64::Engine;
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(rest.trim())
+            .map_err(|e| format!("音源 base64 解码失败: {e}"))?;
+        let mut out = Vec::new();
+        let mut decoder = flate2::read::ZlibDecoder::new(raw.as_slice());
+        std::io::Read::read_to_end(&mut decoder, &mut out)
+            .map_err(|e| format!("音源解压失败: {e}"))?;
+        String::from_utf8(out).map_err(|e| format!("音源不是合法 UTF-8: {e}"))
+    } else {
+        Ok(script.to_string())
+    }
+}
+
+/// 从落雪桌面端导入全部音源，返回导入的文件名列表。
+#[tauri::command]
+fn import_lx_desktop_sources(path: Option<String>) -> Result<Vec<String>, String> {
+    let src = match path {
+        Some(p) if !p.trim().is_empty() => std::path::PathBuf::from(p.trim()),
+        _ => lx_desktop_api_candidates()
+            .into_iter()
+            .find(|p| p.is_file())
+            .ok_or_else(|| "未找到落雪音乐桌面版的音源文件（user_api.json）。请先在落雪 App 内添加音源，或用「导入音源」手动选择文件。".to_string())?,
+    };
+    if !src.is_file() {
+        return Err(format!("文件不存在: {}", src.display()));
+    }
+    let raw = std::fs::read_to_string(&src).map_err(|e| format!("读取音源文件失败: {e}"))?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("音源文件不是合法 JSON: {e}"))?;
+    let apis = parsed
+        .get("userApis")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| "音源文件缺少 userApis 数组（可能不是落雪导出的 user_api.json）".to_string())?;
+    if apis.is_empty() {
+        return Err("落雪音源列表为空：请先在落雪音乐 App 内添加音源".to_string());
+    }
+
+    let dir = user_sources_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建音源目录失败: {e}"))?;
+
+    let mut imported = Vec::new();
+    let mut errors = Vec::new();
+    for (i, api) in apis.iter().enumerate() {
+        let name = api.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        let script = api.get("script").and_then(|v| v.as_str()).unwrap_or("");
+        if script.trim().is_empty() {
+            errors.push(format!("第 {} 个音源没有脚本内容", i + 1));
+            continue;
+        }
+        let js = match decode_lx_script(script) {
+            Ok(s) => s,
+            Err(e) => {
+                errors.push(format!("{}: {e}", if name.is_empty() { format!("第{}个", i + 1) } else { name.to_string() }));
+                continue;
+            }
+        };
+        // 文件名取音源名并做安全清理；重名时加序号
+        let base = if name.trim().is_empty() {
+            format!("lx-source-{}", i + 1)
+        } else {
+            name.trim().to_string()
+        };
+        let safe = sanitize_file_stem(&base);
+        let mut file_name = format!("{safe}.js");
+        let mut n = 2;
+        while dir.join(&file_name).exists() {
+            file_name = format!("{safe}-{n}.js");
+            n += 1;
+        }
+        std::fs::write(dir.join(&file_name), js)
+            .map_err(|e| format!("写入音源 {file_name} 失败: {e}"))?;
+        imported.push(file_name);
+    }
+
+    if imported.is_empty() {
+        return Err(if errors.is_empty() {
+            "没有可导入的音源".to_string()
+        } else {
+            format!("导入失败：{}", errors.join("；"))
+        });
+    }
+    Ok(imported)
+}
+
+/// 把任意字符串清理成安全的文件名主体（去掉 Windows 非法字符与控制字符）。
+fn sanitize_file_stem(raw: &str) -> String {
+    let cleaned: String = raw
+        .chars()
+        .map(|c| match c {
+            '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            c if (c as u32) < 0x20 => '_',
+            c => c,
+        })
+        .collect();
+    let trimmed = cleaned.trim().trim_matches('.').trim();
+    if trimmed.is_empty() {
+        "lx-source".to_string()
+    } else {
+        // 文件名过长会写入失败，截断到 80 字符
+        trimmed.chars().take(80).collect()
+    }
+}
+
 /// 导出歌单为“歌手 - 歌名”清单（去重、按歌单原顺序）。
 #[tauri::command]
 fn export_songs(
@@ -619,6 +839,205 @@ fn save_text_file(path: String, content: String) -> Result<(), String> {
     std::fs::write(&path, content.as_bytes()).map_err(|e| format!("写入文件失败: {e}"))
 }
 
+/// 单曲搜索结果（与引擎 --search 的 JSON 字段对应）。
+#[derive(Serialize, Clone, serde::Deserialize)]
+struct SearchSong {
+    name: String,
+    #[serde(default)]
+    singer: String,
+    #[serde(default)]
+    source: String,
+    #[serde(default)]
+    interval: Option<f64>,
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    songmid: Option<String>,
+    #[serde(default)]
+    via: String,
+    #[serde(default)]
+    album: String,
+    #[serde(default)]
+    qualitys: Vec<String>,
+}
+
+/// 歌单内歌曲（与引擎 --list-songs 的 JSON 字段对应）。
+#[derive(Serialize, Clone, serde::Deserialize)]
+struct SongItem {
+    name: String,
+    #[serde(default)]
+    singer: String,
+    #[serde(default)]
+    source: String,
+    #[serde(default)]
+    interval: String,
+    #[serde(default)]
+    id: String,
+}
+
+/// 单曲搜索：按关键词搜索歌曲，返回候选列表（不下载）。
+#[tauri::command]
+fn search_songs(
+    keyword: String,
+    limit: Option<usize>,
+    python: Option<String>,
+) -> Result<Vec<SearchSong>, String> {
+    validate_python(python.as_ref())?;
+    let kw = keyword.trim();
+    if kw.is_empty() {
+        return Err("搜索关键词不能为空".to_string());
+    }
+    reject_flag_prefix("搜索关键词", kw)?;
+    let n = limit.unwrap_or(30).clamp(1, 100);
+    let args = vec![
+        "--search".to_string(),
+        kw.to_string(),
+        "--search-limit".to_string(),
+        n.to_string(),
+    ];
+    let text = run_engine_json(python.as_ref(), args, 90, "搜索")?;
+    let list: Vec<SearchSong> =
+        serde_json::from_str(&text).map_err(|e| format!("解析搜索结果失败: {e}"))?;
+    Ok(list)
+}
+
+/// 列出指定歌单的全部歌曲（GUI 歌单页展开用）。
+#[tauri::command]
+fn list_songs(
+    playlist: String,
+    db: Option<String>,
+    python: Option<String>,
+) -> Result<Vec<SongItem>, String> {
+    validate_python(python.as_ref())?;
+    let pl = playlist.trim();
+    if pl.is_empty() {
+        return Err("歌单不能为空".to_string());
+    }
+    reject_flag_prefix("歌单 id", pl)?;
+    let mut args = vec![
+        "--playlist".to_string(),
+        pl.to_string(),
+        "--list-songs".to_string(),
+    ];
+    if let Some(d) = &db {
+        let t = d.trim();
+        if !t.is_empty() {
+            reject_flag_prefix("数据库路径", t)?;
+            args.push("--db".to_string());
+            args.push(t.to_string());
+        }
+    }
+    let text = run_engine_json(python.as_ref(), args, 60, "读取歌单歌曲")?;
+    let list: Vec<SongItem> =
+        serde_json::from_str(&text).map_err(|e| format!("解析歌曲列表失败: {e}"))?;
+    Ok(list)
+}
+
+/// 单曲/多曲下载：把选中的歌曲写入临时 JSON，交给引擎的 --song-file 模式下载。
+/// 走与歌单下载完全相同的管线（取链 → 四重校验 → 落盘 → 失败重试）。
+/// 参数较多是 Tauri 命令的固有形态（前端按名字逐个传），不宜合并成结构体。
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+fn download_songs(
+    app: AppHandle,
+    state: State<'_, TaskState>,
+    songs: Vec<serde_json::Value>,
+    quality: String,
+    dir: Option<String>,
+    workers: usize,
+    fallback: bool,
+    min_quality: Option<String>,
+    python: Option<String>,
+) -> Result<String, String> {
+    validate_python(python.as_ref())?;
+    if songs.is_empty() {
+        return Err("请先选择要下载的歌曲".to_string());
+    }
+    for (label, v) in [
+        ("下载目录", dir.as_deref().unwrap_or("").trim()),
+        ("min_quality", min_quality.as_deref().unwrap_or("").trim()),
+    ] {
+        if !v.is_empty() {
+            reject_flag_prefix(label, v)?;
+        }
+    }
+
+    // 写入临时歌曲文件（引擎读取后自行解析）
+    let tmp = std::env::temp_dir().join(format!(
+        "lx-download-songs-{}.json",
+        std::process::id()
+    ));
+    let payload = serde_json::json!({ "songs": songs });
+    std::fs::write(&tmp, serde_json::to_vec(&payload).unwrap_or_default())
+        .map_err(|e| format!("写入歌曲列表失败: {e}"))?;
+
+    let mut args = vec![
+        "--song-file".to_string(),
+        tmp.to_string_lossy().to_string(),
+        "--quality".to_string(),
+        quality,
+    ];
+    if let Some(d) = dir {
+        if !d.trim().is_empty() {
+            args.push("--dir".to_string());
+            args.push(d.trim().to_string());
+        }
+    }
+    if workers > 0 {
+        args.push("--workers".to_string());
+        args.push(workers.to_string());
+    }
+    if fallback {
+        args.push("--fallback-quality".to_string());
+        if let Some(mq) = min_quality {
+            if !mq.trim().is_empty() {
+                args.push("--min-quality".to_string());
+                args.push(mq.trim().to_string());
+            }
+        }
+    }
+    let engine = resolve_engine(python.as_ref());
+    spawn_task(app, &state, "download-log", args, engine)
+}
+
+/// 运行引擎并解析其 JSON 输出（取最后一行非空输出），供 search_songs / list_songs 复用。
+fn run_engine_json(
+    python: Option<&String>,
+    args: Vec<String>,
+    timeout_secs: u64,
+    action: &str,
+) -> Result<String, String> {
+    let (program, prefix) = resolve_engine(python);
+    let mut cmd = Command::new(&program);
+    cmd.args(&prefix).args(&args);
+    let out = match run_command_output(&mut cmd, timeout_secs) {
+        Ok(Some(o)) => o,
+        Ok(None) => return Err(format!("{action}超时（{timeout_secs}s），请稍后重试")),
+        Err(e) => return Err(e),
+    };
+    let text = decode_line(&out.stdout);
+    let stderr_text = decode_line(&out.stderr);
+    if !out.status.success() {
+        let msg = if text.trim().is_empty() { stderr_text } else { text };
+        return Err(if msg.trim().is_empty() {
+            format!("{action}失败")
+        } else {
+            msg.trim().to_string()
+        });
+    }
+    // 引擎可能先打印提示行，JSON 一定在最后一行
+    let line = text
+        .lines()
+        .rev()
+        .map(|l| l.trim())
+        .find(|l| !l.is_empty())
+        .ok_or_else(|| format!("{action}没有返回结果"))?;
+    if !line.starts_with('[') && !line.starts_with('{') {
+        return Err(format!("{action}返回了非 JSON 内容: {}", line.chars().take(120).collect::<String>()));
+    }
+    Ok(line.to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -633,9 +1052,247 @@ pub fn run() {
             list_sources,
             import_source,
             remove_source,
+            find_lx_desktop_api,
+            import_lx_desktop_sources,
+            search_songs,
+            list_songs,
+            download_songs,
             export_songs,
             save_text_file
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ===== 命令行注入防护 =====
+
+    #[test]
+    fn reject_flag_prefix_blocks_dash() {
+        assert!(reject_flag_prefix("歌单", "-rf").is_err());
+        assert!(reject_flag_prefix("歌单", "  --db").is_err());
+    }
+
+    #[test]
+    fn reject_flag_prefix_allows_normal_values() {
+        assert!(reject_flag_prefix("歌单", "love").is_ok());
+        assert!(reject_flag_prefix("目录", r"D:\Music").is_ok());
+        assert!(reject_flag_prefix("歌单", "").is_ok());
+    }
+
+    // ===== python 路径白名单 =====
+
+    #[test]
+    fn validate_python_accepts_empty() {
+        assert!(validate_python(None).is_ok());
+        assert!(validate_python(Some(&"   ".to_string())).is_ok());
+    }
+
+    #[test]
+    fn validate_python_rejects_missing_file() {
+        assert!(validate_python(Some(&r"C:\nope\python.exe".to_string())).is_err());
+    }
+
+    #[test]
+    fn validate_python_rejects_non_interpreter() {
+        // 存在的文件但不是解释器名 → 拒绝（防止任意命令执行）
+        let exe = std::env::current_exe().unwrap();
+        let path = exe.to_string_lossy().to_string();
+        assert!(validate_python(Some(&path)).is_err());
+    }
+
+    // ===== 音源文件名校验（目录穿越防护） =====
+
+    #[test]
+    fn validate_source_name_strips_paths() {
+        assert_eq!(validate_source_name(r"C:\evil\x.js").unwrap(), "x.js");
+        assert_eq!(validate_source_name("../../x.json").unwrap(), "x.json");
+    }
+
+    #[test]
+    fn validate_source_name_rejects_bad_ext() {
+        assert!(validate_source_name("evil.exe").is_err());
+        assert!(validate_source_name("noext").is_err());
+        assert!(validate_source_name("..").is_err());
+        assert!(validate_source_name("").is_err());
+    }
+
+    #[test]
+    fn validate_source_name_accepts_js_and_json() {
+        assert!(validate_source_name("音源 v1.2.js").is_ok());
+        assert!(validate_source_name("user_api.JSON").is_ok());
+    }
+
+    // ===== 歌单解析 =====
+
+    #[test]
+    fn parse_playlists_reads_engine_output() {
+        let out = "落雪音乐中的歌单：\n  [default] 默认列表 (531 首)\n  [love] 我的收藏 (227 首)\n";
+        let pls = parse_playlists(out).unwrap();
+        assert_eq!(pls.len(), 2);
+        assert_eq!(pls[0].id, "default");
+        assert_eq!(pls[0].name, "默认列表");
+        assert_eq!(pls[0].cnt, 531);
+        assert_eq!(pls[1].id, "love");
+        assert_eq!(pls[1].cnt, 227);
+    }
+
+    #[test]
+    fn parse_playlists_handles_names_with_spaces() {
+        let out = "  [userlist_1] 我的 私人 歌单 (12 首)\n";
+        let pls = parse_playlists(out).unwrap();
+        assert_eq!(pls[0].name, "我的 私人 歌单");
+        assert_eq!(pls[0].cnt, 12);
+    }
+
+    #[test]
+    fn parse_playlists_errors_when_empty() {
+        assert!(parse_playlists("no playlists here").is_err());
+    }
+
+    // ===== 日志解码 / 归类 =====
+
+    #[test]
+    fn decode_line_prefers_utf8() {
+        assert_eq!(decode_line("晴天 - 周杰伦".as_bytes()), "晴天 - 周杰伦");
+    }
+
+    #[test]
+    fn decode_line_falls_back_to_gbk() {
+        // GBK 编码的“中文”，不是合法 UTF-8
+        let (gbk, _, _) = encoding_rs::GBK.encode("中文");
+        assert_eq!(decode_line(&gbk), "中文");
+    }
+
+    #[test]
+    fn classify_log_uses_line_prefix() {
+        assert_eq!(classify_log("[错误] 失败"), "error");
+        assert_eq!(classify_log("[失败] 音质不达标"), "error");
+        assert_eq!(classify_log("  [致命错误] x"), "error");
+        assert_eq!(classify_log("[成功] 晴天 [flac]"), "ok");
+        assert_eq!(classify_log("[转换完成] x"), "ok");
+        assert_eq!(classify_log("[跳过] 已存在"), "info");
+        // 关键字出现在行中不应被误判为错误
+        assert_eq!(classify_log("下载 [错误] 已忽略"), "info");
+    }
+
+    #[test]
+    fn trim_end_strips_crlf() {
+        assert_eq!(trim_end(b"line\r\n"), b"line".to_vec());
+        assert_eq!(trim_end(b"line\n\n"), b"line".to_vec());
+        assert_eq!(trim_end(b"line"), b"line".to_vec());
+    }
+
+    // ===== 引擎版本标记 =====
+
+    #[test]
+    fn engine_version_is_stable_and_hex() {
+        let a = engine_version();
+        let b = engine_version();
+        assert_eq!(a, b, "同一份内嵌 zip 必须得到相同版本号");
+        assert_eq!(a.len(), 64, "SHA-256 十六进制应为 64 字符");
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn engine_version_changes_with_content() {
+        // 长度相同、内容不同也必须得到不同版本（这是改用哈希的原因）
+        let mut hasher = <sha2::Sha256 as sha2::Digest>::new();
+        sha2::Digest::update(&mut hasher, b"aaaa");
+        let h1 = format!("{:x}", sha2::Digest::finalize(hasher));
+        let mut hasher = <sha2::Sha256 as sha2::Digest>::new();
+        sha2::Digest::update(&mut hasher, b"bbbb");
+        let h2 = format!("{:x}", sha2::Digest::finalize(hasher));
+        assert_ne!(h1, h2);
+        assert_eq!(h1.len(), h2.len());
+    }
+
+    // ===== 落雪音源导入 =====
+
+    #[test]
+    fn decode_lx_script_plain_js() {
+        let js = "lx.on('request', () => {})";
+        assert_eq!(decode_lx_script(js).unwrap(), js);
+    }
+
+    #[test]
+    fn decode_lx_script_gz_prefix() {
+        // 构造 gz_ = base64(zlib(deflate(js))) 并验证能还原
+        use base64::Engine;
+        use std::io::Write;
+        let js = "const a = 1;";
+        let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(js.as_bytes()).unwrap();
+        let compressed = enc.finish().unwrap();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&compressed);
+        let decoded = decode_lx_script(&format!("gz_{b64}")).unwrap();
+        assert_eq!(decoded, js);
+    }
+
+    #[test]
+    fn decode_lx_script_rejects_bad_base64() {
+        assert!(decode_lx_script("gz_!!!not-base64!!!").is_err());
+    }
+
+    #[test]
+    fn sanitize_file_stem_strips_illegal_chars() {
+        assert_eq!(sanitize_file_stem("a/b:c*d?e\"f<g>h|i"), "a_b_c_d_e_f_g_h_i");
+        assert_eq!(sanitize_file_stem("音源 v1.2"), "音源 v1.2");
+    }
+
+    #[test]
+    fn sanitize_file_stem_handles_empty_and_dots() {
+        assert_eq!(sanitize_file_stem(""), "lx-source");
+        assert_eq!(sanitize_file_stem("   "), "lx-source");
+        assert_eq!(sanitize_file_stem("..."), "lx-source");
+    }
+
+    #[test]
+    fn sanitize_file_stem_truncates_long_names() {
+        let long = "音".repeat(200);
+        let out = sanitize_file_stem(&long);
+        assert_eq!(out.chars().count(), 80);
+    }
+
+    #[test]
+    fn lx_api_candidates_cover_known_layouts() {
+        let c = lx_desktop_api_candidates();
+        assert!(!c.is_empty());
+        assert!(c.iter().any(|p| p.to_string_lossy().contains("lx-music-desktop")));
+        assert!(c.iter().any(|p| p.to_string_lossy().ends_with("user_api.json")));
+    }
+
+    // ===== 引擎 JSON 输出解析 =====
+
+    #[test]
+    fn search_song_deserializes() {
+        let json = r#"[{"name":"晴天","singer":"周杰伦","source":"kw","interval":269,
+                       "id":"51685512","songmid":"51685512","via":"酷我搜索",
+                       "album":"","qualitys":[]}]"#;
+        let list: Vec<SearchSong> = serde_json::from_str(json).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].name, "晴天");
+        assert_eq!(list[0].interval, Some(269.0));
+        assert_eq!(list[0].id, "51685512");
+    }
+
+    #[test]
+    fn search_song_tolerates_missing_optional_fields() {
+        let json = r#"[{"name":"A","id":"1"}]"#;
+        let list: Vec<SearchSong> = serde_json::from_str(json).unwrap();
+        assert_eq!(list[0].singer, "");
+        assert_eq!(list[0].source, "");
+        assert_eq!(list[0].qualitys.len(), 0);
+    }
+
+    #[test]
+    fn song_item_deserializes() {
+        let json = r#"[{"name":"晴天","singer":"周杰伦","source":"kw",
+                       "interval":"04:29","id":"kw_1"}]"#;
+        let list: Vec<SongItem> = serde_json::from_str(json).unwrap();
+        assert_eq!(list[0].interval, "04:29");
+    }
 }
