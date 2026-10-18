@@ -148,20 +148,34 @@ function App() {
   const [exporting, setExporting] = useState(false);
   const exportText = exportLines.join("\n");
 
-  const addLog = useCallback((kind: LogLine["kind"], data: string) => {
-    setLogs((prev) => [...prev, { kind, data }]);
-    if (kind === "done") setRunning(false);
+  // 日志上限：批量下载 700+ 首会产出数千行，全量渲染 + 每行平滑滚动会明显掉帧。
+  // 只保留最近 MAX_LOGS 行（超出后丢弃最旧的），既不影响排障也保证流畅。
+  const MAX_LOGS = 800;
+  const pushLog = useCallback((line: LogLine) => {
+    setLogs((prev) => {
+      const next = prev.length >= MAX_LOGS ? prev.slice(prev.length - MAX_LOGS + 1) : prev.slice();
+      next.push(line);
+      return next;
+    });
   }, []);
+
+  const addLog = useCallback(
+    (kind: LogLine["kind"], data: string) => {
+      pushLog({ kind, data });
+      if (kind === "done") setRunning(false);
+    },
+    [pushLog],
+  );
 
   const handleLog = useCallback(
     (line: LogLine) => {
-      setLogs((prev) => [...prev, line]);
+      pushLog(line);
       if (line.kind === "done") {
         setRunning(false);
         setStopping(false);
       }
     },
-    [],
+    [pushLog],
   );
 
   const loadPlaylists = useCallback(async () => {
@@ -204,8 +218,18 @@ function App() {
     refreshSources();
   }, [loadPlaylists, refreshSources]);
 
+  // 自动滚到底部：节流到 200ms 一次，且只在用户没有手动上翻时滚动。
+  // 每条日志都 smooth scroll 会在批量下载时明显掉帧。
   useEffect(() => {
-    logEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    const box = logEndRef.current?.parentElement;
+    if (!box) return;
+    // 用户往上翻看历史时不打扰
+    const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 80;
+    if (!atBottom) return;
+    const timer = window.setTimeout(() => {
+      logEndRef.current?.scrollIntoView({ behavior: "auto", block: "end" });
+    }, 200);
+    return () => window.clearTimeout(timer);
   }, [logs]);
 
   // 订阅下载日志
