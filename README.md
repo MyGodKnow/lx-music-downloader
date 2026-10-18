@@ -6,6 +6,8 @@
 
 ---
 
+## 作者的话
+
 ## ⚠️ 法律与版权声明（请先阅读）
 
 本项目是一个**音乐下载工具**，本身不包含任何音乐内容，但会借助第三方「音源脚本」从各大音乐平台获取播放链接并下载音频文件。公开托管本仓库存在如下风险，请自行评估后再使用/传播：
@@ -28,7 +30,6 @@
 - **自定义音源**：也可在「音源」页手动导入音源脚本，保存在 `%APPDATA%\lx-downloader-sources\`
 - **四重校验**：时长 / 版本词 / 歌手标签 / 音质（按文件内容探测，非扩展名）
 - **失败重试**：全部失败歌曲二次重试，仍失败写入 `failed.txt`，可重跑补下
-- **优雅停止**：点「停止」会让引擎先收尾（在途任务落盘、写失败清单），超时才强制结束
 - **免安装 EXE**：内置 Python 引擎 + Node.js，双击即用
 
 ## 快速开始
@@ -66,11 +67,11 @@ python lx_music_downloader.py --playlist love --quality flac --dir D:/Music --wo
 
 ## 作者与反馈
 
-| 项目 | 信息 |
-|------|------|
-| 作者 | MyGodKnow |
-| QQ | 1973490065 |
-| 邮箱 | [114514woguizhidaoya@gmail.com](mailto:114514woguizhidaoya@gmail.com) |
+| 项目     | 信息                                                         |
+| -------- | ------------------------------------------------------------ |
+| 作者     | 我鬼知道（MyGodKnow）                                        |
+| QQ       | 1973490065                                                   |
+| 邮箱     | [114514woguizhidaoya@gmail.com](mailto:114514woguizhidaoya@gmail.com) |
 | 问题反馈 | [GitHub Issues](https://github.com/MyGodKnow/lx-music-downloader/issues) |
 
 遇到问题欢迎通过**邮箱**或 **GitHub Issues** 反馈。提交时请附上：操作步骤、日志区的报错内容、所用音源名称。
