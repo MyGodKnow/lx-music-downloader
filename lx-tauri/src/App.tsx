@@ -119,6 +119,8 @@ function App() {
 
   const [logs, setLogs] = useState<LogLine[]>([]);
   const [running, setRunning] = useState(false);
+  // 已发出停止信号、但引擎还在收尾；此期间禁止再起新任务
+  const [stopping, setStopping] = useState(false);
   const [progress, setProgress] = useState<Progress | null>(null);
   const logEndRef = useRef<HTMLDivElement>(null);
 
@@ -154,7 +156,10 @@ function App() {
   const handleLog = useCallback(
     (line: LogLine) => {
       setLogs((prev) => [...prev, line]);
-      if (line.kind === "done") setRunning(false);
+      if (line.kind === "done") {
+        setRunning(false);
+        setStopping(false);
+      }
     },
     [],
   );
@@ -221,7 +226,10 @@ function App() {
         try {
           const p = JSON.parse(e.payload) as Progress;
           setProgress(p);
-          if (p.done >= p.total) setRunning(false);
+          // 注意：进度到 100% 不代表进程已退出（还有二次重试、写失败清单）。
+          // 这里只标记「下载完成」，真正的 running 由 done 事件解除，
+          // 否则停止后引擎仍在收尾时按钮就会提前变为可点。
+          if (p.done >= p.total && p.total > 0) setStopping((s) => (s ? true : false));
         } catch {
           /* ignore badly-formed progress */
         }
@@ -297,13 +305,24 @@ function App() {
   async function stop() {
     try {
       addLog("info", "已请求停止，正在等待在途任务收尾…");
+      // 后端只做「写信号 + 立即返回」，不会阻塞界面；真正的等待在后台线程。
       const mode = await invoke<string>("stop_task");
-      if (mode === "graceful") {
-        addLog("info", "任务已优雅停止：已完成的文件已保留，未完成的不写入正式文件");
-      } else if (mode === "killed") {
-        addLog("error", "引擎未在超时内退出，已强制结束进程（可能残留 .part 临时文件）");
+      if (mode === "stopping") {
+        // 保持 running=true：引擎退出时会推 done 事件，那时才真正解除。
+        // 若这里立刻置 false，用户可能在收尾期间就点「开始下载」，
+        // 新旧任务会争抢同一个引擎目录与停止信号文件。
+        addLog("info", "停止信号已发出：引擎会先收尾（保留已下载文件、清理半成品），超时才强制结束");
+        setStopping(true);
+        return;
       }
+      if (mode === "killing") {
+        addLog("error", "停止信号写入失败，正在强制结束进程");
+        setStopping(true);
+        return;
+      }
+      addLog("info", "当前没有正在运行的任务");
       setRunning(false);
+      setStopping(false);
     } catch (err) {
       addLog("error", String(err));
     }
@@ -525,6 +544,18 @@ function App() {
     }
   }
 
+  // 停止的兜底：后端最多等 20s 后强杀，这里给 28s。
+  // 万一 done 事件因为进程被强杀而没送达，界面也不会永远卡在「正在停止」。
+  useEffect(() => {
+    if (!stopping) return;
+    const timer = window.setTimeout(() => {
+      setStopping(false);
+      setRunning(false);
+      addLog("error", "停止超时：已解除界面锁定，若仍有残留进程请重新开启应用");
+    }, 28000);
+    return () => window.clearTimeout(timer);
+  }, [stopping, addLog]);
+
   const okCount = logs.filter((l) => l.kind === "ok").length;
   const pickedSongs = results.filter((s) => picked.has(songKey(s)));
 
@@ -564,7 +595,7 @@ function App() {
         </nav>
         <div className="sidebar-foot">
           <span className={`status-dot ${running ? "pulse" : ""}`} />
-          {running ? "任务运行中" : "空闲"}
+          {stopping ? "正在停止…" : running ? "任务运行中" : "空闲"}
         </div>
       </aside>
 
@@ -578,8 +609,8 @@ function App() {
               </button>
             )}
             {running && (
-              <button className="danger-btn" onClick={stop}>
-                停止
+              <button className="danger-btn" onClick={stop} disabled={stopping}>
+                {stopping ? "正在停止…" : "停止"}
               </button>
             )}
           </div>
@@ -678,7 +709,7 @@ function App() {
                     <span className="hint">共 {songs.length} 首</span>
                     <button
                       className="primary-btn small"
-                      disabled={running || songs.length === 0}
+                      disabled={running || stopping || songs.length === 0}
                       onClick={() =>
                         downloadSongs(
                           songs,
@@ -710,7 +741,7 @@ function App() {
                           <button
                             className="icon-btn"
                             title="下载这首"
-                            disabled={running}
+                            disabled={running || stopping}
                             onClick={() => downloadSongs([s], `单曲「${s.name}」`)}
                           >
                             <DownloadIcon size={16} />
@@ -747,7 +778,7 @@ function App() {
                 {picked.size > 0 && (
                   <button
                     className="primary-btn"
-                    disabled={running}
+                    disabled={running || stopping}
                     onClick={() => downloadSongs(pickedSongs, "搜索结果选中项")}
                   >
                     下载选中 {picked.size} 首
@@ -799,7 +830,7 @@ function App() {
                           <button
                             className="icon-btn"
                             title="下载这首"
-                            disabled={running}
+                            disabled={running || stopping}
                             onClick={() => downloadSongs([s], `单曲「${s.name}」`)}
                           >
                             <DownloadIcon size={16} />
@@ -905,9 +936,9 @@ function App() {
                 <button
                   className="primary-btn big"
                   onClick={startPlaylistDownload}
-                  disabled={running || playlists.length === 0}
+                  disabled={running || stopping || playlists.length === 0}
                 >
-                  {running ? "正在下载…" : "开始下载"}
+                  {stopping ? "正在停止…" : running ? "正在下载…" : "开始下载"}
                 </button>
                 {playlists.length === 0 && (
                   <span className="hint">请先在「我的歌单」页加载歌单</span>

@@ -416,8 +416,20 @@ struct Playlist {
 }
 
 /// 探测数据库 / 导入歌单并返回可用歌单列表。
+///
+/// 该命令最多阻塞 60s（等引擎子进程）。Tauri 2 的同步命令占用主线程会冻结界面，
+/// 因此改为 async + spawn_blocking，把阻塞工作挪到线程池。
 #[tauri::command]
-fn list_playlists(db: Option<String>, python: Option<String>) -> Result<Vec<Playlist>, String> {
+async fn list_playlists(db: Option<String>, python: Option<String>) -> Result<Vec<Playlist>, String> {
+    tauri::async_runtime::spawn_blocking(move || list_playlists_blocking(db, python))
+        .await
+        .map_err(|e| format!("任务执行失败: {e}"))?
+}
+
+fn list_playlists_blocking(
+    db: Option<String>,
+    python: Option<String>,
+) -> Result<Vec<Playlist>, String> {
     validate_python(python.as_ref())?;
     if let Some(d) = &db {
         let t = d.trim();
@@ -533,8 +545,15 @@ fn start_download(
     spawn_task(_app, &state, "download-log", args, engine)
 }
 
-/// 停止当前任务：优先“优雅停止”（写信号文件让引擎自行收尾），超时才强杀进程树。
-/// 返回 "graceful" 或 "killed"，前端据此提示。
+/// 停止当前任务：先写停止信号让引擎自行收尾，后台线程等待，超时才强杀进程树。
+///
+/// 关键点：**绝不能在这个命令里同步等待**。
+/// Tauri 2 的同步命令运行在主线程，任何 sleep/轮询都会冻结整个窗口
+/// （表现就是「点停止后界面卡死，再点音源页无响应」）。
+/// 因此这里只做三件立刻返回的事：
+///   1. 把 child 从状态里取走（之后新任务不会再被它干扰）
+///   2. 写停止信号文件
+///   3. 交给后台线程去等 / 超时强杀
 #[tauri::command]
 fn stop_task(state: State<'_, TaskState>) -> Result<String, String> {
     let stop_path = state
@@ -544,34 +563,40 @@ fn stop_task(state: State<'_, TaskState>) -> Result<String, String> {
         .and_then(|g| g.clone())
         .unwrap_or_else(stop_signal_path);
 
-    let mut guard = state.child.lock().map_err(|_| "状态锁失效".to_string())?;
-    let Some(mut child) = guard.take() else {
+    // 只短暂持锁取出 child，随即释放，避免阻塞其它命令（如 list_sources）。
+    let child = {
+        let mut guard = state.child.lock().map_err(|_| "状态锁失效".to_string())?;
+        guard.take()
+    };
+    let Some(mut child) = child else {
         return Ok("idle".to_string());
     };
 
     // 1) 写停止信号，交给引擎自己收尾（落盘 + 写失败清单 + 清理 .part）
     let graceful = std::fs::write(&stop_path, b"stop\n").is_ok();
 
-    // 2) 等待引擎退出；期间持续 try_wait，退出即视为优雅停止成功
-    if graceful {
-        let deadline =
-            std::time::Instant::now() + std::time::Duration::from_secs(GRACEFUL_STOP_WAIT_SECS);
-        loop {
-            match child.try_wait() {
-                Ok(Some(_)) => return Ok("graceful".to_string()),
-                Ok(None) => {}
-                Err(_) => break,
+    // 2) 立即返回，等待与兜底强杀放到后台线程
+    std::thread::spawn(move || {
+        if graceful {
+            let deadline = std::time::Instant::now()
+                + std::time::Duration::from_secs(GRACEFUL_STOP_WAIT_SECS);
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) => return, // 引擎已自行退出
+                    Ok(None) => {}
+                    Err(_) => break,
+                }
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(150));
             }
-            if std::time::Instant::now() >= deadline {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(150));
         }
-    }
+        // 3) 兜底：超时仍未退出，强杀整棵进程树
+        kill_process_tree(&mut child);
+    });
 
-    // 3) 兜底：超时仍未退出，强杀整棵进程树
-    kill_process_tree(&mut child);
-    Ok("killed".to_string())
+    Ok(if graceful { "stopping" } else { "killing" }.to_string())
 }
 
 // ============ 音源管理 ============
@@ -689,8 +714,15 @@ fn decode_lx_script(script: &str) -> Result<String, String> {
 }
 
 /// 从落雪桌面端导入全部音源，返回导入的文件名列表。
+/// 解压大音源可能耗时，改 async + spawn_blocking 避免冻结界面。
 #[tauri::command]
-fn import_lx_desktop_sources(path: Option<String>) -> Result<Vec<String>, String> {
+async fn import_lx_desktop_sources(path: Option<String>) -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || import_lx_desktop_sources_impl(path))
+        .await
+        .map_err(|e| format!("任务执行失败: {e}"))?
+}
+
+fn import_lx_desktop_sources_impl(path: Option<String>) -> Result<Vec<String>, String> {
     let src = match path {
         Some(p) if !p.trim().is_empty() => std::path::PathBuf::from(p.trim()),
         _ => lx_desktop_api_candidates()
@@ -779,8 +811,19 @@ fn sanitize_file_stem(raw: &str) -> String {
 }
 
 /// 导出歌单为“歌手 - 歌名”清单（去重、按歌单原顺序）。
+/// 最多阻塞 60s（等引擎），改 async + spawn_blocking 避免冻结界面。
 #[tauri::command]
-fn export_songs(
+async fn export_songs(
+    playlist: String,
+    db: Option<String>,
+    python: Option<String>,
+) -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || export_songs_blocking(playlist, db, python))
+        .await
+        .map_err(|e| format!("任务执行失败: {e}"))?
+}
+
+fn export_songs_blocking(
     playlist: String,
     db: Option<String>,
     python: Option<String>,
@@ -876,8 +919,19 @@ struct SongItem {
 }
 
 /// 单曲搜索：按关键词搜索歌曲，返回候选列表（不下载）。
+/// 最多阻塞 90s（等引擎 + 网络），改 async + spawn_blocking 避免冻结界面。
 #[tauri::command]
-fn search_songs(
+async fn search_songs(
+    keyword: String,
+    limit: Option<usize>,
+    python: Option<String>,
+) -> Result<Vec<SearchSong>, String> {
+    tauri::async_runtime::spawn_blocking(move || search_songs_blocking(keyword, limit, python))
+        .await
+        .map_err(|e| format!("任务执行失败: {e}"))?
+}
+
+fn search_songs_blocking(
     keyword: String,
     limit: Option<usize>,
     python: Option<String>,
@@ -902,8 +956,19 @@ fn search_songs(
 }
 
 /// 列出指定歌单的全部歌曲（GUI 歌单页展开用）。
+/// 最多阻塞 60s，改 async + spawn_blocking 避免冻结界面。
 #[tauri::command]
-fn list_songs(
+async fn list_songs(
+    playlist: String,
+    db: Option<String>,
+    python: Option<String>,
+) -> Result<Vec<SongItem>, String> {
+    tauri::async_runtime::spawn_blocking(move || list_songs_blocking(playlist, db, python))
+        .await
+        .map_err(|e| format!("任务执行失败: {e}"))?
+}
+
+fn list_songs_blocking(
     playlist: String,
     db: Option<String>,
     python: Option<String>,
