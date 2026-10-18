@@ -33,20 +33,18 @@ cd lx-downloader
 #   └── node/node.exe
 
 # 2) 用 PyInstaller 冻结引擎（onedir，含 mutagen 与音源桥接）
-pyinstaller --onedir --collect-all mutagen ^
-  --add-data "lx_url_server.js;." ^
-  --add-data "sources;sources" ^
-  --add-data "_pack;." ^
-  lx_music_downloader.py
+#    spec 已固化上述参数，直接跑 spec 即可，避免手写参数漏项
+python -m PyInstaller --noconfirm --clean lx_music_downloader.spec
 
 # 3) 将 dist/lx_music_downloader 整体打 zip（zip 内文件在根级，不含外层目录）
 #    覆盖写入 lx-tauri/src-tauri/engine/engine.zip
 ```
 
 > 注意：
-> - `engine.zip` 内容根级结构需与 `lib.rs::ensure_engine()` 的预期一致（即解压后直接得到 `lx_music_downloader.exe`、`lx_url_server.js`、`sources/`、`node/`）。
+> - `engine.zip` 内容根级结构需与 `lib.rs::ensure_engine()` 的预期一致（即解压后直接得到 `lx_music_downloader.exe`、`_internal/lx_url_server.js`、`_internal/sources/`、`_internal/node/`）。
 > - **第三方音源不再随引擎捆绑**：引擎运行时默认从 `%APPDATA%\lx-downloader-sources\` 读取用户导入的音源。`sources/` 只是占位目录（含 `.gitkeep` 与 README），不包含任何音源脚本。
 > - 已移除 MP3 转换功能，引擎不再打包 ffmpeg。
+> - 打包前先跑测试：`python -m unittest discover -s tests -v`。
 
 ### 2. 编译 Tauri 发布版
 
@@ -67,9 +65,22 @@ copy target\release\lx-tauri.exe "..\落雪音乐下载器.exe"
 
 ## 引擎版本更新机制
 
-- `lib.rs::ensure_engine()` 以 **内嵌 zip 的长度** 作为版本标记写入 `%LOCALAPPDATA%\落雪下载\engine\.engine_size`
-- 每次重建引擎后 zip 长度变化，用户下次启动会自动重新释放新引擎
-- 因此：**只改前端/后端 Rust 代码，无需重打 engine.zip**；只改 Python 引擎/音源/Node/ffmpeg 时才需要重建引擎
+- `lib.rs::ensure_engine()` 以**内嵌 zip 的 SHA-256 内容哈希**作为版本标记，写入 `%LOCALAPPDATA%\落雪下载\engine\.engine_hash`
+- 任何字节变化（哪怕长度不变）都会触发重新释放；早期用「zip 长度」判断，内容微调时可能长度不变而卡在旧引擎
+- 升级采用「解压到 `engine.staging` → 旧目录改名为 `engine.old` → 新目录改名到位」的目录交换：
+  旧引擎文件被运行中的进程占用时也能完成升级，不会因删不掉旧目录而失败
+- 因此：**只改前端/后端 Rust 代码，无需重打 engine.zip**；只改 Python 引擎/音源/Node 时才需要重建引擎
+
+## 测试
+
+```bash
+cd lx-downloader && python -m unittest discover -s tests -v   # 引擎纯逻辑 33 项
+cd lx-tauri && npx tsc --noEmit                                # 前端类型检查
+cd lx-tauri/src-tauri && cargo test                            # 后端 17 项
+cd lx-tauri/src-tauri && cargo clippy --all-targets -- -D warnings
+```
+
+CI（`.github/workflows/ci.yml`）在 push / PR 时跑上述全部检查。
 
 ## 常见问题
 

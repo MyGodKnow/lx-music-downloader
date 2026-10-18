@@ -12,6 +12,7 @@ Desktop.ini
 __pycache__/
 *.pyc
 *.pyo
+.pytest_cache/
 
 # ============ PyInstaller 构建产物 ============
 lx-downloader/build/
