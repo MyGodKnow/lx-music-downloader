@@ -526,16 +526,28 @@ function urlLooksLossless(url) {
 
 // ========== 平台级并发限制 ==========
 // 多 worker 并发下载时，同一音乐平台的 API 会被瞬间打爆触发限流
-// （表现为所有音源同时"获取链接失败"）。这里按目标平台限制并发数：
-// 同一平台同时最多 PLATFORM_MAX_CONCURRENT 个请求，从源头避免把平台打挂。
-// 3 路在“不触发限流”与“够快”之间取平衡；若仍被限流可调低。
+// （表现为所有音源同时"获取链接失败"）。这里按目标平台限制并发数。
+//
+// 注意：该计数是**进程内**的。Python 每个下载线程各起一个 Node 进程，
+// 所以对平台的真实总并发 = workers × PLATFORM_MAX_CONCURRENT。
+// 之前设为 3，配合 16 workers 就是 48 路并发打同一平台，触发限流后
+// 每首歌都要排队重试，表现为「取链接耗时几十秒」。降到 2 更稳。
 const PLATFORM_MAX_CONCURRENT = 3;
 const platformActive = {};
+
+// 排队等待上限：绝不允许一首歌在「等平台槽位」上无限期挂着。
+// 超过上限直接放弃该源，让上层去试别的源/别的音质档。
+const PLATFORM_WAIT_MS = 8000;
+
 // 统一调用入口：带平台并发限制 + 超时兜底，替代所有裸 entry.handler.call(...)
 async function callHandler(entry, source, action, info, timeoutMs) {
   const key = source || 'kw';
+  const waitDeadline = Date.now() + PLATFORM_WAIT_MS;
   while ((platformActive[key] || 0) >= PLATFORM_MAX_CONCURRENT) {
-    await new Promise((r) => setTimeout(r, 60));
+    if (Date.now() > waitDeadline) {
+      throw new Error('平台排队超时');
+    }
+    await new Promise((r) => setTimeout(r, 40));
   }
   platformActive[key] = (platformActive[key] || 0) + 1;
   try {

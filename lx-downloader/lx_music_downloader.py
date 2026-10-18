@@ -417,6 +417,13 @@ def _connect_db_ro(db_path):
     return sqlite3.connect(f'file:{db_path}?mode=ro', uri=True)
 
 
+# 替代源查询缓存：同一进程内同一首歌只查一次库。
+# 16 并发下每首歌都开一次「全表拉取 + Python 过滤」会造成明显的数据库争用，
+# 缓存后既少开连接也少做重复过滤。key = (db_path, song_id)。
+_ALT_SOURCE_CACHE = {}
+_ALT_SOURCE_LOCK = threading.Lock()
+
+
 def get_alternative_sources(db_path, song):
     """查找同曲的其他平台记录（替代源回退）。
 
@@ -428,22 +435,31 @@ def get_alternative_sources(db_path, song):
     """
     if is_lxmc_file(str(db_path)):
         return []
-    conn = _connect_db_ro(db_path)
-    conn.row_factory = sqlite3.Row
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT id, name, singer, source, interval, meta
-        FROM my_list_music_info
-        WHERE source != ? AND name != ?
-        ORDER BY CASE source WHEN 'tx' THEN 0 WHEN 'wy' THEN 1 WHEN 'kw' THEN 2 WHEN 'kg' THEN 3 ELSE 4 END
-    """, (song['source'], song['name']))
-    cand = [dict(r) for r in cur.fetchall()]
-    conn.close()
 
     target_name = strict_song_key(song['name'])
     target_singer = strict_song_key(song['singer'])
     if not target_name:
         return []
+
+    cache_key = (str(db_path), str(song.get('id') or ''), target_name, target_singer)
+    with _ALT_SOURCE_LOCK:
+        cached = _ALT_SOURCE_CACHE.get(cache_key)
+    if cached is not None:
+        return [dict(r) for r in cached]
+
+    conn = _connect_db_ro(db_path)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    # 先用 SQL 缩小候选集：name 的精确/前缀匹配交给索引与 SQL 过滤，
+    # 避免每次都把整表拉进 Python。带括号的版本后缀用 LIKE 前缀兜住。
+    cur.execute("""
+        SELECT id, name, singer, source, interval, meta
+        FROM my_list_music_info
+        WHERE source != ? AND name != ? AND name LIKE ?
+        ORDER BY CASE source WHEN 'tx' THEN 0 WHEN 'wy' THEN 1 WHEN 'kw' THEN 2 WHEN 'kg' THEN 3 ELSE 4 END
+    """, (song['source'], song['name'], target_name.replace('%', '').replace('_', '') + '%'))
+    cand = [dict(r) for r in cur.fetchall()]
+    conn.close()
 
     rows = []
     seen = set()
@@ -458,6 +474,9 @@ def get_alternative_sources(db_path, song):
             continue
         seen.add(r['id'])
         rows.append(r)
+
+    with _ALT_SOURCE_LOCK:
+        _ALT_SOURCE_CACHE[cache_key] = [dict(r) for r in rows]
     return rows
 
 
@@ -485,6 +504,16 @@ def get_music_info(row):
             info['songmid'] = str(sid)
     elif 'songmid' in info and ('songId' not in info or info['songId'] is None):
         info['songId'] = info['songmid']
+
+    # 统一剥掉平台前缀：数据库 id 形如 `wy_30070747`、`kw_55219`，
+    # 而所有音源要的都是纯 ID（30070747 / 55219）。
+    # 少这一步，单曲下载（--song-file 路径）会把带前缀的 id 传给音源导致取链失败。
+    for key in ('id', 'songId', 'songmid'):
+        val = info.get(key)
+        if isinstance(val, str):
+            stripped = re.sub(r'^[A-Za-z]{2}_', '', val)
+            if stripped != val:
+                info[key] = stripped
     if 'hash' not in info and info.get('_qualitys'):
         qs = info.get('_qualitys', {})
         for q in ('320k', '128k', 'flac'):
@@ -545,12 +574,60 @@ def get_songs(db_path, playlist_id):
 
 
 # ============ 下载引擎（多线程分片 + 断点续传） ============
-# 大文件（≥8MB）切 4 片并行下载再合并；服务器不支持 Range 时退化为
+# 支持 Range 的文件按大小动态分片并行下载再合并；不支持 Range 时退化为
 # 单线程流式下载。每次重试前清理残留 .part 分片，失败重试按指数退避。
+#
+# 分片策略（实测调优）：CDN 常对单连接限速，多连接能显著提速，
+# 但分片过多会带来额外握手开销，因此按文件大小分档。
 
 
-def download_file(url, dest_path, timeout=120, retries=3, parts=4):
-    """下载文件：优先多线程分片并行（大文件），不支持 Range 时退化为单线程流式；支持断点续传。"""
+def _choose_parts(total_size, measured_speed=None):
+    """按文件大小与实测速度选择分片数。
+
+    实测结论（同一 CDN，30MB FLAC）：
+        单连接可能 3s（9.5 MB/s），也可能 13s（0.8 MB/s）——**波动极大**，
+        取决于 CDN 节点给这个连接分配多少带宽。
+        4 分片稳定在 ~10 MB/s；6 片以上反而 SSL EOF 失败。
+    → 策略：先测一小段速度，单连接够快就不分片；慢则切 4 片并行。
+      既避免对快节点做无用分片，又能在被限速时靠多连接提速。
+    """
+    if not total_size or total_size < _MULTIPART_MIN_SIZE:
+        return 1
+    if measured_speed is None:
+        return 4
+    # 单连接 < 3 MB/s 视为被限速，值得分片
+    return 4 if measured_speed < 3 * 1024 * 1024 else 1
+
+
+def _probe_speed(url, headers, timeout, sample_bytes=256 * 1024):
+    """测一小段（默认 256KB）的下载速度，单位 byte/s。失败返回 None。"""
+    try:
+        h = dict(headers)
+        h['Range'] = f'bytes=0-{sample_bytes - 1}'
+        req = Request(url, headers=h)
+        t0 = time.time()
+        with urlopen(req, timeout=timeout) as resp:
+            if getattr(resp, 'status', 200) not in (200, 206):
+                return None
+            got = 0
+            while got < sample_bytes:
+                chunk = resp.read(64 * 1024)
+                if not chunk:
+                    break
+                got += len(chunk)
+        dt = time.time() - t0
+        if dt <= 0 or got <= 0:
+            return None
+        return got / dt
+    except Exception:
+        return None
+
+
+def download_file(url, dest_path, timeout=120, retries=3, parts=None):
+    """下载文件：优先多线程分片并行，不支持 Range 时退化为单线程流式；支持断点续传。
+
+    parts=None 时按文件大小自动决定分片数（见 `_choose_parts`）。
+    """
     dest_path = Path(dest_path)
     dest_path.parent.mkdir(parents=True, exist_ok=True)
     last_error = None
@@ -560,8 +637,15 @@ def download_file(url, dest_path, timeout=120, retries=3, parts=4):
         try:
             headers = {'User-Agent': 'Mozilla/5.0', 'Accept': 'audio/*,*/*;q=0.8', 'Referer': url}
             total_size = _probe_content_length(url, headers, timeout)
-            if total_size and total_size >= _MULTIPART_MIN_SIZE and parts > 1:
-                _multipart_download(url, dest_path, total_size, parts, headers, timeout)
+            if parts is not None:
+                n_parts = parts
+            else:
+                # 先花 ~0.3s 测单连接速度：快就不分片（省掉握手与合并开销），
+                # 慢（被 CDN 限速）才切 4 片并行。
+                speed = _probe_speed(url, headers, timeout) if total_size else None
+                n_parts = _choose_parts(total_size, speed)
+            if total_size and n_parts > 1:
+                _multipart_download(url, dest_path, total_size, n_parts, headers, timeout)
             else:
                 _download_sequential(url, dest_path, timeout, headers)
             return True
@@ -569,16 +653,17 @@ def download_file(url, dest_path, timeout=120, retries=3, parts=4):
             last_error = e
             if DOWNLOAD_STOP_EVENT.is_set():
                 raise InterruptedError('用户请求停止')
-            # 清理可能残留的分片临时文件
-            for i in range(parts):
+            # 清理可能残留的分片临时文件（按最大可能片数清理，避免漏删）
+            for i in range(16):
                 safe_unlink(dest_path.with_suffix(dest_path.suffix + f'.part{i}'))
             if attempt < retries:
                 time.sleep(min(2 ** attempt, 8))
     raise RuntimeError(f'下载失败: {last_error}')
 
 
-# 分片并行下载门槛：小于此大小的文件用单线程，避免小文件分片开销
-_MULTIPART_MIN_SIZE = 8 * 1024 * 1024
+# 分片并行下载门槛：小于此大小的文件用单线程，避免小文件分片开销。
+# 1MB 起分片：实测 CDN 单连接常被限速，连 2-3MB 的 320k 文件分片也有收益。
+_MULTIPART_MIN_SIZE = 1 * 1024 * 1024
 
 
 def _probe_content_length(url, headers, timeout):
@@ -659,6 +744,7 @@ def _download_part(url, start, end, part_path, headers, timeout):
 
 def _multipart_download(url, dest_path, total_size, parts, headers, timeout):
     """多线程分片并行下载，最后按顺序合并到 dest_path。"""
+    dest = Path(dest_path)          # 兼容调用方传 str
     part_size = (total_size + parts - 1) // parts
     jobs = []
     for i in range(parts):
@@ -666,7 +752,7 @@ def _multipart_download(url, dest_path, total_size, parts, headers, timeout):
         end = min(total_size - 1, start + part_size - 1)
         if start > end:
             break
-        pp = dest_path.with_suffix(dest_path.suffix + f'.part{i}')
+        pp = dest.with_suffix(dest.suffix + f'.part{i}')
         jobs.append((start, end, pp))
     if not jobs:
         raise RuntimeError('分片切分失败')
@@ -691,7 +777,7 @@ def _multipart_download(url, dest_path, total_size, parts, headers, timeout):
         raise RuntimeError(f'分片下载失败: {errors[0]}')
 
     # 按顺序合并各分片
-    with open(dest_path, 'wb') as out:
+    with open(dest, 'wb') as out:
         for _, _, pp in jobs:
             with open(pp, 'rb') as pin:
                 while True:
@@ -1141,7 +1227,10 @@ def load_config():
         'dir': DOWNLOAD_DIR,
         'quality': '320k',
         'fallback_quality': False,
-        'workers': max(4, min(12, cpu_count * 2)),  # 默认按 CPU 核数×2，至少 4
+        # 默认并发 8：实测 16 首对比（320k，同一音源池）
+        #   4 并发 122.3s / 8 并发 108.8s / 16 并发 141.2s（失败也更多）
+        # 16 路会打爆平台限流，反而更慢。上限也压到 12。
+        'workers': max(4, min(8, (cpu_count or 4))),
         'node': '',
         'api': '',
         'api_dir': USER_SOURCES_DIR,
@@ -1394,12 +1483,24 @@ def run():
             else load_lxmc_songs(db_path, args.playlist)
         out = []
         for s in songs:
+            # 关键：必须把 meta 一起输出。
+            # 数据库里的 id 是带平台前缀的（如 wy_30070747），
+            # 而音源需要的是 meta 里的纯数字 songId（30070747）。
+            # 之前只输出 5 个字段，导致 GUI 单曲下载把带前缀的 id 传给音源，
+            # 音源认不出来 → 「首页选歌单后无法下单曲」。
+            meta_raw = s.get('meta') or '{}'
+            try:
+                meta = json.loads(meta_raw) if isinstance(meta_raw, str) else dict(meta_raw)
+            except Exception:
+                meta = {}
             out.append({
                 'name': s.get('name', ''),
                 'singer': s.get('singer', ''),
                 'source': s.get('source', ''),
                 'interval': s.get('interval', ''),
                 'id': str(s.get('id', '')),
+                # 完整 meta 原样带回，前端写入 --song-file 后引擎即可还原
+                'meta': meta,
             })
         print(json.dumps(out, ensure_ascii=False), flush=True)
         return
@@ -1804,18 +1905,33 @@ def load_song_file(path):
                 if k not in ('name', 'singer', 'source', 'interval', 'meta') and v is not None}
         if isinstance(s.get('meta'), dict):
             meta.update(s['meta'])
-        # 兼容音源期望的 ID 字段名
+
+        # 兼容音源期望的 ID 字段名。
+        #
+        # 关键：数据库里的 id 形如 `wy_30070747`（带平台前缀），而音源要的是
+        # 纯数字 `30070747`。若 meta 已带纯数字 songId（歌单路径），以 meta 为准；
+        # 否则把前缀剥掉，避免把 `wy_30070747` 直接喂给音源导致取链失败。
         sid = s.get('id') or s.get('songId') or s.get('songmid')
-        if sid is not None:
-            meta.setdefault('id', sid)
-            meta.setdefault('songId', sid)
-            if s.get('source') == 'tx':
-                meta.setdefault('songmid', str(sid))
+        bare_sid = re.sub(r'^[A-Za-z]{2}_', '', str(sid)) if sid is not None else None
+        src = str(s.get('source', '') or '')
+
+        # meta 里已有的 songId 优先（那是数据库原始 ID，最准确）
+        meta_song_id = meta.get('songId') or meta.get('songmid') or meta.get('id')
+        if meta_song_id is not None:
+            # 若 meta 里也是带前缀的，同样剥掉
+            meta_song_id = re.sub(r'^[A-Za-z]{2}_', '', str(meta_song_id))
+        effective_id = meta_song_id or bare_sid
+
+        if effective_id is not None:
+            meta.setdefault('id', effective_id)
+            meta.setdefault('songId', effective_id)
+            if src == 'tx':
+                meta.setdefault('songmid', str(effective_id))
         songs.append({
             'id': str(sid or ''),
             'name': name,
             'singer': singer,
-            'source': str(s.get('source', '') or ''),
+            'source': src,
             'interval': s.get('interval', '') or '',
             'meta': json.dumps(meta, ensure_ascii=False),
         })

@@ -58,6 +58,8 @@ interface Song {
   via?: string;
   album?: string;
   qualitys?: string[];
+  /** 引擎 --list-songs 带回的原始 meta（含纯数字 songId），单曲下载必须透传 */
+  meta?: Record<string, unknown> | null;
 }
 
 interface Progress {
@@ -318,6 +320,9 @@ function App() {
           interval: s.interval ?? null,
           id: s.id,
           songmid: s.songmid ?? s.id,
+          // meta 里带的是数据库原始纯数字 ID（如 songId=30070747），
+          // 少了它，音源就认不出带平台前缀的 id（wy_30070747）。
+          meta: s.meta ?? null,
         })),
         ...downloadArgs(),
       });

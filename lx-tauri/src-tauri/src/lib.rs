@@ -1117,6 +1117,9 @@ struct SearchSong {
 }
 
 /// 歌单内歌曲（与引擎 --list-songs 的 JSON 字段对应）。
+///
+/// `meta` 必须原样保留：数据库里的 id 是带平台前缀的（如 `wy_30070747`），
+/// 音源真正需要的是 meta 里的纯数字 songId。丢掉 meta 会让单曲下载取链失败。
 #[derive(Serialize, Clone, serde::Deserialize)]
 struct SongItem {
     name: String,
@@ -1128,6 +1131,8 @@ struct SongItem {
     interval: String,
     #[serde(default)]
     id: String,
+    #[serde(default)]
+    meta: serde_json::Value,
 }
 
 /// 单曲搜索：按关键词搜索歌曲，返回候选列表（不下载）。
