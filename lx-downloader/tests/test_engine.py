@@ -123,6 +123,64 @@ class FilenameTest(unittest.TestCase):
         base = Path('D:/Music/Mr.Chu')
         self.assertEqual(eng._path_with_ext(base, '.flac').name, 'Mr.Chu.flac')
 
+    # ===== 路径穿越防护（歌名/歌手来自不可信音源脚本）=====
+
+    def test_sanitize_never_yields_dot_dot(self):
+        for raw in ('..', '.', '...', '  ..  ', ' . . '):
+            got = eng.sanitize_filename(raw)
+            self.assertNotIn(got, ('.', '..'), f'{raw!r} 派生出目录语义 {got!r}')
+            self.assertTrue(got)
+
+    def test_sanitize_collapses_dot_runs(self):
+        # 连续点折叠成一个，避免 "..." 被某些系统当成 ".." 处理
+        self.assertNotIn('..', eng.sanitize_filename('a..b'))
+
+    def test_sanitize_truncates_long_names(self):
+        self.assertLessEqual(len(eng.sanitize_filename('x' * 500)), 120)
+
+    def test_safe_join_rejects_escape(self):
+        with tempfile.TemporaryDirectory() as td:
+            for bad in ('../../evil.mp3', '..\\..\\evil.mp3', 'sub/../../evil.mp3'):
+                with self.assertRaises(RuntimeError):
+                    eng.safe_join(td, bad)
+
+    def test_safe_join_accepts_normal(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = eng.safe_join(td, '周杰伦 - 晴天.mp3')
+            self.assertTrue(str(p).startswith(str(Path(td).resolve())))
+
+
+class UrlSafetyTest(unittest.TestCase):
+    """候选 URL 来自第三方音源脚本，必须限制协议与目标主机。"""
+
+    def test_accepts_public_http(self):
+        self.assertTrue(eng.is_safe_http_url('https://music.163.com/a.mp3'))
+        self.assertTrue(eng.is_safe_http_url('http://kw-bj.kuwo.cn/x.flac'))
+
+    def test_rejects_non_http_schemes(self):
+        # file:// 会让 urlopen 直接读本地文件，等同于给音源脚本任意读文件能力
+        for bad in ('file:///C:/Windows/win.ini', 'ftp://a.com/x',
+                    'javascript:alert(1)', 'data:audio/mp3;base64,AAA'):
+            self.assertFalse(eng.is_safe_http_url(bad), bad)
+
+    def test_rejects_loopback_and_private(self):
+        for bad in ('http://127.0.0.1:8080/x', 'http://localhost/x',
+                    'http://[::1]/x', 'http://10.0.0.5/x',
+                    'http://192.168.1.1/x', 'http://172.16.0.1/x',
+                    'http://169.254.1.1/x', 'http://evil.local/x'):
+            self.assertFalse(eng.is_safe_http_url(bad), bad)
+
+    def test_rejects_malformed(self):
+        for bad in ('', None, 'https://'):
+            self.assertFalse(eng.is_safe_http_url(bad), bad)
+
+    def test_download_file_rejects_file_scheme(self):
+        # 纵深防御：即使调用方漏检，download_file 自己也要拒绝
+        with tempfile.TemporaryDirectory() as td:
+            with self.assertRaises(RuntimeError):
+                eng.download_file('file:///C:/Windows/win.ini',
+                                  Path(td) / 'x.mp3', retries=0)
+
 
 class AudioMagicTest(unittest.TestCase):
     def _write(self, data):

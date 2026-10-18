@@ -97,8 +97,13 @@ function loadScripts(file) {
         description: api.description,
         author: api.author,
         homepage: api.homepage,
+        // 限制解压后大小：user_api.json 是用户导入的文件，恶意构造的 zlib
+        // 压缩炸弹可在几 KB 内解出 GB 级数据把内存打满。
         script: api.script.startsWith('gz_')
-          ? zlib.inflateSync(Buffer.from(api.script.slice(3), 'base64')).toString('utf-8')
+          ? zlib.inflateSync(
+              Buffer.from(api.script.slice(3), 'base64'),
+              { maxOutputLength: 64 * 1024 * 1024 },
+            ).toString('utf-8')
           : api.script,
       }));
       return items;

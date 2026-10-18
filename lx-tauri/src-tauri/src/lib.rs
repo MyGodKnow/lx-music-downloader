@@ -241,6 +241,22 @@ fn reject_flag_prefix(label: &str, value: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// 音质档位白名单（与引擎 QUALITY_OPTIONS 的键一致）。
+///
+/// 这是「值域校验」而非「前缀校验」：`quality` 是直接拼进 argv 的值，
+/// 若只挡 `-` 开头，像 `flac --dir C:\Windows\System32` 这种仍会被 argparse
+/// 解析成第二个 `--dir` 并覆盖下载落点。白名单能彻底杜绝这类注入。
+const QUALITY_WHITELIST: [&str; 5] = ["128k", "192k", "320k", "flac", "flac24bit"];
+
+/// 校验音质参数；空值表示「用引擎默认值」，也允许。
+fn validate_quality(quality: &str) -> Result<(), String> {
+    let q = quality.trim();
+    if q.is_empty() || QUALITY_WHITELIST.contains(&q) {
+        return Ok(());
+    }
+    Err(format!("不支持的音质: {quality}"))
+}
+
 /// 统一的分行日志读取线程：按行缓冲并解码，避免多字节字符被块边界截断。
 /// emit_done=true 时在流结束后推送一次 "done" 事件。
 fn spawn_log_reader<R: Read + Send + 'static>(
@@ -588,6 +604,8 @@ fn start_download_blocking(
         return Err("歌单不能为空".to_string());
     }
     reject_flag_prefix("歌单 id", playlist)?;
+    // quality 直接进 argv，必须做值域白名单（仅挡 `-` 前缀不足以防 `flac --dir X`）
+    validate_quality(&quality)?;
     // 统一校验：进入 argv 的空字符串值不得以 `-` 开头
     for (label, v) in [
         ("下载目录", dir.as_deref().unwrap_or("").trim()),
@@ -596,6 +614,9 @@ fn start_download_blocking(
     ] {
         if !v.is_empty() {
             reject_flag_prefix(label, v)?;
+        }
+        if label == "min_quality" {
+            validate_quality(v)?;
         }
     }
     let mut args = vec!["--playlist".into(), playlist.to_string(), "--quality".into(), quality];
@@ -797,24 +818,36 @@ fn list_sources() -> Vec<String> {
 }
 
 /// 导入音源：把前端传来的音源内容写入用户音源目录。
+///
+/// 用 async + spawn_blocking：混淆音源可达数 MB，同步写 + 杀软扫描可能
+/// 让主线程卡上几百毫秒甚至更久。
 #[tauri::command]
-fn import_source(file_name: String, content: String) -> Result<String, String> {
+async fn import_source(file_name: String, content: String) -> Result<String, String> {
     let name = validate_source_name(&file_name)?;
     let dir = user_sources_dir();
-    std::fs::create_dir_all(&dir).map_err(|e| format!("创建音源目录失败: {e}"))?;
-    std::fs::write(dir.join(&name), content).map_err(|e| format!("写入音源失败: {e}"))?;
+    let target = dir.join(&name);
+    tauri::async_runtime::spawn_blocking(move || {
+        std::fs::create_dir_all(&dir).map_err(|e| format!("创建音源目录失败: {e}"))?;
+        std::fs::write(&target, content).map_err(|e| format!("写入音源失败: {e}"))
+    })
+    .await
+    .map_err(|e| format!("导入任务执行失败: {e}"))??;
     Ok(name)
 }
 
 /// 删除用户已导入的音源。
 #[tauri::command]
-fn remove_source(file_name: String) -> Result<(), String> {
+async fn remove_source(file_name: String) -> Result<(), String> {
     let name = validate_source_name(&file_name)?;
     let dest = user_sources_dir().join(&name);
-    if dest.exists() {
-        std::fs::remove_file(&dest).map_err(|e| format!("删除音源失败: {e}"))?;
-    }
-    Ok(())
+    tauri::async_runtime::spawn_blocking(move || {
+        if dest.exists() {
+            std::fs::remove_file(&dest).map_err(|e| format!("删除音源失败: {e}"))?;
+        }
+        Ok::<(), String>(())
+    })
+    .await
+    .map_err(|e| format!("删除任务执行失败: {e}"))?
 }
 
 // ============ 音源优先级（拖拽排序） ============
@@ -916,9 +949,17 @@ fn decode_lx_script(script: &str) -> Result<String, String> {
             .decode(rest.trim())
             .map_err(|e| format!("音源 base64 解码失败: {e}"))?;
         let mut out = Vec::new();
+        // 限制解压后的最大字节数：user_api.json 来自用户导入的文件，
+        // 恶意构造的 zlib 压缩炸弹可在几 KB 内解出 GB 级数据，直接把内存打满。
+        // 正常音源（含混淆）最大也就几 MB，64MB 足够且安全。
+        const MAX_SCRIPT_BYTES: u64 = 64 * 1024 * 1024;
         let mut decoder = flate2::read::ZlibDecoder::new(raw.as_slice());
-        std::io::Read::read_to_end(&mut decoder, &mut out)
+        let mut limited = std::io::Read::take(&mut decoder, MAX_SCRIPT_BYTES + 1);
+        std::io::Read::read_to_end(&mut limited, &mut out)
             .map_err(|e| format!("音源解压失败: {e}"))?;
+        if out.len() as u64 > MAX_SCRIPT_BYTES {
+            return Err("音源解压后过大（疑似压缩炸弹），已拒绝".to_string());
+        }
         String::from_utf8(out).map_err(|e| format!("音源不是合法 UTF-8: {e}"))
     } else {
         Ok(script.to_string())
@@ -1086,12 +1127,41 @@ fn export_songs_blocking(
 }
 
 /// 把文本以 UTF-8 写入用户选择的文件（配合前端保存对话框“另存为”）。
+///
+/// `path` 来自 dialog 插件（用户自己选的），不是音源脚本可控的输入，
+/// 因此不做目录白名单限制；但仍做纵深防御：
+///   - 拒绝空路径、目录
+///   - 限制扩展名（本命令只用于导出歌单清单）
+///   - 限制内容大小，避免一次 IPC 把内存打满
+///
+/// 用 async + spawn_blocking：目标可能是 U 盘 / 网络盘 / 被占用文件，
+/// 同步写可能卡住事件循环（表现为「点保存后界面卡住」）。
 #[tauri::command]
-fn save_text_file(path: String, content: String) -> Result<(), String> {
+async fn save_text_file(path: String, content: String) -> Result<(), String> {
     if path.trim().is_empty() {
         return Err("保存路径为空".to_string());
     }
-    std::fs::write(&path, content.as_bytes()).map_err(|e| format!("写入文件失败: {e}"))
+    const MAX_TEXT_BYTES: usize = 32 * 1024 * 1024; // 32MB 足够放几十万首歌单
+    if content.len() > MAX_TEXT_BYTES {
+        return Err("导出内容过大（超过 32MB）".to_string());
+    }
+    let target = std::path::PathBuf::from(&path);
+    if target.is_dir() {
+        return Err("保存路径是一个目录".to_string());
+    }
+    // 本命令只用于导出清单，限制为文本扩展名，避免被当成通用写文件原语
+    let ext = target
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    if !matches!(ext.as_str(), "txt" | "csv" | "json" | "m3u" | "m3u8" | "log") {
+        return Err(format!("不支持的导出文件类型: .{ext}（请用 .txt/.csv/.json/.m3u）"));
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        std::fs::write(&target, content.as_bytes()).map_err(|e| format!("写入文件失败: {e}"))
+    })
+    .await
+    .map_err(|e| format!("保存任务执行失败: {e}"))?
 }
 
 /// 单曲搜索结果（与引擎 --search 的 JSON 字段对应）。
@@ -1251,6 +1321,7 @@ fn download_songs_blocking(
     python: Option<String>,
 ) -> Result<String, String> {
     validate_python(python.as_ref())?;
+    validate_quality(&quality)?;
     if songs.is_empty() {
         return Err("请先选择要下载的歌曲".to_string());
     }
@@ -1260,6 +1331,9 @@ fn download_songs_blocking(
     ] {
         if !v.is_empty() {
             reject_flag_prefix(label, v)?;
+        }
+        if label == "min_quality" {
+            validate_quality(v)?;
         }
     }
 
@@ -1386,6 +1460,33 @@ mod tests {
         assert!(reject_flag_prefix("歌单", "love").is_ok());
         assert!(reject_flag_prefix("目录", r"D:\Music").is_ok());
         assert!(reject_flag_prefix("歌单", "").is_ok());
+    }
+
+    // ===== 音质白名单（argv 注入防护）=====
+
+    #[test]
+    fn validate_quality_accepts_known_tiers() {
+        for q in ["128k", "192k", "320k", "flac", "flac24bit"] {
+            assert!(validate_quality(q).is_ok(), "{q}");
+        }
+        // 空值代表「用引擎默认值」
+        assert!(validate_quality("").is_ok());
+    }
+
+    #[test]
+    fn validate_quality_rejects_flag_injection() {
+        // 这是本项目最重要的一条注入防护：只挡 `-` 前缀不足以防住这种值，
+        // 因为它不以 `-` 开头，却会被 argparse 拆成 "--dir <任意目录>"。
+        assert!(validate_quality("flac --dir C:\\Windows\\System32").is_err());
+        assert!(validate_quality("flac --db D:\\evil.db").is_err());
+        assert!(validate_quality("320k extra").is_err());
+        assert!(validate_quality("--quality").is_err());
+    }
+
+    #[test]
+    fn validate_quality_rejects_unknown() {
+        assert!(validate_quality("999k").is_err());
+        assert!(validate_quality("flac ").is_ok(), "首尾空白应被容忍");
     }
 
     // ===== python 路径白名单 =====

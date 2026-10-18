@@ -30,6 +30,7 @@ lx_music_downloader.py - 落雪音乐歌单一键下载器
   python lx_music_downloader.py --playlist <id> --quality flac --dir D:/Music --workers 4
 """
 import argparse
+import ipaddress
 import json
 import os
 import re
@@ -44,6 +45,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COM
 from pathlib import Path
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlsplit
 
 # 强制 stdout/stderr 以 UTF-8 输出（errors='replace'）：中文 Windows 下默认用 GBK，
 # 打印含 GBK 外字符（如日文「・」U+30FB）会抛 UnicodeEncodeError 使整个程序崩溃。
@@ -71,6 +73,11 @@ BUNDLED_NODE = os.path.join(RESOURCE_DIR, 'node', 'node.exe')
 # 用户音源目录：音源脚本由用户自行导入，存到 APPDATA 下（不随程序/仓库分发），
 # GUI「音源」页的导入/删除也操作此目录；引擎默认从这里加载音源。
 USER_SOURCES_DIR = os.path.join(os.environ.get('APPDATA', APP_DIR), 'lx-downloader-sources')
+
+# Node 权限模型（--permission）可用性缓存。
+# None = 尚未探测；True = 可用；False = 该环境不支持，已回退到无隔离模式。
+# 音源脚本是第三方代码且 vm 可被逃逸，--permission 是进程级的兜底防线。
+_NODE_PERMISSION_SUPPORTED = None
 
 # 落雪音乐数据库候选路径：官方版 / 便携版 / 不同 fork / 历史版本，
 # 保证不同安装方式的用户都能自动识别到歌单。
@@ -256,7 +263,38 @@ class UrlServer:
         self.api_dir = api_dir
 
     def start(self):
-        cmd = [self.node_exe, URL_SERVER]
+        global _NODE_PERMISSION_SUPPORTED
+        cmd = [self.node_exe]
+
+        # ===== 安全隔离：Node 权限模型 =====
+        #
+        # 音源脚本是用户从网络下载的第三方 JS，由 vm.runInContext 执行。
+        # 但 vm **不是安全边界**：脚本可用 `this.constructor.constructor(...)`
+        # 这类方式逃逸拿到宿主 process（实测 4/5 种逃逸方式有效），
+        # 随后就能读环境变量、读写任意文件、启动子进程。
+        #
+        # Node 22 的 --permission 能从进程层面兜住这个逃逸：
+        # 实测开启后，即使 vm 已逃逸，写文件与 spawn 仍被拒绝（ERR_ACCESS_DENIED）。
+        # 这里只授予「读音源目录 + 读本脚本所在目录（node 需要读 lx_url_server.js）」，
+        # 不授予写权限、不授予 child_process 权限。
+        #
+        # 若运行环境不支持该参数（Node < 20 或某些打包环境），自动回退到
+        # 无隔离模式并打印警告，绝不因为加固而导致功能不可用。
+        if _NODE_PERMISSION_SUPPORTED is not False:
+            read_paths = []
+            if self.api_file:
+                read_paths.append(os.path.dirname(os.path.abspath(self.api_file)))
+            if self.api_dir:
+                read_paths.append(os.path.abspath(self.api_dir))
+            read_paths.append(os.path.dirname(os.path.abspath(URL_SERVER)))
+            perm_args = []
+            for p in dict.fromkeys(read_paths):  # 去重且保序
+                if p and os.path.isdir(p):
+                    perm_args.append(f'--allow-fs-read={p}')
+            if perm_args:
+                cmd += ['--permission'] + perm_args
+
+        cmd.append(URL_SERVER)
         if self.api_file:
             cmd += ['--api', self.api_file]
         elif self.api_dir:
@@ -276,6 +314,22 @@ class UrlServer:
         ready = self.proc.stdout.readline()
         if '"ready"' not in ready:
             err = self.proc.stderr.read() if self.proc.stderr else ''
+            # 不支持 --permission 的环境：去掉该参数重试一次，保证功能可用
+            if _NODE_PERMISSION_SUPPORTED is not False and any(
+                    str(a).startswith('--permission') or str(a).startswith('--allow-fs-read')
+                    for a in cmd):
+                _NODE_PERMISSION_SUPPORTED = False
+                try:
+                    if self.proc.poll() is None:
+                        self.proc.kill()
+                except Exception:
+                    pass
+                # 必须写 stderr：stdout 是 JSON 协议通道（--search/--list-songs），
+                # 往 stdout 打警告会污染上层解析，正是之前「返回了非 JSON 内容」的成因之一。
+                print('[警告] 当前 Node 不支持 --permission，已回退到无隔离模式；'
+                      '音源脚本将以完全权限运行，请只导入可信来源。',
+                      file=sys.stderr, flush=True)
+                return self.start()
             raise RuntimeError(f'音源服务启动失败: {ready} {err}')
         # 后台读取 stderr 以防阻塞
         def _drain():
@@ -339,6 +393,22 @@ class UrlServer:
                 self.proc.terminate()
             except Exception:
                 pass
+            # terminate 只是发信号，不等待就可能留下僵尸进程；
+            # 大批量下载会起很多 Node 实例（每线程一个），必须真正回收。
+            try:
+                self.proc.wait(timeout=3)
+            except Exception:
+                try:
+                    self.proc.kill()
+                    self.proc.wait(timeout=2)
+                except Exception:
+                    pass
+            for stream in (self.proc.stdin, self.proc.stdout, self.proc.stderr):
+                try:
+                    if stream:
+                        stream.close()
+                except Exception:
+                    pass
             self.proc = None
 
 
@@ -346,10 +416,36 @@ class UrlServer:
 
 
 def sanitize_filename(name):
-    """清理文件名非法字符"""
+    """清理文件名非法字符，并防止 `..` 造成目录穿越。
+
+    歌名/歌手来自第三方音源脚本，完全不可信。虽然已把路径分隔符替换成 `_`，
+    但若结果恰好是 `..`（或含 `..` 段），`download_dir / name` 仍可能跳出目录。
+    这里额外做：折叠连续点、去掉纯点段、限制长度（Windows 上限 255，留余量）。
+    """
     name = re.sub(r'[\\/:*?"<>|\r\n\t]', '_', name)
+    # 把「两个及以上的连续点」压成一个点，避免 ".." 与 "..." 之类的目录语义
+    name = re.sub(r'\.{2,}', '.', name)
     name = name.strip(' .')
+    if not name or name in ('.', '..'):
+        return 'untitled'
+    # 长度限制：按字符数截断（不同文件系统按字节，但 120 字符对 UTF-8 也安全）
+    if len(name) > 120:
+        name = name[:120].rstrip(' .')
     return name or 'untitled'
+
+
+def safe_join(base_dir, filename):
+    """把 filename 安全地拼到 base_dir 下，确保结果不越界。
+
+    双重保险：即使 sanitize_filename 有疏漏，这里也会拒绝解析后跑到外面的路径。
+    """
+    base = Path(base_dir).resolve()
+    candidate = (base / filename).resolve()
+    try:
+        candidate.relative_to(base)
+    except ValueError:
+        raise RuntimeError(f'文件名越界，已拒绝: {filename!r}')
+    return candidate
 
 
 def strict_song_key(s):
@@ -431,6 +527,8 @@ def _connect_db_ro(db_path):
 # 缓存后既少开连接也少做重复过滤。key = (db_path, song_id)。
 _ALT_SOURCE_CACHE = {}
 _ALT_SOURCE_LOCK = threading.Lock()
+# 缓存条目上限：超出即清空（该缓存只用于单首歌的重复查询去重，清空无副作用）
+_ALT_SOURCE_CACHE_MAX = 800
 
 
 def get_alternative_sources(db_path, song):
@@ -485,6 +583,11 @@ def get_alternative_sources(db_path, song):
         rows.append(r)
 
     with _ALT_SOURCE_LOCK:
+        # 上限保护：700 首的批量下载会逐首写入缓存，虽然单条很小，
+        # 但配合「二次重试」会翻倍。超出上限时直接清空重来——
+        # 这个缓存只用于「同一首歌查两次」的去重，清空无正确性影响。
+        if len(_ALT_SOURCE_CACHE) >= _ALT_SOURCE_CACHE_MAX:
+            _ALT_SOURCE_CACHE.clear()
         _ALT_SOURCE_CACHE[cache_key] = [dict(r) for r in rows]
     return rows
 
@@ -632,11 +735,64 @@ def _probe_speed(url, headers, timeout, sample_bytes=256 * 1024):
         return None
 
 
+def _is_private_host(host):
+    """判断主机名是否指向本机/内网。
+
+    音源脚本是不可信的，若允许它把候选 URL 指向 127.0.0.1 或内网段，
+    就能靠「响应耗时/状态码差异」枚举本机与内网服务（SSRF-lite）。
+    正常音乐 CDN 不可能落在这些地址上，因此一律拒绝。
+    """
+    if not host:
+        return True
+    h = host.strip('[]').lower()
+    if h in ('localhost', 'localhost.localdomain', 'ip6-localhost', 'ip6-loopback'):
+        return True
+    if h.endswith('.local') or h.endswith('.internal') or h.endswith('.localhost'):
+        return True
+    # 纯 IPv4 / IPv6 字面量
+    try:
+        ip = ipaddress.ip_address(h)
+    except ValueError:
+        return False  # 普通域名，交还给 DNS
+    return bool(
+        ip.is_private or ip.is_loopback or ip.is_link_local
+        or ip.is_reserved or ip.is_multicast or ip.is_unspecified
+    )
+
+
+def is_safe_http_url(url):
+    """只接受 http/https 绝对地址，且拒绝本机/内网主机。
+
+    候选 URL 来自第三方音源脚本（不可信）。若不校验协议，
+    `file:///C:/...` 会被 urlopen 当本地文件读出来，等同于给音源脚本
+    一个「任意读文件」的原语；`ftp://` 等同理。
+    """
+    if not isinstance(url, str) or not url:
+        return False
+    try:
+        parts = urlsplit(url.strip())
+    except Exception:
+        return False
+    if parts.scheme.lower() not in ('http', 'https'):
+        return False
+    if not parts.netloc:
+        return False
+    # 端口一并取出再判 host：netloc 可能形如 host:8080 或 user@host:8080
+    try:
+        host = parts.hostname
+    except Exception:
+        return False
+    return not _is_private_host(host)
+
+
 def download_file(url, dest_path, timeout=120, retries=3, parts=None):
     """下载文件：优先多线程分片并行，不支持 Range 时退化为单线程流式；支持断点续传。
 
     parts=None 时按文件大小自动决定分片数（见 `_choose_parts`）。
     """
+    # 纵深防御：即使调用方漏检，这里也拒绝非 http(s) 协议。
+    if not is_safe_http_url(url):
+        raise RuntimeError(f'不支持的下载协议（仅允许 http/https）: {str(url)[:80]}')
     dest_path = Path(dest_path)
     dest_path.parent.mkdir(parents=True, exist_ok=True)
     last_error = None
@@ -660,11 +816,17 @@ def download_file(url, dest_path, timeout=120, retries=3, parts=None):
             return True
         except Exception as e:
             last_error = e
+            # 无论中断还是普通失败，都必须清理分片临时文件。
+            # 原实现在「停止」分支直接 raise，跳过了下面的清理，
+            # 导致中途停止后目录里残留 .part0/.part1… 这些无主文件。
+            #
+            # 注意：分片文件是 `<目标名>.part0`，即「目标名再拼 .partN」，
+            # 因此这里要用字符串拼接而不是 with_suffix —— 后者会把 .part 当扩展名替换掉。
+            base = str(dest_path)
+            for i in range(16):
+                safe_unlink(Path(f'{base}.part{i}'))
             if DOWNLOAD_STOP_EVENT.is_set():
                 raise InterruptedError('用户请求停止')
-            # 清理可能残留的分片临时文件（按最大可能片数清理，避免漏删）
-            for i in range(16):
-                safe_unlink(dest_path.with_suffix(dest_path.suffix + f'.part{i}'))
             if attempt < retries:
                 time.sleep(min(2 ** attempt, 8))
     raise RuntimeError(f'下载失败: {last_error}')
@@ -721,6 +883,11 @@ def _download_sequential(url, dest_path, timeout, headers):
         with open(dest_path, mode) as out:
             while True:
                 if DOWNLOAD_STOP_EVENT.is_set():
+                    # 停止时把半成品删掉：留着会占空间，更严重的是会被
+                    # 「已存在」判断误认为下载成功，导致下次直接跳过。
+                    # 顺序下载直接写目标文件（为支持断点续传），所以这里必须清。
+                    out.close()
+                    safe_unlink(dest_path)
                     raise InterruptedError('用户请求停止')
                 chunk = resp.read(1024 * 256)
                 if not chunk:
@@ -728,6 +895,7 @@ def _download_sequential(url, dest_path, timeout, headers):
                 out.write(chunk)
                 total += len(chunk)
         if total < 1024:
+            safe_unlink(dest_path)
             raise RuntimeError(f'文件过小({total} bytes)，可能是错误页')
     return total
 
@@ -754,6 +922,7 @@ def _download_part(url, start, end, part_path, headers, timeout):
 def _multipart_download(url, dest_path, total_size, parts, headers, timeout):
     """多线程分片并行下载，最后按顺序合并到 dest_path。"""
     dest = Path(dest_path)          # 兼容调用方传 str
+    base = str(dest)
     part_size = (total_size + parts - 1) // parts
     jobs = []
     for i in range(parts):
@@ -761,7 +930,9 @@ def _multipart_download(url, dest_path, total_size, parts, headers, timeout):
         end = min(total_size - 1, start + part_size - 1)
         if start > end:
             break
-        pp = dest.with_suffix(dest.suffix + f'.part{i}')
+        # 用字符串拼接而非 with_suffix：dest 可能是 `xxx.part`，
+        # with_suffix 会把 `.part` 当成扩展名替换掉，导致分片名与清理逻辑对不上。
+        pp = Path(f'{base}.part{i}')
         jobs.append((start, end, pp))
     if not jobs:
         raise RuntimeError('分片切分失败')
@@ -848,6 +1019,10 @@ def download_with_candidates(candidates, dest_base, expected_interval=None, expe
     part_path = Path(str(dest_base) + '.part')
     for cand in candidates:
         safe_unlink(part_path)
+        # 只允许 http(s)：候选 URL 来自第三方音源脚本，若不校验 scheme，
+        # `file:///C:/Users/x/.ssh/id_rsa` 会被 urlopen 直接读出来并落成"歌曲文件"。
+        if not is_safe_http_url(cand.get('url')):
+            continue
         try:
             download_file(cand['url'], part_path, retries=2)
             if not verify_duration(part_path, expected_interval):
@@ -1650,8 +1825,12 @@ def run_download(args, songs, db_path=None, title=None):
 
             errors = []
             server = get_worker_server()
-            # 目标文件基础名（不含扩展名）：扩展名在下载后按文件内容确定
-            dest_base = download_dir / sanitize_filename(f"{song['singer']} - {song['name']}")
+            # 目标文件基础名（不含扩展名）：扩展名在下载后按文件内容确定。
+            # 用 safe_join 兜底：歌名/歌手来自音源脚本，必须确保拼出的路径不越出下载目录。
+            dest_base = safe_join(
+                download_dir,
+                sanitize_filename(f"{song['singer']} - {song['name']}"),
+            )
             # 尝试原源 + 替代源
             candidates_queue = [song]
             # 只有歌单下载（有数据库）才查同名替代源；单曲下载没有数据库上下文
