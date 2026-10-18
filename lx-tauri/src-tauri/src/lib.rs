@@ -1,24 +1,37 @@
 use serde::Serialize;
 use std::io::{BufReader, Read};
 use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 /// 全局状态：当前正在运行的子进程（下载或转换），每次只允许一个。
+///
+/// child 用 `Arc<Mutex<..>>` 而不是直接 `Mutex`：优雅停止时后台线程需要在
+/// 20s 窗口内持有它等待退出，而窗口关闭时 `Drop` 仍必须能把它取出来清理。
+/// 两者共享同一个 Arc，谁先取到谁负责回收，不会出现「进程退出后遗留引擎」。
 #[derive(Default)]
 struct TaskState {
-    child: Mutex<Option<Child>>,
+    child: Arc<Mutex<Option<Child>>>,
     /// 当前任务的“优雅停止”信号文件路径；停止时先写该文件让引擎自行收尾。
     stop_file: Mutex<Option<std::path::PathBuf>>,
+    /// 引擎是否处于「正在启动」阶段（解压引擎包 / spawn 子进程尚未完成）。
+    /// 该窗口内 `stop_task` 需要返回 "starting"，否则前端会误以为任务已结束。
+    starting: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// App 退出（窗口关闭）时也清理仍在运行的子进程树，避免遗留 python/node。
-/// `drop` 拿到的是 `&mut self`，用 `get_mut()` 直接取内部值，完全不加锁——
-/// 避免退出时恰好有后台线程持锁而导致卡在关闭流程上。
+///
+/// 注意 child 是 `Arc<Mutex<..>>`：优雅停止的后台线程可能正持有同一个 Arc
+/// 在等引擎收尾。这里用 `try_lock` 避免与它僵持——拿不到锁说明后台线程
+/// 正在处理，它会在自己的超时后强杀，不会漏清理。
 impl Drop for TaskState {
     fn drop(&mut self) {
-        let child = self.child.get_mut().ok().and_then(|c| c.take());
-        if let Some(mut child) = child {
+        let taken = match self.child.try_lock() {
+            Ok(mut g) => g.take(),
+            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner().take(),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        };
+        if let Some(mut child) = taken {
             kill_process_tree(&mut child);
         }
     }
@@ -146,23 +159,40 @@ fn resolve_engine(python: Option<&String>) -> (String, Vec<String>) {
 }
 
 /// 结束子进程并连带清理其子孙进程（Python 会派生 node）。
-/// Windows 用 taskkill /T 杀整棵进程树，避免停止后遗留孤儿进程。
 ///
-/// 注意：这里的 `wait()` 必须带超时。若子进程卡在不可中断的系统调用上，
-/// 无超时的 `wait()` 会永久阻塞调用者——而调用者可能是主线程或 shutdown 路径。
+/// 三层保险，任何一层都不允许无限阻塞：
+///   1. `taskkill /T /F` 放到独立线程执行，主流程最多等 2s —— 安全软件拦截
+///      taskkill 时它是同步 `output()` 会永久挂起，绝不能让它拖住调用方
+///      （调用方可能是主线程或窗口关闭路径）
+///   2. `child.kill()` 直接 TerminateProcess，不依赖外部命令
+///   3. 回收最多等 3s，超时放弃（进程已被杀，句柄随 Child drop 释放）
 fn kill_process_tree(child: &mut Child) {
+    let pid = child.id();
+
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x08000000;
-        let _ = Command::new("taskkill")
-            .args(["/PID", &child.id().to_string(), "/T", "/F"])
-            .creation_flags(CREATE_NO_WINDOW)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .output();
+        // 独立线程跑 taskkill：即使被拦截挂起，也不会阻塞本函数
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = Command::new("taskkill")
+                .args(["/PID", &pid.to_string(), "/T", "/F"])
+                .creation_flags(CREATE_NO_WINDOW)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .output();
+            let _ = tx.send(());
+        });
+        // 最多等 2 秒；等不到就继续走 child.kill()
+        let _ = rx.recv_timeout(std::time::Duration::from_secs(2));
     }
+    #[cfg(not(windows))]
+    {
+        let _ = pid;
+    }
+
     let _ = child.kill();
 
     // 最多等 3 秒回收，超时则放弃（进程已被 kill，句柄随 Child drop 释放）
@@ -347,8 +377,8 @@ fn spawn_task(
     engine: (String, Vec<String>),
 ) -> Result<String, String> {
     // 先取走上一次任务的 child，**在锁外**再杀。
-    // 绝不能持锁调用 kill_process_tree：它内部有 taskkill .output() 与无超时的
-    // child.wait()，持锁期间会堵死 stop_task / 窗口退出等所有路径。
+    // 绝不能持锁调用 kill_process_tree：它内部有 taskkill 与进程回收，
+    // 持锁期间会堵死 stop_task / 窗口退出等所有路径。
     let old_child = state.child.lock().ok().and_then(|mut g| g.take());
     if let Some(mut old) = old_child {
         kill_process_tree(&mut old);
@@ -357,6 +387,12 @@ fn spawn_task(
     // 清理上一次运行残留的停止信号，避免新任务一启动就被当成“停止”。
     let stop_path = stop_signal_path();
     let _ = std::fs::remove_file(&stop_path);
+
+    // 标记「正在启动」：此时还没有 child，stop_task 需要据此返回 "starting"
+    // 而不是 "idle"（否则前端会误判任务已结束）。
+    state
+        .starting
+        .store(true, std::sync::atomic::Ordering::SeqCst);
 
     let mut cmd = Command::new(&engine.0);
     cmd.args(&engine.1)
@@ -374,7 +410,12 @@ fn spawn_task(
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
 
-    let mut child = cmd.spawn().map_err(|e| format!("启动子进程失败: {e}"))?;
+    let spawned = cmd.spawn();
+    // 无论成败都清除启动标记，避免后续 stop 一直显示 "starting"
+    state
+        .starting
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let mut child = spawned.map_err(|e| format!("启动子进程失败: {e}"))?;
     let stdout = child.stdout.take().expect("no stdout");
     let stderr = child.stderr.take().expect("no stderr");
     if let Ok(mut guard) = state.child.lock() {
@@ -606,14 +647,27 @@ fn stop_task(state: State<'_, TaskState>) -> Result<String, String> {
         .and_then(|g| g.clone())
         .unwrap_or_else(stop_signal_path);
 
-    // 只短暂持锁取出 child，随即释放，避免阻塞其它命令（如 list_sources）。
-    let child = {
-        let mut guard = state.child.lock().map_err(|_| "状态锁失效".to_string())?;
-        guard.take()
-    };
-    let Some(mut child) = child else {
+    // 引擎还在启动阶段（解压引擎包 / spawn 未完成）时没有 child，
+    // 不能直接报 idle —— 否则前端会把 running 置 false 并允许再点开始，
+    // 与仍在启动的那次任务撞车。
+    if state
+        .starting
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        // 让引擎在启动后立刻看到停止信号，收尾退出
+        let _ = std::fs::write(&stop_path, b"stop\n");
+        return Ok("starting".to_string());
+    }
+
+    // 用 Arc 共享 child：后台线程拿走等待权，但 Drop 仍能在窗口关闭时清理。
+    let child_arc = state.child.clone();
+    let has_child = child_arc
+        .lock()
+        .map(|g| g.is_some())
+        .unwrap_or(false);
+    if !has_child {
         return Ok("idle".to_string());
-    };
+    }
 
     // 1) 写停止信号，交给引擎自己收尾（落盘 + 写失败清单 + 清理 .part）
     let graceful = std::fs::write(&stop_path, b"stop\n").is_ok();
@@ -624,10 +678,27 @@ fn stop_task(state: State<'_, TaskState>) -> Result<String, String> {
             let deadline = std::time::Instant::now()
                 + std::time::Duration::from_secs(GRACEFUL_STOP_WAIT_SECS);
             loop {
-                match child.try_wait() {
-                    Ok(Some(_)) => return, // 引擎已自行退出
-                    Ok(None) => {}
-                    Err(_) => break,
+                // 每轮短暂持锁只做 try_wait，避免长时间占住 Arc
+                let state_now = {
+                    let mut guard = match child_arc.lock() {
+                        Ok(g) => g,
+                        Err(p) => p.into_inner(),
+                    };
+                    match guard.as_mut() {
+                        Some(c) => match c.try_wait() {
+                            Ok(Some(_)) => {
+                                // 引擎已自行退出：取走 child，Drop 不会再碰它
+                                *guard = None;
+                                Some(true)
+                            }
+                            Ok(None) => Some(false),
+                            Err(_) => Some(true),
+                        },
+                        None => Some(true), // 已被别处取走（退出路径），结束等待
+                    }
+                };
+                if state_now != Some(false) {
+                    return;
                 }
                 if std::time::Instant::now() >= deadline {
                     break;
@@ -636,16 +707,50 @@ fn stop_task(state: State<'_, TaskState>) -> Result<String, String> {
             }
         }
         // 3) 兜底：超时仍未退出，强杀整棵进程树
-        kill_process_tree(&mut child);
+        let mut guard = match child_arc.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        if let Some(mut child) = guard.take() {
+            drop(guard); // 锁外杀，避免持锁调用 taskkill
+            kill_process_tree(&mut child);
+        }
     });
 
     Ok(if graceful { "stopping" } else { "killing" }.to_string())
 }
 
+/// 查询当前是否有任务在跑（供前端在「正在停止」时做早期校正）。
+/// 纯内存读，不会阻塞。
+#[tauri::command]
+fn is_task_running(state: State<'_, TaskState>) -> bool {
+    if state
+        .starting
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        return true;
+    }
+    let mut guard = match state.child.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    match guard.as_mut() {
+        None => false,
+        // 已退出的子进程顺手回收，并报告「没在跑」
+        Some(child) => match child.try_wait() {
+            Ok(Some(_)) => {
+                *guard = None;
+                false
+            }
+            Ok(None) => true,
+            Err(_) => false,
+        },
+    }
+}
+
 // ============ 音源管理 ============
 // 音源脚本由用户自行导入，统一存放于 %APPDATA%\lx-downloader-sources（与 Python 引擎
 // 的 USER_SOURCES_DIR 一致）。仓库与程序更新不会覆盖该目录，用户音源长期保留。
-
 fn user_sources_dir() -> std::path::PathBuf {
     let base = std::env::var_os("APPDATA").unwrap_or_else(|| ".".into());
     std::path::PathBuf::from(base).join("lx-downloader-sources")
@@ -1244,6 +1349,7 @@ pub fn run() {
             list_sources,
             import_source,
             remove_source,
+            is_task_running,
             get_source_order,
             set_source_order,
             find_lx_desktop_api,
@@ -1378,6 +1484,39 @@ mod tests {
         assert_eq!(trim_end(b"line\r\n"), b"line".to_vec());
         assert_eq!(trim_end(b"line\n\n"), b"line".to_vec());
         assert_eq!(trim_end(b"line"), b"line".to_vec());
+    }
+
+    // ===== 任务状态机 =====
+
+    #[test]
+    fn task_state_default_is_idle() {
+        let st = TaskState::default();
+        assert!(!st
+            .starting
+            .load(std::sync::atomic::Ordering::SeqCst));
+        assert!(st.child.lock().unwrap().is_none());
+        assert!(st.stop_file.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn starting_flag_toggles() {
+        let st = TaskState::default();
+        st.starting
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(st.starting.load(std::sync::atomic::Ordering::SeqCst));
+        st.starting
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(!st.starting.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn child_arc_is_shared_not_moved() {
+        // 确认 child 是 Arc：clone 后仍是同一个底层锁，
+        // 这样 stop 后台线程与 Drop 能共享同一个 child。
+        let st = TaskState::default();
+        let a = st.child.clone();
+        let b = st.child.clone();
+        assert!(Arc::ptr_eq(&a, &b));
     }
 
     // ===== 引擎版本标记 =====

@@ -316,6 +316,13 @@ function App() {
         setStopping(true);
         return;
       }
+      if (mode === "starting") {
+        // 引擎还在解压/启动，没有子进程可停。停止信号已写入，
+        // 引擎启动后会立刻看到并退出；这里保持 running，等 done 事件。
+        addLog("info", "引擎正在启动，已请求其在启动完成后立即退出");
+        setStopping(true);
+        return;
+      }
       if (mode === "killing") {
         addLog("error", "停止信号写入失败，正在强制结束进程");
         setStopping(true);
@@ -586,7 +593,25 @@ function App() {
       setRunning(false);
       addLog("error", "停止超时：已解除界面锁定，若仍有残留进程请重新开启应用");
     }, 28000);
-    return () => window.clearTimeout(timer);
+
+    // 早期校正：若引擎其实早已退出（done 事件在 stop 之前就已错过），
+    // 1.5s 后主动探测一次任务状态，避免无意义地等满 28 秒。
+    const probe = window.setTimeout(async () => {
+      try {
+        const busy = await invoke<boolean>("is_task_running");
+        if (!busy) {
+          setStopping(false);
+          setRunning(false);
+        }
+      } catch {
+        /* 探测失败就交给 28s 兜底 */
+      }
+    }, 1500);
+
+    return () => {
+      window.clearTimeout(timer);
+      window.clearTimeout(probe);
+    };
   }, [stopping, addLog]);
 
   const okCount = logs.filter((l) => l.kind === "ok").length;
