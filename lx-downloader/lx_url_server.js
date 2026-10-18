@@ -285,6 +285,22 @@ async function init() {
       vm.runInContext(api.script, context, { timeout: 8000 });
     } catch (e) {
       initError = `${api.name}: 脚本执行失败 - ${e.message}`;
+      // 单个音源失败必须显式报出来：否则用户只会看到「音源已加载」里少了一个，
+      // 却完全不知道某个源其实没生效（表现为「能听歌但下载失败」）。
+      // 说明：混淆过的音源脚本，stack 首行是压缩后的源码，信息量极低，
+      // 因此优先输出 message 与本脚本自己的堆栈行。
+      try {
+        const msg = String((e && e.message) || e);
+        const stackLine = String((e && e.stack) || '')
+          .split('\n')
+          .filter((l) => l.includes('lx_url_server.js') || /^[A-Za-z]*Error:/.test(l.trim()))
+          .slice(0, 3)
+          .join(' | ');
+        process.stderr.write(
+          `[lx-url-server] 音源加载失败 ${api.name}: ${msg.slice(0, 400)}`
+          + (stackLine ? ` (${stackLine.slice(0, 300)})` : '') + '\n',
+        );
+      } catch (_) { /* ignore */ }
       continue;
     }
     // 等待处理器注册
@@ -297,7 +313,16 @@ async function init() {
       continue;
     }
     initError = `${api.name}: 未注册 request 处理器`;
+    try {
+      process.stderr.write(
+        `[lx-url-server] 音源加载失败 ${api.name}: 脚本执行了但未调用 lx.on('request', ...) 注册处理器\n`,
+      );
+    } catch (_) { /* ignore */ }
   }
+  process.stderr.write(
+    `[lx-url-server] 共 ${requestHandlers.length} 个音源可用: `
+    + requestHandlers.map(h => h.name).join(', ') + '\n',
+  );
   return requestHandlers.length > 0;
 }
 
@@ -1013,8 +1038,12 @@ async function getMusicUrls(source, musicInfo, qualities) {
   const candidates = [];
   const targetCount = 2; // 2 个候选即够 Python 端实测（实测比多候选更省时）
   let lastErr = null;
-  // 整体取链接预算：超时就返回已收候选（即使没拿够），绝不让一首歌卡死
-  const dlDeadline = Date.now() + 12000;
+  const failures = [];   // 记录每个源的失败原因，用于最终诊断
+  // 整体取链接预算。
+  // 注意：音源脚本内部单次请求可能长达 20s（doRequest 默认超时），
+  // 预算过短会导致「只试了一两个源就放弃」，表现为整首歌莫名失败。
+  // Python 侧对整首歌有更长的容忍度，这里给足 45s，但仍保证不会无限卡住。
+  const dlDeadline = Date.now() + 45000;
   const overDl = () => Date.now() > dlDeadline;
   for (const q of qList) {
     const wantRank = qualityRank(q);
@@ -1023,7 +1052,7 @@ async function getMusicUrls(source, musicInfo, qualities) {
       if (sourceBlocked(entry.name)) continue;
       try {
         const info = { musicInfo: { ...musicInfo }, type: q };
-        const result = await callHandler(entry, source, 'musicUrl', info, 5000);
+        const result = await callHandler(entry, source, 'musicUrl', info, 20000);
         let url = null;
         if (typeof result === 'string' && /^https?:\/\//.test(result)) url = result;
         else if (result && typeof result === 'object') {
@@ -1040,6 +1069,7 @@ async function getMusicUrls(source, musicInfo, qualities) {
             : null;
           if (wantRank > 0 && resultRank === 0) {
             lastErr = new Error('已忽略低于请求档位的 128k 音源结果');
+            failures.push(`${entry.name}: 低码率(128k)`);
             continue;
           }
           seen.add(url);
@@ -1051,26 +1081,91 @@ async function getMusicUrls(source, musicInfo, qualities) {
             if (candidates.length >= targetCount) break; // 拿够候选立即停止
           } else {
             lastErr = new Error('链接无效(404/403): ' + url.slice(0, 100));
+            failures.push(`${entry.name}: 链接校验失败`);
             noteSourceFail(entry.name, true);
             bumpSource(entry.name, -3);
           }
         } else {
           lastErr = new Error('音源返回无效链接: ' + JSON.stringify(result).slice(0, 120));
+          failures.push(`${entry.name}: 未返回有效链接`);
           noteSourceFail(entry.name, true);
           bumpSource(entry.name, -1);
         }
       } catch (e) {
         lastErr = e;
         // 超时/网络错误可能是平台限流导致，不记入冷却（以免误把好源锁死）
-        const isTimeout = String(e.message || e).includes('超时');
+        const msg = String((e && e.message) || e);
+        const isTimeout = msg.includes('超时') || msg.includes('timeout');
+        // 单个源失败**绝不能**中断整轮：常见的有 socket hang up / ECONNRESET，
+        // 换个源往往就能拿到链接。这里只记录，继续试下一个源。
+        failures.push(`${entry.name}: ${msg.slice(0, 60)}`);
+        try {
+          process.stderr.write(
+            `[lx-url-server] 音源失败 ${entry.name} (${source}/${q}): `
+            + String((e && e.stack) || e).slice(0, 300).replace(/\n/g, ' | ') + '\n',
+          );
+        } catch (_) { /* ignore */ }
         noteSourceFail(entry.name, !isTimeout);
         bumpSource(entry.name, isTimeout ? -2 : -1);
       }
     }
     if (candidates.length > 0) break; // 已有候选就不到更高音质档继续扫源
   }
-  if (!candidates.length) throw lastErr || new Error('获取链接失败');
+  if (!candidates.length) {
+    // 所有音源脚本都失败时，再用「不依赖音源脚本」的直连兜底试一次。
+    // 这是「能听歌却下载不了」的最后一道防线。
+    try {
+      const direct = await directFallbackCandidates(musicInfo, source);
+      if (direct.length) {
+        process.stderr.write(
+          `[lx-url-server] 音源全部失败，直连兜底命中: ${direct[0].url.slice(0, 90)}\n`,
+        );
+        return direct;
+      }
+    } catch (e) { /* 兜底失败就按原错误抛出 */ }
+
+    // 把所有失败原因带回上层，而不是只报最后一个（那样只会看到 "socket hang up"）
+    const detail = failures.length ? failures.slice(0, 6).join('; ') : '无可用音源';
+    const err = new Error(`所有音源均未返回可用链接（${detail}）`);
+    err.cause = lastErr;
+    throw err;
+  }
   return candidates;
+}
+
+// ========== 直连兜底（完全不依赖音源脚本） ==========
+// 目的：音源脚本会失效（接口变更、作者停更、被目标站点断开），此时
+// 「能听歌但下载不了」就成了死局。这里实现一个只依赖公开接口的最小取链器。
+//
+// ⚠️ 已实测排除的方案：酷我 antiserver（antiserver.kuwo.cn/anti.s）
+//   它对多数 rid 返回同一个默认文件、且忽略 br 参数（固定 32kbps），
+//   用它兜底会**下错歌**——比下载失败更糟。宁可不兜底也不给错文件。
+//
+// 当前策略：只保留能通过「时长 + 音质」双重校验的直连路径；
+// 若拿不到可信链接，就如实报错，由上层记录到 failed.txt。
+
+/** 从 musicInfo 里尽力取出「平台 + 该平台的 ID」 */
+function extractPlatformId(musicInfo, source) {
+  const info = musicInfo || {};
+  const raw = info.rid || info.id || info.songId || info.songmid || info.hash || '';
+  let id = String(raw || '').trim();
+  id = id.replace(/^MUSIC_/i, '').replace(/^[a-z]{2}_/i, '');
+  if (!/^\d{3,}$/.test(id)) return null;
+  return { source: String(source || info.source || '').toLowerCase(), id };
+}
+
+/**
+ * 直连兜底总入口：返回候选数组（可能为空）。
+ *
+ * 目前**没有**可信的免签名直链接口可用，因此返回空数组，
+ * 让上层走「按名搜索」或如实报错。保留此函数是为了：
+ *   1. 后续若发现稳定接口，可在此直接补上；
+ *   2. 明确记录「为什么不做兜底」，避免以后又接回会下错歌的接口。
+ */
+async function directFallbackCandidates(musicInfo, source) {
+  const got = extractPlatformId(musicInfo, source);
+  if (!got) return [];
+  return [];
 }
 
 // ========== 主流程 ==========

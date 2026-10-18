@@ -1329,6 +1329,8 @@ def run():
                         help='导出歌单歌曲清单为“歌手 - 歌名”（与 --playlist/-p 搭配；去重、按歌单原顺序）')
     parser.add_argument('--stop-file', default=None,
                         help='优雅停止信号文件（GUI 使用：该文件出现即收尾退出，不直接强杀进程）')
+    parser.add_argument('--interactive', action='store_true',
+                        help='结束前等待按键（仅用于双击运行的控制台 EXE；GUI 调用不要传，否则会污染 stdout）')
     parser.add_argument('--search', default=None,
                         help='单曲搜索：按关键词搜索歌曲，以 JSON 输出候选列表（不下载）')
     parser.add_argument('--search-limit', type=int, default=30, help='单曲搜索返回条数上限（默认 30）')
@@ -1844,8 +1846,26 @@ if __name__ == '__main__':
         if crash_log:
             print(f'详细错误已保存：{crash_log}')
     finally:
-        # 双击控制台 EXE 时不要在完成/异常后直接关闭窗口；命令行调用不阻塞。
-        if getattr(sys, 'frozen', False) and sys.stdin and sys.stdin.isatty():
+        # 双击控制台 EXE 时不要在完成/异常后直接关闭窗口。
+        #
+        # 关键：GUI（Tauri）调用时 stdin 被重定向到 NUL 设备，某些环境下
+        # isatty() 仍会返回 True，于是这里会等待输入并打印提示语，
+        # 污染 stdout —— 上层按 JSON 解析时就会报
+        # 「返回了非 JSON 内容: 程序已结束，输入 q 退出：」。
+        #
+        # 因此追加三个条件：
+        #   1. 只有显式传入 --interactive 才等待（GUI 永远不传）
+        #   2. stdin 与 stdout 都必须是真终端
+        #   3. 任何情况下都不把提示写到 stdout
+        interactive = (
+            getattr(sys, 'frozen', False)
+            and '--interactive' in sys.argv
+            and sys.stdin is not None
+            and sys.stdout is not None
+            and sys.stdin.isatty()
+            and sys.stdout.isatty()
+        )
+        if interactive:
             try:
                 while True:
                     answer = input('\n程序已结束，输入 q 退出：').strip().lower()
