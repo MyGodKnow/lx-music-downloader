@@ -2,7 +2,7 @@ use serde::Serialize;
 use std::io::{BufReader, Read};
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 /// 全局状态：当前正在运行的子进程（下载或转换），每次只允许一个。
 #[derive(Default)]
@@ -12,13 +12,14 @@ struct TaskState {
     stop_file: Mutex<Option<std::path::PathBuf>>,
 }
 
-/// App 退出（窗口关闭）时也清理仍在运行的子进程树，避免遗留 python/node/ffmpeg。
+/// App 退出（窗口关闭）时也清理仍在运行的子进程树，避免遗留 python/node。
+/// `drop` 拿到的是 `&mut self`，用 `get_mut()` 直接取内部值，完全不加锁——
+/// 避免退出时恰好有后台线程持锁而导致卡在关闭流程上。
 impl Drop for TaskState {
     fn drop(&mut self) {
-        if let Ok(mut guard) = self.child.lock() {
-            if let Some(mut child) = guard.take() {
-                kill_process_tree(&mut child);
-            }
+        let child = self.child.get_mut().ok().and_then(|c| c.take());
+        if let Some(mut child) = child {
+            kill_process_tree(&mut child);
         }
     }
 }
@@ -144,8 +145,11 @@ fn resolve_engine(python: Option<&String>) -> (String, Vec<String>) {
     ("python".to_string(), vec![default_script()])
 }
 
-/// 结束子进程并连带清理其子孙进程（Python 会派生 node/ffmpeg）。
+/// 结束子进程并连带清理其子孙进程（Python 会派生 node）。
 /// Windows 用 taskkill /T 杀整棵进程树，避免停止后遗留孤儿进程。
+///
+/// 注意：这里的 `wait()` 必须带超时。若子进程卡在不可中断的系统调用上，
+/// 无超时的 `wait()` 会永久阻塞调用者——而调用者可能是主线程或 shutdown 路径。
 fn kill_process_tree(child: &mut Child) {
     #[cfg(windows)]
     {
@@ -160,7 +164,20 @@ fn kill_process_tree(child: &mut Child) {
             .output();
     }
     let _ = child.kill();
-    let _ = child.wait();
+
+    // 最多等 3 秒回收，超时则放弃（进程已被 kill，句柄随 Child drop 释放）
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {}
+            Err(_) => break,
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
 }
 
 /// 校验 python 路径是否为一个可信的解释器可执行文件。
@@ -329,11 +346,12 @@ fn spawn_task(
     args: Vec<String>,
     engine: (String, Vec<String>),
 ) -> Result<String, String> {
-    // 先杀掉上一次任务（连带清理其子进程）
-    if let Ok(mut guard) = state.child.lock() {
-        if let Some(mut old) = guard.take() {
-            kill_process_tree(&mut old);
-        }
+    // 先取走上一次任务的 child，**在锁外**再杀。
+    // 绝不能持锁调用 kill_process_tree：它内部有 taskkill .output() 与无超时的
+    // child.wait()，持锁期间会堵死 stop_task / 窗口退出等所有路径。
+    let old_child = state.child.lock().ok().and_then(|mut g| g.take());
+    if let Some(mut old) = old_child {
+        kill_process_tree(&mut old);
     }
 
     // 清理上一次运行残留的停止信号，避免新任务一启动就被当成“停止”。
@@ -485,11 +503,35 @@ fn parse_playlists(stdout: &str) -> Result<Vec<Playlist>, String> {
 
 /// 开始下载歌单。
 /// 参数较多是 Tauri 命令的固有形态（前端按名字逐个传），不宜合并成结构体。
+///
+/// 必须 async：`resolve_engine` 在首次运行时会同步解压 41MB 内嵌引擎包，
+/// 而同步命令跑在主线程，会造成启动即卡死。这里用 AppHandle（'static）取状态，
+/// 绕开 `State<'_, _>` 无法移入 spawn_blocking 闭包的生命周期限制。
 #[allow(clippy::too_many_arguments)]
 #[tauri::command]
-fn start_download(
-    _app: AppHandle,
-    state: State<'_, TaskState>,
+async fn start_download(
+    app: AppHandle,
+    playlist: String,
+    quality: String,
+    dir: Option<String>,
+    workers: usize,
+    fallback: bool,
+    min_quality: Option<String>,
+    db: Option<String>,
+    python: Option<String>,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        start_download_blocking(
+            app, playlist, quality, dir, workers, fallback, min_quality, db, python,
+        )
+    })
+    .await
+    .map_err(|e| format!("任务执行失败: {e}"))?
+}
+
+#[allow(clippy::too_many_arguments)]
+fn start_download_blocking(
+    app: AppHandle,
     playlist: String,
     quality: String,
     dir: Option<String>,
@@ -542,7 +584,8 @@ fn start_download(
         }
     }
     let engine = resolve_engine(python.as_ref());
-    spawn_task(_app, &state, "download-log", args, engine)
+    let state = app.state::<TaskState>();
+    spawn_task(app.clone(), &state, "download-log", args, engine)
 }
 
 /// 停止当前任务：先写停止信号让引擎自行收尾，后台线程等待，超时才强杀进程树。
@@ -1001,11 +1044,30 @@ fn list_songs_blocking(
 /// 单曲/多曲下载：把选中的歌曲写入临时 JSON，交给引擎的 --song-file 模式下载。
 /// 走与歌单下载完全相同的管线（取链 → 四重校验 → 落盘 → 失败重试）。
 /// 参数较多是 Tauri 命令的固有形态（前端按名字逐个传），不宜合并成结构体。
+///
+/// 必须 async：`resolve_engine` 首次运行会同步解压 41MB 引擎包，不能阻塞主线程。
 #[allow(clippy::too_many_arguments)]
 #[tauri::command]
-fn download_songs(
+async fn download_songs(
     app: AppHandle,
-    state: State<'_, TaskState>,
+    songs: Vec<serde_json::Value>,
+    quality: String,
+    dir: Option<String>,
+    workers: usize,
+    fallback: bool,
+    min_quality: Option<String>,
+    python: Option<String>,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        download_songs_blocking(app, songs, quality, dir, workers, fallback, min_quality, python)
+    })
+    .await
+    .map_err(|e| format!("任务执行失败: {e}"))?
+}
+
+#[allow(clippy::too_many_arguments)]
+fn download_songs_blocking(
+    app: AppHandle,
     songs: Vec<serde_json::Value>,
     quality: String,
     dir: Option<String>,
@@ -1062,7 +1124,8 @@ fn download_songs(
         }
     }
     let engine = resolve_engine(python.as_ref());
-    spawn_task(app, &state, "download-log", args, engine)
+    let state = app.state::<TaskState>();
+    spawn_task(app.clone(), &state, "download-log", args, engine)
 }
 
 /// 运行引擎并解析其 JSON 输出（取最后一行非空输出），供 search_songs / list_songs 复用。
