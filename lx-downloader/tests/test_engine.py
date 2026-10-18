@@ -319,5 +319,45 @@ class SearchApiTest(unittest.TestCase):
         self.assertIn('--song-file', src)
 
 
+class StrictMatchTest(unittest.TestCase):
+    """严格匹配：歌名必须完全相同，绝不把「出山」和「出山 (DJ版)」当同一首。"""
+
+    def test_identical_names_match(self):
+        self.assertTrue(eng.strict_song_key_match('晴天', '晴天'))
+        self.assertTrue(eng.strict_song_key_match('出山', '出山'))
+
+    def test_version_suffix_does_not_match(self):
+        # 核心回归：真实库 773 首里有 35 组这样的同键冲突
+        self.assertFalse(eng.strict_song_key_match('出山', '出山 (DJ版)'))
+        self.assertFalse(
+            eng.strict_song_key_match('高阶萌妹成长指南', '高阶萌妹成长指南 (消音伴奏)')
+        )
+        self.assertFalse(
+            eng.strict_song_key_match('萌妹进行曲', '萌妹进行曲（高阶萌妹成长指南）')
+        )
+
+    def test_whitespace_and_case_normalized(self):
+        self.assertTrue(eng.strict_song_key_match('  晴天  ', '晴天'))
+        self.assertTrue(eng.strict_song_key_match('Hello  World', 'hello world'))
+        self.assertTrue(eng.strict_song_key_match('ＳＵＮ', 'SUN'))  # 全角 → 半角
+
+    def test_brackets_content_is_significant(self):
+        self.assertFalse(eng.strict_song_key_match('歌 (Live)', '歌 (Remix)'))
+        self.assertTrue(eng.strict_song_key_match('歌 (Live)', '歌 （Live）'))
+
+    def test_empty_never_matches(self):
+        self.assertFalse(eng.strict_song_key_match('', '晴天'))
+        self.assertFalse(eng.strict_song_key_match('晴天', ''))
+        self.assertFalse(eng.strict_song_key_match('', ''))
+
+    def test_loose_key_still_strips_brackets(self):
+        # 宽松版本保留给「已下载文件扫描」，行为不变
+        self.assertEqual(eng.norm_song_key('歌 (Live)'), '歌')
+        self.assertEqual(eng.norm_song_key('歌 （Live）'), '歌')
+
+    def test_strict_key_handles_none(self):
+        self.assertEqual(eng.strict_song_key(None), '')
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

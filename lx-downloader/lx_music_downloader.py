@@ -343,8 +343,46 @@ def sanitize_filename(name):
     return name or 'untitled'
 
 
+def strict_song_key(s):
+    """严格匹配键：只做「首尾空白 + 连续空白折叠 + 大小写 + 全半角」归一化。
+
+    **绝不删除括号内容、标点或任何字符**。原因（真实库 773 首里有 35 组同键冲突）：
+      - 「出山」 vs 「出山 (DJ版)」
+      - 「高阶萌妹成长指南」 vs 「高阶萌妹成长指南 (消音伴奏)」
+      - 「萌妹进行曲」 vs 「萌妹进行曲（高阶萌妹成长指南）」
+    若按「去掉括号再比」，这些会被判成同一首，正是下错歌的根源。
+    """
+    if not s:
+        return ''
+    s = str(s)
+    # 全角 ASCII（！ 到 ～）→ 半角，避免「（」与「(」被判成不同
+    s = ''.join(
+        chr(ord(ch) - 0xFEE0) if 0xFF01 <= ord(ch) <= 0xFF5E else ch
+        for ch in s
+    )
+    s = s.replace('\u3000', ' ')          # 全角空格 → 半角
+    s = re.sub(r'\s+', ' ', s).strip()    # 折叠空白
+    return s.casefold()
+
+
+def strict_song_key_match(a, b):
+    """严格比较：归一化后必须**完全相等**。空值一律视为不匹配。
+
+    旧实现「空即放行」会让没有标题的候选直接通过校验，这里一并收紧。
+    """
+    ka = strict_song_key(a)
+    kb = strict_song_key(b)
+    if not ka or not kb:
+        return False
+    return ka == kb
+
+
 def norm_song_key(s):
-    """归一化歌名/歌手用于模糊匹配：去括号内容、空白和标点，转小写。"""
+    """宽松归一化（**已无调用方，仅保留给外部脚本/测试参考**）。
+
+    会去掉括号内容与标点，是「不可逆的多对一映射」——「出山」与「出山 (DJ版)」
+    会塌缩成同一个键。判断「是不是同一首歌」一律用 strict_song_key。
+    """
     if not s:
         return ''
     s = re.sub(r'\([^)]*\)', '', str(s))   # 半角括号内容
@@ -353,8 +391,13 @@ def norm_song_key(s):
     s = re.sub(r'[!-/:-@\[-`{-~]', '', s)
     return s.lower()
 
+
 def norm_song_key_match(a, b):
-    """归一化后比较歌名是否匹配：全等 或 短名为长名前缀（版本后缀场景）。"""
+    """宽松比较（**已无调用方**）。
+
+    保留它只是为了让 `analyze_quality.py` 等辅助脚本仍可导入；
+    主流程已全部改用 `strict_song_key_match`。
+    """
     na = norm_song_key(a)
     nb = norm_song_key(b)
     if not na or not nb:
@@ -374,50 +417,47 @@ def _connect_db_ro(db_path):
     return sqlite3.connect(f'file:{db_path}?mode=ro', uri=True)
 
 
-def get_alternative_sources(db_path, song, fuzzy=True):
-    """查找同名歌曲的其他可用源（替代源回退）。
-    默认做模糊匹配：歌名归一化（去掉 ()/（）/标点后）相同即视为同曲，可命中
-    “萌妹进行曲” vs “萌妹进行曲（高阶萌妹成长指南）”这类带版本后缀的条目，
-    从而拿到真正的无损/320k 版本。
-    若来源是导入的 .lxmc/.json 歌单文件（非 SQLite），无数据库可查，返回空列表。"""
+def get_alternative_sources(db_path, song):
+    """查找同曲的其他平台记录（替代源回退）。
+
+    **严格匹配**：歌名与歌手都必须是「归一化后完全相等」（只忽略空白/大小写/全半角）。
+    不再把「出山」与「出山 (DJ版)」、「萌妹进行曲」与「萌妹进行曲（高阶萌妹成长指南）」
+    当成同一首——真实库里这类同键冲突有 35 组，模糊匹配正是下错歌的主因。
+
+    若来源是导入的 .lxmc/.json 歌单文件（非 SQLite），无数据库可查，返回空列表。
+    """
     if is_lxmc_file(str(db_path)):
         return []
     conn = _connect_db_ro(db_path)
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
-    if fuzzy:
-        cur.execute("""
-            SELECT id, name, singer, source, interval, meta
-            FROM my_list_music_info
-            WHERE source != ? AND name != ?
-            ORDER BY CASE source WHEN 'tx' THEN 0 WHEN 'wy' THEN 1 WHEN 'kw' THEN 2 WHEN 'kg' THEN 3 ELSE 4 END
-        """, (song['source'], song['name']))
-        cand = [dict(r) for r in cur.fetchall()]
-        nk_name = norm_song_key(song['name'])
-        nk_singer = norm_song_key(song['singer'])
-        rows = []
-        seen = set()
-        for r in cand:
-            # 版本后缀兼容：如“萌妹进行曲” 与 “萌妹进行曲（高阶萌妹成长指南）”视为同曲，
-            # 从而把有 flac/320k 记录的 kw 版本找回来当替代源。
-            if not norm_song_key_match(r['name'], song['name']):
-                continue
-            # 歌手完全匹配，或归一化后完全匹配（兼容多歌手顺序/别名）
-            if nk_singer and norm_song_key(r['singer']) != nk_singer:
-                continue
-            if r['id'] in seen:
-                continue
-            seen.add(r['id'])
-            rows.append(r)
-    else:
-        cur.execute("""
-            SELECT id, name, singer, source, interval, meta
-            FROM my_list_music_info
-            WHERE name = ? AND singer = ? AND source != ?
-            ORDER BY CASE source WHEN 'tx' THEN 0 WHEN 'wy' THEN 1 WHEN 'kw' THEN 2 WHEN 'kg' THEN 3 ELSE 4 END
-        """, (song['name'], song['singer'], song['source']))
-        rows = [dict(r) for r in cur.fetchall()]
+    cur.execute("""
+        SELECT id, name, singer, source, interval, meta
+        FROM my_list_music_info
+        WHERE source != ? AND name != ?
+        ORDER BY CASE source WHEN 'tx' THEN 0 WHEN 'wy' THEN 1 WHEN 'kw' THEN 2 WHEN 'kg' THEN 3 ELSE 4 END
+    """, (song['source'], song['name']))
+    cand = [dict(r) for r in cur.fetchall()]
     conn.close()
+
+    target_name = strict_song_key(song['name'])
+    target_singer = strict_song_key(song['singer'])
+    if not target_name:
+        return []
+
+    rows = []
+    seen = set()
+    for r in cand:
+        # 歌名必须完全一致（含括号内的版本后缀）
+        if strict_song_key(r['name']) != target_name:
+            continue
+        # 歌手：目标歌手为空时不做限制，否则必须完全一致
+        if target_singer and strict_song_key(r['singer']) != target_singer:
+            continue
+        if r['id'] in seen:
+            continue
+        seen.add(r['id'])
+        rows.append(r)
     return rows
 
 
@@ -684,14 +724,17 @@ def safe_unlink(path):
 
 
 def song_exists_in_dir(download_dir, singer, name):
-    """检查歌单中某首歌是否已下载（按 歌手-歌名 归一化模糊匹配任意扩展名）。
-    可命中已下载的变体版本（如“歌名 (Live)”），避免重复下载；模糊命中后
-    仍由下载流程按时长+内容校验把关，不会因误判而跳过必需的重新下载。"""
+    """检查歌单中某首歌是否已下载（按「歌手 - 歌名」**严格**匹配任意扩展名）。
+
+    严格等于「归一化后完全相同」：只忽略空白/大小写/全半角，
+    绝不把「晴天」当成「晴天 (Live)」——否则用户要原版时会被错误跳过，
+    拿到的是伴奏/Live 版，而且每次重跑都会跳过、永远得不到纠正。
+    """
     base_name = sanitize_filename(f"{singer} - {name}")
     try:
         for f in download_dir.iterdir():
             if f.is_file() and f.suffix.lower() in ('.mp3', '.m4a', '.flac', '.aac', '.wav', '.ogg', '.ape'):
-                if norm_song_key_match(f.stem, base_name):
+                if strict_song_key_match(f.stem, base_name):
                     return f
     except Exception:
         pass
@@ -1007,20 +1050,26 @@ def read_artist_tag(path):
 
 
 def artist_matches_downloaded(path, expected_singer):
-    """若文件带 artist 标签，校验是否与预期歌手匹配（归一化后）。
-    预期歌手为空或标签为空时不做判断（返回 True，不误杀）。"""
+    """若文件带 artist 标签，校验是否与预期歌手**严格**匹配。
+
+    严格化点：不再吃掉括号内容与标点，避免「某某（feat. 谁）」被判成「某某」。
+    预期歌手为空或标签为空时仍不做判断（返回 True），避免误杀无标签文件。
+    """
     if not expected_singer:
         return True
     tags = read_artist_tag(path)
     if not tags:
         return True  # 无标签不做歌手校验，避免误杀
-    exp_n = norm_song_key(expected_singer)
+    exp_n = strict_song_key(expected_singer)
+    if not exp_n:
+        return True
     for a in tags:
-        if norm_song_key(a) == exp_n:
+        if strict_song_key(a) == exp_n:
             return True
-    # 多歌手：任一标签与预期任一分段匹配
-    exp_parts = [norm_song_key(x) for x in re.split(r'[、,，;&/]', expected_singer) if x.strip()]
-    tag_norms = [norm_song_key(a) for a in tags]
+    # 多歌手：预期按分隔符拆段后，每段都要能在标签里找到完全相等的一项
+    exp_parts = [strict_song_key(x) for x in re.split(r'[、,，;&/]', expected_singer) if x.strip()]
+    tag_norms = [strict_song_key(a) for a in tags]
+    exp_parts = [e for e in exp_parts if e]
     if exp_parts:
         return all(any(e == t for t in tag_norms) for e in exp_parts)
     return False
@@ -1391,7 +1440,9 @@ def run():
             if not name:
                 continue
             singer = str(s.get('singer', '') or '').strip()
-            key = (norm_song_key(singer), norm_song_key(name))
+            # 严格去重：只合并「完全同名同歌手」的多平台记录，
+            # 不把「晴天」与「晴天 (伴奏)」合并成一行
+            key = (strict_song_key(singer), strict_song_key(name))
             if key in seen:
                 continue
             seen.add(key)

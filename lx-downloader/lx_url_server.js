@@ -107,13 +107,39 @@ function loadScripts(file) {
   return [{ name: path.basename(file), version: '1.0.0', script: raw }];
 }
 
-// 加载优先级（2026-08-22 全流程实测保留的 5 个有效音源）：
-// 聚合源候选最多放最前，其后是 QQ 直查稳定的源。运行时另有 sourceScore
-// 成功榜动态调序，这里的静态排序只决定冷启动顺序。
+// 音源加载顺序：优先读用户拖拽排序的结果（%APPDATA%\lx-downloader-sources\.order.json），
+// 没有则回落到内置的静态优先级。GUI「音源」页拖拽后会写这个文件。
+const ORDER_FILE = path.join(
+  apiDir || path.join(process.env.APPDATA || '', 'lx-downloader-sources'),
+  '.order.json',
+);
+
+function readUserOrder() {
+  try {
+    if (!fs.existsSync(ORDER_FILE)) return null;
+    const raw = JSON.parse(fs.readFileSync(ORDER_FILE, 'utf-8'));
+    if (Array.isArray(raw) && raw.length && raw.every((x) => typeof x === 'string')) {
+      return raw;
+    }
+  } catch (e) {
+    process.stderr.write('[lx-url-server] 读取音源排序失败，使用默认顺序\n');
+  }
+  return null;
+}
+
+// 兜底优先级（用户没手动排序过时使用）
 const SOURCE_PRIORITY = ['墨澜', 'K×H', '玉宁熙', '屿溪', '长青'];
 function sourceRank(name) {
   for (let i = 0; i < SOURCE_PRIORITY.length; i++) if (name.includes(SOURCE_PRIORITY[i])) return i;
   return SOURCE_PRIORITY.length;
+}
+
+// 用户排序：文件名完全一致则按其下标排序，未列出的排在最后并保持字典序
+const USER_ORDER = readUserOrder();
+function userRank(name) {
+  if (!USER_ORDER) return null;
+  const idx = USER_ORDER.indexOf(name);
+  return idx >= 0 ? idx : USER_ORDER.length;
 }
 
 // 音源缺失/为空时的统一出口：打印清晰指引后退出，避免后续取链接全部失败、用户一头雾水。
@@ -130,9 +156,19 @@ function loadScriptSet() {
   }
   const dir = apiDir || path.join(__dirname, 'sources');
   if (!fs.existsSync(dir)) failNoSources('未找到音源目录: ' + dir);
-  const files = fs.readdirSync(dir).filter(name => /\.(js|json)$/i.test(name));
+  const files = fs.readdirSync(dir)
+    .filter(name => /\.(js|json)$/i.test(name))
+    .filter(name => name !== '.order.json');
   if (!files.length) failNoSources('音源目录为空: ' + dir);
-  files.sort((a, b) => (sourceRank(a) - sourceRank(b)) || a.localeCompare(b));
+  // 排序规则：用户拖拽顺序优先；没排过则用内置优先级
+  files.sort((a, b) => {
+    const ua = userRank(a), ub = userRank(b);
+    if (ua != null && ub != null && ua !== ub) return ua - ub;
+    if (ua != null && ub == null) return -1;
+    if (ua == null && ub != null) return 1;
+    return (sourceRank(a) - sourceRank(b)) || a.localeCompare(b);
+  });
+  process.stderr.write('[lx-url-server] 音源顺序: ' + files.join(' > ') + '\n');
   return files.flatMap(name => loadScripts(path.join(dir, name)));
 }
 const scripts = loadScriptSet();
@@ -342,37 +378,54 @@ function checkUrl(url, timeout = 4000) {
 }
 
 // ========== 按名搜索兜底（多接口，带歌名+歌手+时长校验） ==========
+// 宽松归一化：**仅**用于「已下载文件/本地比对」这类允许变体的场景。
+// 会删括号内容与标点，不能用来判断「两个平台上的这首歌是不是同一首」。
 function normKw(s) {
   if (!s) return '';
   return String(s)
     .replace(/\(\s*Live\s*\)/gi, '')
     .replace(/\([^)]*\)/g, '')
-    .replace(/（[^）]*）/g, '')   // 全角括号内容（如“萌妹进行曲（高阶萌妹成长指南）”）
+    .replace(/（[^）]*）/g, '')
     .replace(/\s+/g, '')
     .replace(/[!-/:-@\[-`{-~]/g, '')
     .trim().toLowerCase();
 }
-function nameMatch(a, b) {
-  const na = normKw(a), nb = normKw(b);
-  if (!na || !nb) return true;
-  if (na === nb) return true;
-  // 版本后缀场景：如 “萌妹进行曲” vs “萌妹进行曲（高阶萌妹成长指南）”
-  // （normKw 已去掉全角括号，后缀文字保留）。短名若是长名的前缀则视为同曲，
-  // 命中结果仍由下载器按时长+内容校验兜底，不会下错歌。
-  const [short, long] = na.length <= nb.length ? [na, nb] : [nb, na];
-  return long.startsWith(short);
+
+// 严格归一化：只折叠空白、忽略大小写、全角 ASCII 转半角。
+// **绝不删括号内容/标点**，因为「出山」与「出山 (DJ版)」是两首歌。
+function strictKey(s) {
+  if (s == null) return '';
+  let out = '';
+  for (const ch of String(s)) {
+    const code = ch.codePointAt(0);
+    // 全角 ASCII（！ U+FF01 ~ ～ U+FF5E）转半角
+    out += (code >= 0xff01 && code <= 0xff5e) ? String.fromCodePoint(code - 0xfee0) : ch;
+  }
+  return out.replace(/\u3000/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
 }
+
+// 严格歌名匹配：归一化后必须完全相等。
+// 旧实现用「短名是长名前缀」放行，会让「萌妹进行曲」命中
+// 「萌妹进行曲（高阶萌妹成长指南）」，这正是下错歌的来源。
+function nameMatch(a, b) {
+  const na = strictKey(a), nb = strictKey(b);
+  if (!na || !nb) return false;
+  return na === nb;
+}
+
+// 严格歌手匹配：完全相等；支持多歌手的顺序无关全匹配（不允许多余/缺失歌手）。
 function singerMatch(actual, expected) {
   if (!expected) return true;
   if (!actual) return false;
-  const na = normKw(actual), nb = normKw(expected);
-  // 完全一致 或 相互包含（多歌手场景）
-  if (na === nb || na.includes(nb) || nb.includes(na)) return true;
-  // 多歌手：按分隔符拆分后逐名匹配（如“熊田茜音、増井優花” vs “増井優花;熊田茜音”）
-  const split = (s) => s.split(/[、,，;;&/]/).map(x => normKw(x)).filter(Boolean);
+  const na = strictKey(actual), nb = strictKey(expected);
+  if (na === nb) return true;
+  // 多歌手：双方都按分隔符拆分，集合完全一致才算匹配（顺序无关）
+  const split = (s) => strictKey(s).split(/[、,，;&/]+/).map((x) => x.trim()).filter(Boolean);
   const ea = split(nb), aa = split(na);
-  if (ea.length > 1) return ea.every(x => aa.some(y => y.includes(x) || x.includes(y)));
-  return false;
+  if (ea.length === 0 || aa.length === 0) return false;
+  if (ea.length !== aa.length) return false;
+  const sa = new Set(aa);
+  return ea.every((x) => sa.has(x));
 }
 // 时长匹配：期望 interval（秒）存在时，候选时长差异需在容差内，进一步防止下错歌
 function intervalMatch(actualSec, expectedInterval) {
