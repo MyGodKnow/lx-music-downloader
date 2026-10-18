@@ -40,7 +40,7 @@ import threading
 import time
 import queue
 import traceback
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 from pathlib import Path
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
@@ -111,6 +111,15 @@ QUALITY_OPTIONS = {
     '5': ('flac24bit', 'Hi-Res'),
 }
 QUALITY_LABELS = {value[0]: value[1] for value in QUALITY_OPTIONS.values()}
+
+# 单首歌的总时间预算（秒）。超预算就放弃这首歌并记入 failed.txt。
+#
+# 依据：正常歌曲从取链到落盘约 10-60s；而失败歌曲会走
+# 「多个候选源 × 多个音质档 × 每源 20s 超时」+「按名搜索 30s 预算」，
+# 实测累积到 200-400s。这段时间足够其它 5-8 首正常歌曲完成，
+# 让一首失败歌独占并发位是纯浪费。
+SONG_TIME_BUDGET = 150
+
 DOWNLOAD_STOP_EVENT = threading.Event()
 # GUI 优雅停止：Rust 侧写入该信号文件，本进程轮询到后走与 Ctrl+C 相同的收尾流程
 # （停止派发新任务 → 在途任务落盘 → 写 failed.txt），避免被直接强杀而留下 .part。
@@ -1229,7 +1238,11 @@ def load_config():
         'fallback_quality': False,
         # 默认并发 8：实测 16 首对比（320k，同一音源池）
         #   4 并发 122.3s / 8 并发 108.8s / 16 并发 141.2s（失败也更多）
-        # 16 路会打爆平台限流，反而更慢。上限也压到 12。
+        # 16 路会打爆平台限流，反而更慢。
+        # 注意：这只是**起始窗口**，run_download 会按实测成功率动态升降
+        # （失败率高就降到 4，全成功且仍有积压就往上加），因为最优值随
+        # 网络与音源状态漂移——40 首测试里 6 并发 192s、12 并发 204s，
+        # 而 20 首测试里 12 并发反而更快，固定值没有普适解。
         'workers': max(4, min(8, (cpu_count or 4))),
         'node': '',
         'api': '',
@@ -1648,9 +1661,20 @@ def run_download(args, songs, db_path=None, title=None):
                 candidates_queue.reverse()
             tried_sources = set()
 
+            # 单首歌的总时间预算：超过就放弃，避免一首卡住整个 worker。
+            # 实测失败歌曲常因「多源 × 多音质档 × 每源 20s 超时」累积到 200-400s，
+            # 而这段时间足以让其它 5-8 首歌完成下载。宁可把这首歌记进 failed.txt，
+            # 也不要它独占一个并发位。
+            song_deadline = _t0 + SONG_TIME_BUDGET
+            budget_hit = False
+
             for cand in candidates_queue:
                 if DOWNLOAD_STOP_EVENT.is_set():
                     return 'stopped'
+                if time.time() > song_deadline:
+                    budget_hit = True
+                    errors.append('单曲时间预算耗尽')
+                    break
                 if cand['source'] in tried_sources:
                     continue
                 tried_sources.add(cand['source'])
@@ -1661,6 +1685,10 @@ def run_download(args, songs, db_path=None, title=None):
                     quality_levels = lower_quality_options(args.quality, args.min_quality if hasattr(args, 'min_quality') else '320k') if args.fallback_quality else [args.quality]
                     quality_errors = []
                     for requested_quality in quality_levels:
+                        if time.time() > song_deadline:
+                            budget_hit = True
+                            quality_errors.append('单曲时间预算耗尽')
+                            break
                         try:
                             _tu = time.time()
                             cands = server.get_urls(source, music_info, requested_quality)
@@ -1682,6 +1710,10 @@ def run_download(args, songs, db_path=None, title=None):
                     raise RuntimeError('; '.join(quality_errors) or '所有音质均失败')
                 except Exception as e:
                     errors.append(f'{cand["source"]}: {e}')
+
+            # 预算耗尽就不再走「按名搜索」（它本身还有 30s 预算，会继续拖）
+            if budget_hit:
+                raise RuntimeError('; '.join(errors) if errors else '耗时超限')
 
             # 按名搜索兜底（不限定原平台）。返回多个候选，逐个下载实测内容，
             # 通过时长+音质校验才算成功，避免"伪无损"链接（标 FLAC 实为 48k MP4）导致的误判。
@@ -1714,59 +1746,110 @@ def run_download(args, songs, db_path=None, title=None):
             return ('fail', song['name'], song['singer'], str(e))
     start_time = time.time()
     worker_count = max(1, min(32, args.workers))
-    with ThreadPoolExecutor(max_workers=worker_count) as pool:
-        futures = {pool.submit(process_song, i, s): s for i, s in enumerate(songs)}
+    # 自适应并发：固定并发不可靠——实测同一批歌 8 并发 139s、12 并发 97s，
+    # 而另一轮 8 并发反而优于 16 并发（最优值随网络与音源状态漂移）。
+    # 这里用「分批调度」：每批完成后根据实测成功率与耗时调整下一批的并发度。
+    # 池子按最大并发建好复用，实际同时在跑的任务数由调度器控制。
+    max_workers = min(32, max(worker_count, 12))
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
         total = len(songs)
         stopped_early = False
-        for i, fut in enumerate(as_completed(futures), 1):
-            try:
-                result = fut.result()
-            except Exception as exc:
-                result = ('fail', futures[fut].get('name', 'unknown'), futures[fut].get('singer', ''), str(exc))
-                with print_lock:
-                    print(f'\n[线程异常] {futures[fut].get("name", "unknown")}: {exc}')
-            if result == 'stopped' and DOWNLOAD_STOP_EVENT.is_set():
-                for pending in futures:
-                    if not pending.done():
-                        pending.cancel()
-                stopped_early = True
-                break
-            if result == 'success':
-                stats['success'] += 1
-            elif result == 'skip':
-                stats['skip'] += 1
-            elif result == 'stopped':
-                continue
-            else:
-                stats['fail'] += 1
-                if len(result) >= 4:
-                    failure = (result[1], result[2], result[3])
-                    fail_list.append(failure)
-                    failed_songs.append((futures[fut], failure))
+        done = 0
+        pending_index = 0
+        in_flight = {}          # future -> song
+        cur_window = worker_count   # 当前允许的在途任务数
+        import collections
+        recent = collections.deque(maxlen=30)  # 最近结果：True=成功
+        batch_start = time.time()
+        batch_done = 0
+
+        def submit_until_full():
+            nonlocal pending_index
+            while pending_index < total and len(in_flight) < cur_window:
+                if DOWNLOAD_STOP_EVENT.is_set():
+                    return
+                s = songs[pending_index]
+                fut = pool.submit(process_song, pending_index, s)
+                in_flight[fut] = s
+                pending_index += 1
+
+        submit_until_full()
+
+        while in_flight:
+            # 等任意一个完成
+            done_set, _ = wait(list(in_flight.keys()), return_when=FIRST_COMPLETED)
+            for fut in done_set:
+                song_obj = in_flight.pop(fut, None)
+                done += 1
+                batch_done += 1
+                try:
+                    result = fut.result()
+                except Exception as exc:
+                    result = ('fail', (song_obj or {}).get('name', 'unknown'),
+                              (song_obj or {}).get('singer', ''), str(exc))
+                    with print_lock:
+                        print(f'\n[线程异常] {(song_obj or {}).get("name", "unknown")}: {exc}')
+                if result == 'stopped' and DOWNLOAD_STOP_EVENT.is_set():
+                    for p in in_flight:
+                        p.cancel()
+                    in_flight.clear()
+                    stopped_early = True
+                    break
+                if result == 'success':
+                    stats['success'] += 1
+                    recent.append(True)
+                elif result == 'skip':
+                    stats['skip'] += 1
+                    recent.append(True)
+                elif result == 'stopped':
+                    continue
                 else:
-                    failure = (str(result), '', 'unknown')
-                    fail_list.append(failure)
-                    failed_songs.append((futures[fut], failure))
-            done = i
-            elapsed = time.time() - start_time
-            speed = done / elapsed if elapsed > 0 else 0
-            # 进行中（未完成）的任务数：并发实时活跃度，避免进度"冻结→突跳"的观感
-            active = max(0, len(futures) - done)
-            # 结构化进度事件（前端识别 ##PROGRESS## 前缀渲染进度条，不进入日志区）
-            try:
-                _progress = {
-                    'done': done,
-                    'total': total,
-                    'success': stats['success'],
-                    'fail': stats['fail'],
-                    'skip': stats['skip'],
-                    'active': active,
-                    'speed': round(speed, 1),
-                }
-                print('##PROGRESS## ' + json.dumps(_progress, ensure_ascii=False), flush=True)
-            except Exception:
-                print(f'\r进度: {done}/{total} | 成功 {stats["success"]} | 失败 {stats["fail"]} | '
-                      f'跳过 {stats["skip"]} | 进行中 {active} | 速率 {speed:.1f}首/秒', end='', flush=True)
+                    stats['fail'] += 1
+                    recent.append(False)
+                    if len(result) >= 4:
+                        failure = (result[1], result[2], result[3])
+                        fail_list.append(failure)
+                        failed_songs.append((song_obj, failure))
+                    else:
+                        failure = (str(result), '', 'unknown')
+                        fail_list.append(failure)
+                        failed_songs.append((song_obj, failure))
+
+                elapsed = time.time() - start_time
+                speed = done / elapsed if elapsed > 0 else 0
+                active = len(in_flight)
+                try:
+                    _progress = {
+                        'done': done,
+                        'total': total,
+                        'success': stats['success'],
+                        'fail': stats['fail'],
+                        'skip': stats['skip'],
+                        'active': active,
+                        'speed': round(speed, 1),
+                    }
+                    print('##PROGRESS## ' + json.dumps(_progress, ensure_ascii=False), flush=True)
+                except Exception:
+                    pass
+
+            if stopped_early:
+                break
+
+            # 每完成 6 首评估一次：失败率高就降并发，全成功且仍有积压就小幅升
+            if batch_done >= 6:
+                fail_rate = 1.0 - (sum(recent) / len(recent) if recent else 1.0)
+                old_window = cur_window
+                if fail_rate > 0.35:
+                    cur_window = max(4, cur_window - 3)
+                elif fail_rate < 0.12 and cur_window < max_workers:
+                    cur_window = min(max_workers, cur_window + 2)
+                if cur_window != old_window:
+                    with print_lock:
+                        print(f'[调度] 并发窗口 {old_window} → {cur_window}'
+                              f'（近 {len(recent)} 首失败率 {fail_rate*100:.0f}%）', flush=True)
+                batch_done = 0
+
+            submit_until_full()
     print()
 
     # 停止时等待在途任务收尾：ThreadPoolExecutor 退出时会 join 所有运行中的任务，

@@ -615,16 +615,21 @@ async function searchByName(name, singer, interval) {
     else if (urlLooks128k(url)) s += 50; // 已知 128k，几乎垫底
     return s;
   };
-  // 兜底搜索允许的总耗时预算：源一多（约 30 个）逐个带超时轮询会很慢，
-  // 一旦超时就用已收集到的候选返回，宁可少几个候选也不能让下载卡死。
-  const deadline = Date.now() + 30000;
+  // 兜底搜索允许的总耗时预算。
+  // 关键改动：原来是「跑满 30s 才返回」，导致失败歌曲每首都白等 30 秒。
+  // 现在改为「拿到足够候选就提前返回」——只要凑够 3 个候选直接收工，
+  // 只有长时间一个都没拿到时才耗到预算上限。
+  const SEARCH_BUDGET_MS = 15000;
+  const ENOUGH_CANDIDATES = 3;
+  const deadline = Date.now() + SEARCH_BUDGET_MS;
   const overBudget = () => Date.now() > deadline;
+  const enough = () => candidates.length >= ENOUGH_CANDIDATES;
 
   // 方式一：多平台逐音源 musicSearch（换接口搜索）—— 精确命中后取直链
   for (const platform of ['kw', 'kg', 'wy', 'tx']) {
-    if (overBudget()) break;
+    if (overBudget() || enough()) break;
     for (const entry of requestHandlers) {
-      if (overBudget()) break;
+      if (overBudget() || enough()) break;
       if (sourceBlocked(entry.name)) continue;
       try {
         const result = await callHandler(entry, platform, 'musicSearch', { musicInfo: { name, singer }, page: 1, type: 'song' }, 5000);
@@ -649,7 +654,7 @@ async function searchByName(name, singer, interval) {
   }
 
   // 方式二：溯音酷我（oiapi）严格校验
-  try {
+  if (!enough()) try {
     const kwQuery = encodeURIComponent(`${singer} ${name}`);
     const r = await doRequest(`https://oiapi.net/api/Kuwo?msg=${kwQuery}&n=1&br=5`, { method: 'GET' }, 15000);
     if (r.statusCode === 200 && r.body && typeof r.body === 'object' && r.body.code === 1) {
@@ -670,7 +675,7 @@ async function searchByName(name, singer, interval) {
     }
   } catch (e) { /* continue */ }
   // 方式三：溯音网易云（oiapi）严格校验
-  try {
+  if (!enough()) try {
     const nameQuery = encodeURIComponent(`${singer} ${name}`);
     const r = await doRequest(`https://oiapi.net/api/Music_163?name=${nameQuery}&n=1&br=5`, { method: 'GET' }, 15000);
     if (r.statusCode === 200 && r.body && typeof r.body === 'object' && r.body.code === 0 && r.body.data) {
@@ -688,7 +693,7 @@ async function searchByName(name, singer, interval) {
   } catch (e) { /* continue */ }
   // 方式四：QQ 音乐按名搜索 → 把命中歌曲的 songmid 喂回各音源 tx 取链接。
   // 兜底场景：某些源自身的 tx 搜索返回 128k，但直接喂正确 songmid 时可拿到 M800/F000。
-  try {
+  if (!enough()) try {
     const list = await qqSearch(`${singer} ${name}`);
     for (const hit of list) {
       const mid = hit.songmid || '';
@@ -723,11 +728,11 @@ async function searchByName(name, singer, interval) {
   // 个别歌曲的歌手名在不同平台差异较大（日文 vs 中文译名 vs 罗马音），
   // 带歌手搜索可能无结果；此时哪怕已有 128k 候选，也应继续找无损/320k。
   const hasHighQuality = candidates.some((c) => urlLooks320(c.url) || urlLooksLossless(c.url));
-  if (singer && !hasHighQuality) {
+  if (singer && !hasHighQuality && !enough() && !overBudget()) {
     try {
       const list = await qqSearch(name);
       for (const hit of list) {
-        if (overBudget()) break;
+        if (overBudget() || enough()) break;
         const mid = hit.songmid || '';
         if (!mid) continue;
         const qTitle = hit.songname || '';
