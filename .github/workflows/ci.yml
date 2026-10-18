@@ -85,13 +85,21 @@ jobs:
 
       # engine.zip 是构建产物（gitignore），lib.rs 里 include_bytes! 需要它存在。
       # CI 不验证打包，这里放一个占位 zip 让编译与测试可跑。
+      #
+      # 注意：`Set-Content -Encoding Byte` 只在 Windows PowerShell 5.1 可用，
+      # PowerShell 7（GitHub Actions 的 pwsh）已移除该值，必须用 -AsByteStream。
+      # 这里改用 .NET 直接写字节，两个版本都兼容。
       - name: 准备占位引擎包
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path engine | Out-Null
           if (-not (Test-Path engine/engine.zip)) {
-            Set-Content -Path engine/engine.zip -Value "placeholder" -NoNewline -Encoding Byte
+            [System.IO.File]::WriteAllBytes(
+              (Join-Path (Get-Location) 'engine/engine.zip'),
+              [System.Text.Encoding]::ASCII.GetBytes('placeholder')
+            )
           }
+          Get-Item engine/engine.zip | Select-Object Name, Length
 
       - name: 测试
         run: cargo test --all-targets

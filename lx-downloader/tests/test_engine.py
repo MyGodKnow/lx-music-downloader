@@ -211,8 +211,15 @@ class ConfigSelfHealTest(unittest.TestCase):
                 loaded = eng.load_config()
                 self.assertEqual(loaded['dir'], eng.DOWNLOAD_DIR)
                 self.assertEqual(loaded['quality'], 'flac')  # 其他字段保留
-                # 自愈结果应写回配置
-                self.assertIn('落雪', cfg.read_text(encoding='utf-8'))
+
+                # 自愈结果应写回配置文件。
+                # 注意：不要断言路径里包含「落雪」——开发模式与 CI 上的
+                # DOWNLOAD_DIR 是 `<repo>/lx-downloader/downloads`，并不含这两个字；
+                # 真正该验证的是「写回的目录可用」且「不再是乱码路径」。
+                written = json.loads(cfg.read_text(encoding='utf-8'))
+                self.assertEqual(written['dir'], eng.DOWNLOAD_DIR)
+                self.assertFalse(eng._looks_mojibake(written['dir']))
+                self.assertTrue(eng._dir_is_usable(written['dir']))
             finally:
                 eng.CONFIG_PATH = original
 
