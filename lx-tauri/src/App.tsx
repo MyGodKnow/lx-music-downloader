@@ -1138,7 +1138,11 @@ function App() {
               </div>
 
               <div className="sources-toolbar">
-                <button className="primary-btn" onClick={() => sourceInputRef.current?.click()}>
+                <button
+                  className="primary-btn"
+                  onClick={() => sourceInputRef.current?.click()}
+                  disabled={importingLx}
+                >
                   导入音源文件
                 </button>
                 <button className="ghost-btn" onClick={refreshSources}>
