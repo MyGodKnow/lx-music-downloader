@@ -184,12 +184,13 @@ function App() {
 
   const refreshSources = useCallback(async () => {
     try {
-      const [files, dirPath, lxPath] = await Promise.all([
-        invoke<string[]>("list_sources"),
+      // get_source_order 已经包含「实际存在 + 用户排序 + 新文件追加」，直接用它
+      const [ordered, dirPath, lxPath] = await Promise.all([
+        invoke<string[]>("get_source_order"),
         invoke<string>("get_sources_dir"),
         invoke<string | null>("find_lx_desktop_api"),
       ]);
-      setSourceFiles(files);
+      setSourceFiles(ordered);
       setSourcesDir(dirPath);
       setLxApiPath(lxPath);
     } catch (err) {
@@ -327,6 +328,38 @@ function App() {
       addLog("error", String(err));
     }
   }
+
+  // ===== 音源拖拽排序 =====
+  const [dragIndex, setDragIndex] = useState<number | null>(null);
+  const [dropIndex, setDropIndex] = useState<number | null>(null);
+  const [reordering, setReordering] = useState(false);
+
+  /** 把 from 位置的音源移动到 to 位置，并立刻持久化 */
+  const moveSource = useCallback(
+    async (to: number) => {
+      const from = dragIndex;
+      setDragIndex(null);
+      setDropIndex(null);
+      if (from == null || from === to) return;
+
+      const next = [...sourceFiles];
+      const [moved] = next.splice(from, 1);
+      next.splice(to, 0, moved);
+      setSourceFiles(next); // 先乐观更新，拖拽手感不卡
+
+      setReordering(true);
+      try {
+        await invoke("set_source_order", { order: next });
+        addLog("ok", `音源优先级已更新：${moved} → 第 ${to + 1} 位`);
+      } catch (err) {
+        addLog("error", `保存音源顺序失败: ${err}`);
+        await refreshSources(); // 失败则回滚到磁盘上的真实顺序
+      } finally {
+        setReordering(false);
+      }
+    },
+    [dragIndex, sourceFiles, addLog, refreshSources],
+  );
 
   // ===================== 搜索 =====================
 
@@ -1071,6 +1104,13 @@ function App() {
                 />
               </div>
 
+              {sourceFiles.length > 1 && (
+                <p className="hint">
+                  按住音源左侧的 <strong>⠿</strong> 拖拽可调整优先级：越靠上越先被尝试。
+                  顺序会保存到音源目录，下次启动依然生效。
+                </p>
+              )}
+
               <div className="source-list">
                 {sourceFiles.length === 0 ? (
                   <p className="hint">
@@ -1078,10 +1118,47 @@ function App() {
                     音源文件。没有音源时下载会提示「请先导入音源」。
                   </p>
                 ) : (
-                  sourceFiles.map((name) => (
-                    <div key={name} className="source-item">
+                  sourceFiles.map((name, index) => (
+                    <div
+                      key={name}
+                      className={`source-item ${dragIndex === index ? "dragging" : ""} ${
+                        dropIndex === index ? "drop-target" : ""
+                      }`}
+                      draggable={!reordering}
+                      onDragStart={(e) => {
+                        setDragIndex(index);
+                        e.dataTransfer.effectAllowed = "move";
+                        // Firefox 需要设置数据才会触发 drag
+                        e.dataTransfer.setData("text/plain", name);
+                      }}
+                      onDragOver={(e) => {
+                        e.preventDefault();
+                        e.dataTransfer.dropEffect = "move";
+                        if (dropIndex !== index) setDropIndex(index);
+                      }}
+                      onDragLeave={() => {
+                        setDropIndex((d) => (d === index ? null : d));
+                      }}
+                      onDrop={(e) => {
+                        e.preventDefault();
+                        moveSource(index);
+                      }}
+                      onDragEnd={() => {
+                        setDragIndex(null);
+                        setDropIndex(null);
+                      }}
+                      title="按住左侧手柄拖拽可调整优先级"
+                    >
+                      <span className="drag-handle" aria-hidden>
+                        ⠿
+                      </span>
+                      <span className="source-rank">{index + 1}</span>
                       <span className="source-name">{name}</span>
-                      <button className="danger-btn" onClick={() => removeSource(name)}>
+                      <button
+                        className="danger-btn"
+                        onClick={() => removeSource(name)}
+                        disabled={reordering}
+                      >
                         删除
                       </button>
                     </div>

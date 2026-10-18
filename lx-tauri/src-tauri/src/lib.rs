@@ -712,6 +712,70 @@ fn remove_source(file_name: String) -> Result<(), String> {
     Ok(())
 }
 
+// ============ 音源优先级（拖拽排序） ============
+// 顺序存成 `%APPDATA%\lx-downloader-sources\.order.json`（字符串数组，按文件名）。
+// Node 桥接在加载音源时会先读这个文件决定顺序；没有则用内置优先级。
+// 这样排序结果是「用户意图」，不会被程序更新覆盖。
+
+fn source_order_file() -> std::path::PathBuf {
+    user_sources_dir().join(".order.json")
+}
+
+/// 读取用户设定的音源顺序（仅返回当前实际存在的文件，避免残留旧文件名）。
+#[tauri::command]
+fn get_source_order() -> Vec<String> {
+    let dir = user_sources_dir();
+    let existing: Vec<String> = std::fs::read_dir(&dir)
+        .map(|rd| {
+            rd.flatten()
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .filter(|n| {
+                    let l = n.to_lowercase();
+                    (l.ends_with(".js") || l.ends_with(".json")) && n != ".order.json"
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut ordered: Vec<String> = Vec::new();
+    if let Ok(raw) = std::fs::read_to_string(source_order_file()) {
+        if let Ok(list) = serde_json::from_str::<Vec<String>>(&raw) {
+            for name in list {
+                if existing.iter().any(|e| e == &name) && !ordered.contains(&name) {
+                    ordered.push(name);
+                }
+            }
+        }
+    }
+    // 未纳入顺序的新文件按名称追加，保证列表完整
+    let mut rest: Vec<String> = existing
+        .into_iter()
+        .filter(|e| !ordered.contains(e))
+        .collect();
+    rest.sort();
+    ordered.extend(rest);
+    ordered
+}
+
+/// 保存音源顺序（GUI 拖拽后调用）。
+#[tauri::command]
+fn set_source_order(order: Vec<String>) -> Result<(), String> {
+    let dir = user_sources_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建音源目录失败: {e}"))?;
+    // 只接受合法音源文件名，防止写入任意路径
+    let mut clean: Vec<String> = Vec::new();
+    for raw in order {
+        let name = validate_source_name(&raw)?;
+        if !clean.contains(&name) {
+            clean.push(name);
+        }
+    }
+    let json = serde_json::to_string_pretty(&clean)
+        .map_err(|e| format!("序列化音源顺序失败: {e}"))?;
+    std::fs::write(source_order_file(), json).map_err(|e| format!("保存音源顺序失败: {e}"))?;
+    Ok(())
+}
+
 // ============ 从落雪音乐桌面端导入音源 ============
 // 落雪桌面版把用户在 App 内添加的音源存在 %APPDATA%\lx-music-desktop\LxDatas\user_api.json，
 // 结构为 {"userApis":[{"name","version","author","script":"gz_<base64(zlib)>"|"<js>"}]}。
@@ -1180,6 +1244,8 @@ pub fn run() {
             list_sources,
             import_source,
             remove_source,
+            get_source_order,
+            set_source_order,
             find_lx_desktop_api,
             import_lx_desktop_sources,
             search_songs,
