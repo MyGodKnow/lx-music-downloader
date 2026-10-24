@@ -217,7 +217,6 @@ function App() {
   /** 体检后用户勾选要删除的失活音源 */
   const [deadPicked, setDeadPicked] = useState<Set<string>>(new Set());
   /** 体检日志面板是否展开 */
-  const [probeLogOpen, setProbeLogOpen] = useState(false);
   /**
    * 体检过程中的实时日志行。
    *
@@ -766,9 +765,10 @@ function App() {
   async function probeSources() {
     if (probing) return;
     setProbing(true);
-    // 清空上一轮实时日志，并自动展开面板让用户能看到进度
+    // 清空上一轮实时日志（面板会自动出现在音源列表下方）
     setProbeLiveLines([]);
-    setProbeLogOpen(true);
+    // 清掉上一轮结果：否则重新体检期间会一直显示旧结果，看不出在跑
+    setProbeReport(null);
     addLog("info", "开始音源体检（逐个实测取链接 + 测速），可能需要一两分钟…");
     try {
       // 流式跑：日志由 download-log 事件实时推过来（引擎把进度写 stderr），
@@ -1533,145 +1533,6 @@ function App() {
                 />
               </div>
 
-              {/* ===== 体检面板 =====
-                  渲染条件放宽：体检进行中也要显示（此时只有实时日志，没有结果列表），
-                  否则用户点了「音源体检」会看到界面毫无反应。 */}
-              {(probing || (probeReport && probeReport.sources.length > 0)) && (
-                <div className="probe-panel">
-                  <div className="probe-head">
-                    <strong>{probing ? "体检中…" : "体检结果"}</strong>
-                    <span className="hint">
-                      {probing
-                        ? "正在逐个音源实测，日志实时刷新"
-                        : probeReport?.probedAt
-                          ? new Date(probeReport.probedAt).toLocaleString("zh-CN")
-                          : ""}
-                      {!probing && "｜按响应速度排序，快的在前"}
-                    </span>
-                  </div>
-
-                  {/* 实时日志：体检期间自动显示并滚动到底部 */}
-                  {(probing || probeLiveLines.length > 0) && (
-                    <div className="probe-log" ref={probeLogRef}>
-                      {probeLiveLines.length === 0 ? (
-                        <div className="probe-log-line">
-                          <span className="probe-log-detail">正在启动引擎…</span>
-                        </div>
-                      ) : (
-                        probeLiveLines.map((text, i) => {
-                          const isDead = text.includes("失活");
-                          const isFlaky = text.includes("不稳定");
-                          const cls = isDead ? "dead" : isFlaky ? "flaky" : "ok";
-                          return (
-                            <div key={`live-${i}`} className={`probe-log-line ${cls}`}>
-                              <span className="probe-log-detail">{text}</span>
-                            </div>
-                          );
-                        })
-                      )}
-                    </div>
-                  )}
-
-                  {!probing && probeReport && probeReport.sources.length > 0 && (
-                    <>
-                  <div className="probe-list">
-                    {probeReport.sources.map((s, i) => {
-                      const dead = s.status === "dead";
-                      const flaky = s.status === "flaky";
-                      return (
-                        <div
-                          key={s.name}
-                          className={`probe-row ${dead ? "dead" : flaky ? "flaky" : "ok"}`}
-                        >
-                          <span className="probe-rank">{i + 1}</span>
-                          <span className="probe-name" title={s.name}>{s.name}</span>
-                          <span className={`probe-badge ${s.status}`}>
-                            {dead ? "失活" : flaky ? "不稳定" : "正常"}
-                          </span>
-                          <span className="probe-speed">
-                            {s.speedMs != null ? `${s.speedMs} ms` : "—"}
-                          </span>
-                          <span className="probe-detail" title={s.error}>
-                            {dead
-                              ? s.error || "取不到链接"
-                              : `${s.okCount}/${s.total} 成功`}
-                          </span>
-                          {dead && (
-                            <label className="probe-pick">
-                              <input
-                                type="checkbox"
-                                checked={deadPicked.has(s.name)}
-                                onChange={(e) => {
-                                  setDeadPicked((prev) => {
-                                    const next = new Set(prev);
-                                    if (e.target.checked) next.add(s.name);
-                                    else next.delete(s.name);
-                                    return next;
-                                  });
-                                }}
-                              />
-                              删除
-                            </label>
-                          )}
-                        </div>
-                      );
-                    })}
-                  </div>
-
-                  {deadPicked.size > 0 && (
-                    <div className="probe-actions">
-                      <span className="hint">
-                        已勾选 {deadPicked.size} 个失活音源
-                      </span>
-                      <button className="danger-btn" onClick={deletePickedSources}>
-                        删除勾选的音源
-                      </button>
-                      <button className="ghost-btn" onClick={() => setDeadPicked(new Set())}>
-                        取消勾选
-                      </button>
-                    </div>
-                  )}
-
-                  {/* 体检日志：默认折叠，需要时展开看每个源的详细结果 */}
-                  <div className="probe-log-wrap">
-                    <button
-                      className="ghost-btn small"
-                      onClick={() => setProbeLogOpen((v) => !v)}
-                    >
-                      {probeLogOpen ? "收起体检日志" : "查看体检日志"}
-                    </button>
-                    {probeLogOpen && (
-                      <div className="probe-log">
-                        {probeReport.sources.map((s) => {
-                          const mark =
-                            s.status === "dead" ? "失活" : s.status === "flaky" ? "不稳定" : "正常";
-                          const speed = s.speedMs != null ? `  ${s.speedMs}ms` : "";
-                          return (
-                            <div key={`log-${s.name}`} className={`probe-log-line ${s.status}`}>
-                              <span className="probe-log-mark">[{mark}]</span>
-                              <span className="probe-log-name">{s.name}</span>
-                              <span className="probe-log-detail">
-                                {s.okCount}/{s.total} 成功{speed}
-                                {s.error ? ` ｜ ${s.error}` : ""}
-                              </span>
-                            </div>
-                          );
-                        })}
-                        <div className="probe-log-foot">
-                          体检时间：
-                          {probeReport.probedAt
-                            ? new Date(probeReport.probedAt).toLocaleString("zh-CN")
-                            : "未知"}
-                          ｜探测样本：晴天、夜曲（酷我）+ 晴天（网易云）
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                    </>
-                  )}
-                </div>
-              )}
-
               {sourceFiles.length > 1 && (
                 <p className="hint">
                   按住音源左侧的 <strong>⠿</strong> 拖拽可调整优先级：越靠上越先被尝试。
@@ -1733,6 +1594,107 @@ function App() {
                   ))
                 )}
               </div>
+
+              {/* ===== 体检面板（放在音源列表下方，不遮挡音源）=====
+                  只有一份日志：
+                    - 体检中：显示实时滚动的进度行
+                    - 跑完：同一块区域改为显示结果明细（不再重复出现第二份日志） */}
+              {(probing || probeLiveLines.length > 0) && (
+                <div className="probe-panel">
+                  <div className="probe-head">
+                    <strong>{probing ? "体检中…" : "体检日志"}</strong>
+                    <span className="hint">
+                      {probing
+                        ? "正在逐个音源实测，日志实时刷新"
+                        : probeReport?.probedAt
+                          ? new Date(probeReport.probedAt).toLocaleString("zh-CN")
+                          : ""}
+                    </span>
+                    {!probing && probeReport && (
+                      <span className="probe-summary">
+                        正常 {probeReport.sources.filter((s) => s.status === "ok").length}
+                        {" · "}不稳定 {probeReport.sources.filter((s) => s.status === "flaky").length}
+                        {" · "}失活 {probeReport.sources.filter((s) => s.status === "dead").length}
+                      </span>
+                    )}
+                  </div>
+
+                  <div className="probe-log" ref={probeLogRef}>
+                    {/* 跑完后用结构化结果替换原始日志行（信息更全，且避免两份重复） */}
+                    {!probing && probeReport && probeReport.sources.length > 0
+                      ? probeReport.sources.map((s) => {
+                          const mark =
+                            s.status === "dead" ? "失活" : s.status === "flaky" ? "不稳定" : "正常";
+                          const speed = s.speedMs != null ? `  ${s.speedMs}ms` : "";
+                          return (
+                            <div key={`res-${s.name}`} className={`probe-log-line ${s.status}`}>
+                              <span className="probe-log-mark">[{mark}]</span>
+                              <span className="probe-log-name">{s.name}</span>
+                              <span className="probe-log-detail">
+                                {s.okCount}/{s.total} 成功{speed}
+                                {s.error ? ` ｜ ${s.error}` : ""}
+                              </span>
+                            </div>
+                          );
+                        })
+                      : probeLiveLines.length === 0
+                        ? (
+                            <div className="probe-log-line">
+                              <span className="probe-log-detail">正在启动引擎…</span>
+                            </div>
+                          )
+                        : probeLiveLines.map((text, i) => {
+                            const isDead = text.includes("失活");
+                            const isFlaky = text.includes("不稳定");
+                            const cls = isDead ? "dead" : isFlaky ? "flaky" : "ok";
+                            return (
+                              <div key={`live-${i}`} className={`probe-log-line ${cls}`}>
+                                <span className="probe-log-detail">{text}</span>
+                              </div>
+                            );
+                          })}
+                  </div>
+
+                  {/* 失活音源：勾选后可批量删除 */}
+                  {!probing && deadPicked.size > 0 && (
+                    <div className="probe-actions">
+                      <span className="hint">已勾选 {deadPicked.size} 个失活音源</span>
+                      <button className="danger-btn" onClick={deletePickedSources}>
+                        删除勾选的音源
+                      </button>
+                      <button className="ghost-btn" onClick={() => setDeadPicked(new Set())}>
+                        取消勾选
+                      </button>
+                    </div>
+                  )}
+
+                  {/* 勾选框：跑完后对每个失活音源显示，让用户决定删不删 */}
+                  {!probing && probeReport && probeReport.sources.some((s) => s.status === "dead") && (
+                    <div className="probe-pick-row">
+                      <span className="hint">要删除哪些失活音源？勾选后点上方「删除勾选的音源」</span>
+                      {probeReport.sources
+                        .filter((s) => s.status === "dead")
+                        .map((s) => (
+                          <label key={`pick-${s.name}`} className="probe-pick">
+                            <input
+                              type="checkbox"
+                              checked={deadPicked.has(s.name)}
+                              onChange={(e) => {
+                                setDeadPicked((prev) => {
+                                  const next = new Set(prev);
+                                  if (e.target.checked) next.add(s.name);
+                                  else next.delete(s.name);
+                                  return next;
+                                });
+                              }}
+                            />
+                            {s.name}
+                          </label>
+                        ))}
+                    </div>
+                  )}
+                </div>
+              )}
             </section>
           )}
 
