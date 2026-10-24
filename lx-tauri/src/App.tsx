@@ -1619,41 +1619,80 @@ function App() {
                     )}
                   </div>
 
-                  <div className="probe-log" ref={probeLogRef}>
-                    {/* 跑完后用结构化结果替换原始日志行（信息更全，且避免两份重复） */}
-                    {!probing && probeReport && probeReport.sources.length > 0
-                      ? probeReport.sources.map((s) => {
-                          const mark =
-                            s.status === "dead" ? "失活" : s.status === "flaky" ? "不稳定" : "正常";
-                          const speed = s.speedMs != null ? `  ${s.speedMs}ms` : "";
+                  {/* 体检中：实时滚动日志；跑完：切换为「测速排行图」。
+                      两者互斥，只显示其中一个，不会出现两份内容。 */}
+                  {!probing && probeReport && probeReport.sources.length > 0 ? (
+                    <>
+                      {/* ===== 测速排行图 =====
+                          按速度排序，每行：排名 / 名称 / 状态徽标 / 耗时 / 速度条 / 详情 */}
+                      <div className="probe-list">
+                        {probeReport.sources.map((s, i) => {
+                          const dead = s.status === "dead";
+                          const flaky = s.status === "flaky";
+                          const maxSpeed = Math.max(
+                            ...probeReport.sources.map((x) => x.speedMs || 0),
+                            1,
+                          );
+                          const barPct =
+                            s.speedMs != null
+                              ? Math.max(6, Math.round((s.speedMs / maxSpeed) * 100))
+                              : 0;
                           return (
-                            <div key={`res-${s.name}`} className={`probe-log-line ${s.status}`}>
-                              <span className="probe-log-mark">[{mark}]</span>
-                              <span className="probe-log-name">{s.name}</span>
-                              <span className="probe-log-detail">
-                                {s.okCount}/{s.total} 成功{speed}
-                                {s.error ? ` ｜ ${s.error}` : ""}
+                            <div
+                              key={`rank-${s.name}`}
+                              className={`probe-row ${dead ? "dead" : flaky ? "flaky" : "ok"}`}
+                            >
+                              <span className="probe-rank">{i + 1}</span>
+                              <span className="probe-name" title={s.name}>
+                                {s.name}
+                              </span>
+                              <span className={`probe-badge ${s.status}`}>
+                                {dead ? "失活" : flaky ? "不稳定" : "正常"}
+                              </span>
+                              <span className="probe-speed">
+                                {s.speedMs != null ? `${s.speedMs} ms` : "—"}
+                              </span>
+                              <span className="probe-bar" aria-hidden>
+                                <i
+                                  className={`probe-bar-fill ${s.status}`}
+                                  style={{ width: `${barPct}%` }}
+                                />
+                              </span>
+                              <span className="probe-detail" title={s.error}>
+                                {dead ? s.error || "取不到链接" : `${s.okCount}/${s.total} 成功`}
                               </span>
                             </div>
                           );
-                        })
-                      : probeLiveLines.length === 0
-                        ? (
-                            <div className="probe-log-line">
-                              <span className="probe-log-detail">正在启动引擎…</span>
+                        })}
+                      </div>
+                      <div className="probe-foot">
+                        体检时间：
+                        {probeReport.probedAt
+                          ? new Date(probeReport.probedAt).toLocaleString("zh-CN")
+                          : "未知"}
+                        ｜探测样本：晴天、夜曲（酷我）+ 晴天（网易云）
+                      </div>
+                    </>
+                  ) : (
+                    <div className="probe-log" ref={probeLogRef}>
+                      {probeLiveLines.length === 0 ? (
+                        <div className="probe-log-line">
+                          <span className="probe-log-detail">正在启动引擎…</span>
+                        </div>
+                      ) : (
+                        probeLiveLines.map((text, i) => {
+                          const isDead = text.includes("失活");
+                          const isFlaky = text.includes("不稳定");
+                          const cls = isDead ? "dead" : isFlaky ? "flaky" : "ok";
+                          return (
+                            <div key={`live-${i}`} className={`probe-log-line ${cls}`}>
+                              <span className="probe-log-detail">{text}</span>
                             </div>
-                          )
-                        : probeLiveLines.map((text, i) => {
-                            const isDead = text.includes("失活");
-                            const isFlaky = text.includes("不稳定");
-                            const cls = isDead ? "dead" : isFlaky ? "flaky" : "ok";
-                            return (
-                              <div key={`live-${i}`} className={`probe-log-line ${cls}`}>
-                                <span className="probe-log-detail">{text}</span>
-                              </div>
-                            );
-                          })}
-                  </div>
+                          );
+                        })
+                      )}
+                    </div>
+                  )}
 
                   {/* 失活音源：勾选后可批量删除 */}
                   {!probing && deadPicked.size > 0 && (
