@@ -717,7 +717,14 @@ function App() {
     setProbing(true);
     addLog("info", "开始音源体检（逐个实测取链接 + 测速），可能需要一两分钟…");
     try {
-      const report = await invoke<ProbeReport>("probe_sources", { python: pythonPath || null });
+      // 流式跑：日志由 download-log 事件实时推过来（引擎把进度写 stderr），
+      // 这里只负责等它跑完，然后读引擎落盘的缓存拿结果。
+      await invoke<string>("probe_sources", { python: pythonPath || null });
+      const report = await invoke<ProbeReport | null>("load_probe_cache");
+      if (!report) {
+        addLog("error", "体检未产出结果，请查看上方日志");
+        return;
+      }
       setProbeReport(report);
 
       const dead = report.sources.filter((s) => s.status === "dead");
@@ -728,9 +735,6 @@ function App() {
         dead.length ? "error" : "ok",
         `体检完成：正常 ${ok.length} 个，不稳定 ${flaky.length} 个，失活 ${dead.length} 个`,
       );
-      for (const s of dead) {
-        addLog("error", `  失活: ${s.name}（${s.error || "取不到链接"}）`);
-      }
       // 默认勾选失活音源，用户可自行取消
       setDeadPicked(new Set(dead.map((s) => s.name)));
     } catch (err) {

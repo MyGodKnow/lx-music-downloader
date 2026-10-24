@@ -1759,6 +1759,18 @@ async function directFallbackCandidates(musicInfo, source) {
             speedMs,
             error: okCount === probes.length ? '' : lastError,
           });
+
+          // 每测完一个源就推一行进度事件（不带 id，Python 侧用 on_event 接收）。
+          // 体检要跑一两分钟，没有进度用户会以为卡死。
+          process.stdout.write(JSON.stringify({
+            event: 'probeProgress',
+            name: entry.name,
+            status,
+            okCount,
+            total: probes.length,
+            speedMs,
+            error: okCount === probes.length ? '' : lastError,
+          }) + '\n');
         }
 
         // 按速度排序（快的在前，无速度的垫底）——GUI 可直接用这个顺序展示
@@ -1773,8 +1785,7 @@ async function directFallbackCandidates(musicInfo, source) {
         process.stdout.write(JSON.stringify({
           id: msg.id, ok: true, sources: perSource, probedAt: Date.now(),
         }) + '\n');
-      } else if (msg.cmd === 'scanSources') {
-        // 调试/健康检查：对若干歌曲逐个音源实测，返回每个音源成功命中的歌曲数
+      } else if (msg.cmd === 'scanSources') {        // 调试/健康检查：对若干歌曲逐个音源实测，返回每个音源成功命中的歌曲数
         const songs = msg.songs || [];
         const perSource = {};
         const report = [];

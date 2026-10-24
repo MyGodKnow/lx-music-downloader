@@ -1518,37 +1518,33 @@ fn probe_cache_file() -> std::path::PathBuf {
 
 /// 音源体检：逐个实测能否取到可下载链接 + 测响应速度。
 ///
-/// 必须 async + spawn_blocking：整个过程要真实联网，可能耗时数十秒。
+/// 用 spawn_task 走**流式日志**，而不是 run_engine_json：
+/// 体检要跑 20-120 秒，用户必须能实时看到「正在测哪个源」，
+/// 否则会以为程序卡死。引擎把进度写 stderr，spawn_task 的日志线程
+/// 按行推成 download-log 事件，界面日志区就能实时显示。
+///
+/// 结果不通过返回值传递（spawn_task 是流式的），而是：
+///   引擎跑完后自己把结果写进 `.probe.json`，
+///   前端在收到 done 事件后调用 `load_probe_cache` 读取。
 #[tauri::command]
-async fn probe_sources(python: Option<String>) -> Result<ProbeReport, String> {
-    tauri::async_runtime::spawn_blocking(move || probe_sources_blocking(python))
-        .await
-        .map_err(|e| format!("任务执行失败: {e}"))?
-}
-
-fn probe_sources_blocking(python: Option<String>) -> Result<ProbeReport, String> {
-    validate_python(python.as_ref())?;
-    // 9 个源 × 3 个样本 × 8s 超时，最坏约 3-4 分钟；给 300s 上限
-    let text = run_engine_json(python.as_ref(), vec!["--probe-sources".to_string()], 300,
-                               "音源体检")?;
-    let value: serde_json::Value =
-        serde_json::from_str(&text).map_err(|e| format!("解析体检结果失败: {e}"))?;
-    let sources: Vec<SourceProbe> = serde_json::from_value(
-        value.get("sources").cloned().unwrap_or_else(|| serde_json::json!([])),
-    )
-    .map_err(|e| format!("解析音源列表失败: {e}"))?;
-    let probed_at = value.get("probedAt").and_then(|v| v.as_u64()).unwrap_or(0);
-    let report = ProbeReport { sources, probed_at };
-
-    // 落盘缓存：下次打开界面可以先展示上次结果，不必每次都等几十秒。
-    // 写失败不影响本次返回（只是少了个缓存）。
-    if let Ok(json) = serde_json::to_string(&report) {
-        let _ = std::fs::write(probe_cache_file(), json);
-    }
-    Ok(report)
+async fn probe_sources(app: AppHandle, python: Option<String>) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        validate_python(python.as_ref())?;
+        // 先删旧缓存：避免「本次体检失败、界面却显示上次结果」造成误解
+        let _ = std::fs::remove_file(probe_cache_file());
+        let args = vec!["--probe-sources".to_string()];
+        let engine = resolve_engine(python.as_ref());
+        let state = app.state::<TaskState>();
+        spawn_task(app.clone(), &state, "download-log", args, engine)
+    })
+    .await
+    .map_err(|e| format!("任务执行失败: {e}"))?
 }
 
 /// 读取上次体检的缓存结果；没有缓存时返回空列表。
+///
+/// 体检本身是流式跑的（为了实时日志），结果由引擎写进 `.probe.json`，
+/// 这个命令只负责读出来给界面用。
 #[tauri::command]
 fn load_probe_cache() -> Option<ProbeReport> {
     let raw = std::fs::read_to_string(probe_cache_file()).ok()?;

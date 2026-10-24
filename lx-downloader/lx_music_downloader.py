@@ -396,16 +396,44 @@ class UrlServer:
         t.start()
         return self
 
-    def request(self, cmd, **kwargs):
+    def request(self, cmd, on_event=None, **kwargs):
+        """发一条指令并等待对应 id 的响应。
+
+        on_event：可选的进度回调。Node 侧在执行长任务（如音源体检）时，
+        会先输出若干行 `{"event":"probeProgress", ...}` 再输出最终响应。
+        这些中间行不属于响应，交给 on_event 处理（用于实时打印进度），
+        不会污染最终返回值。
+        """
         with self.lock:
             self.counter += 1
-            msg = {'id': self.counter, 'cmd': cmd, **kwargs}
+            my_id = self.counter
+            msg = {'id': my_id, 'cmd': cmd, **kwargs}
             self.proc.stdin.write(json.dumps(msg, ensure_ascii=False) + '\n')
             self.proc.stdin.flush()
-            resp = self.proc.stdout.readline()
-            if not resp:
-                raise RuntimeError('音源服务已退出')
-            return json.loads(resp)
+            while True:
+                line = self.proc.stdout.readline()
+                if not line:
+                    raise RuntimeError('音源服务已退出')
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    # 非 JSON 行（如音源脚本的 console 输出）直接忽略
+                    continue
+                # 进度事件：交给回调，继续等真正的响应
+                if 'event' in obj and 'id' not in obj:
+                    if on_event:
+                        try:
+                            on_event(line)
+                        except Exception:
+                            pass
+                    continue
+                # 只接受本次请求 id 的响应，避免串号
+                if obj.get('id') != my_id:
+                    continue
+                return obj
 
     def get_urls(self, source, music_info, quality):
         """获取播放链接候选列表（多音质），对临时网络错误/平台限流自动退避重试。"""
@@ -2583,9 +2611,13 @@ def run_check_update(args):
 def run_probe_sources(args):
     """音源体检：逐个音源实测能否取到可下载链接，并测响应速度。
 
-    输出一行 JSON：
+    输出一行 JSON（stdout 是 GUI 的解析通道，必须保持纯净）：
       {"sources":[{"name","status","okCount","total","speedMs","error"}],"probedAt":...}
     status: ok（全部成功）/ flaky（部分成功）/ dead（一次都没成功）
+
+    **进度日志一律写 stderr**：stdout 只留给最终 JSON。
+    GUI 的 spawn_log_reader 会同时读 stdout/stderr 并按行推送，
+    所以 stderr 上的进度也会出现在界面日志区，但不会破坏 JSON 解析。
 
     设计取舍：
       - 每个源用同一组探测样本，保证横向可比；
@@ -2608,10 +2640,35 @@ def run_probe_sources(args):
         for src, name, singer, song_id in _PROBE_SAMPLES
     ]
 
+    def log(msg):
+        print(msg, file=sys.stderr, flush=True)
+
+    log(f'[体检] 开始：{len(probes)} 个探测样本（'
+        + '、'.join(f'{s[0]}:{s[1]}' for s in _PROBE_SAMPLES) + '）')
+    log(f'[体检] 每个音源逐个实测，预计需要 1-2 分钟…')
+
     server = UrlServer(node_exe, args.api, args.api_dir).start()
     try:
+        # 边跑边把进度写 stderr：Node 侧每完成一个音源就发一行 probeProgress
+        def on_progress(line):
+            try:
+                obj = json.loads(line)
+            except Exception:
+                return
+            if obj.get('event') != 'probeProgress':
+                return
+            name = obj.get('name', '?')
+            status = obj.get('status', '')
+            ok_n = obj.get('okCount', 0)
+            total = obj.get('total', 0)
+            speed = obj.get('speedMs')
+            mark = {'ok': '正常', 'flaky': '不稳定', 'dead': '失活'}.get(status, status)
+            tail = f'  {speed}ms' if speed is not None else ''
+            log(f'[体检] {mark:<6} {name}（{ok_n}/{total}）{tail}')
+
         resp = server.request('probeSources', probes=probes,
-                              timeoutMs=getattr(args, 'probe_timeout_ms', 8000))
+                              timeoutMs=getattr(args, 'probe_timeout_ms', 8000),
+                              on_event=on_progress)
     finally:
         server.close()
 
@@ -2619,10 +2676,29 @@ def run_probe_sources(args):
         print(json.dumps({'error': resp.get('error', '体检失败')}, ensure_ascii=False), flush=True)
         return 1
 
-    print(json.dumps({
-        'sources': resp.get('sources', []),
-        'probedAt': resp.get('probedAt'),
-    }, ensure_ascii=False), flush=True)
+    sources = resp.get('sources', [])
+    ok_n = sum(1 for s in sources if s.get('status') == 'ok')
+    flaky_n = sum(1 for s in sources if s.get('status') == 'flaky')
+    dead_n = sum(1 for s in sources if s.get('status') == 'dead')
+    log(f'[体检] 完成：正常 {ok_n} 个，不稳定 {flaky_n} 个，失活 {dead_n} 个')
+
+    result = {'sources': sources, 'probedAt': resp.get('probedAt') or int(time.time() * 1000)}
+
+    # 自己把结果写进缓存文件（.probe.json）。
+    # GUI 侧是流式跑体检的（为了实时显示日志），拿不到返回值，
+    # 所以由引擎负责落盘，前端在收到 done 事件后读这个文件。
+    try:
+        cache_dir = args.api_dir or USER_SOURCES_DIR
+        if cache_dir and os.path.isdir(cache_dir):
+            cache_path = os.path.join(cache_dir, '.probe.json')
+            with open(cache_path, 'w', encoding='utf-8') as f:
+                json.dump(result, f, ensure_ascii=False)
+            log(f'[体检] 结果已缓存: {cache_path}')
+    except Exception as exc:
+        # 缓存写失败不影响本次结果输出
+        log(f'[体检] 缓存写入失败（不影响本次结果）: {exc}')
+
+    print(json.dumps(result, ensure_ascii=False), flush=True)
     return 0
 
 
