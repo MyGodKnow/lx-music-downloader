@@ -439,6 +439,27 @@ class SearchApiTest(unittest.TestCase):
         self.assertIn('--search', src)
         self.assertIn('--song-file', src)
 
+    def test_probe_and_update_flags_exist(self):
+        """新增的 --probe-sources / --check-update 必须注册（GUI 依赖它们）。"""
+        import inspect
+        src = inspect.getsource(eng.run)
+        self.assertIn('--probe-sources', src)
+        self.assertIn('--check-update', src)
+
+    def test_probe_samples_are_complete(self):
+        """探测样本必须字段齐全，否则体检会把好音源误判为失活。"""
+        self.assertGreaterEqual(len(eng._PROBE_SAMPLES), 2)
+        for sample in eng._PROBE_SAMPLES:
+            self.assertEqual(len(sample), 4, f'样本字段不完整: {sample}')
+            src, name, singer, song_id = sample
+            self.assertIn(src, ('kw', 'wy', 'tx', 'kg', 'mg'))
+            self.assertTrue(name and singer and song_id)
+
+    def test_probe_samples_cover_multiple_platforms(self):
+        """样本要跨平台，否则「只支持某平台」的音源会被误判为失活。"""
+        platforms = {s[0] for s in eng._PROBE_SAMPLES}
+        self.assertGreaterEqual(len(platforms), 2, f'样本平台过于单一: {platforms}')
+
 
 class StrictMatchTest(unittest.TestCase):
     """严格匹配：歌名必须完全相同，绝不把「出山」和「出山 (DJ版)」当同一首。"""

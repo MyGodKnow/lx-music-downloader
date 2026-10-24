@@ -805,7 +805,7 @@ fn get_sources_dir() -> String {
 /// 若不显式排除会被当成音源脚本：既会出现在音源列表里让用户困惑，
 /// 又会被 Node 当脚本加载（内容不是合法音源，白白报错）。
 fn is_meta_file(name: &str) -> bool {
-    matches!(name, ".order.json" | ".health.json")
+    matches!(name, ".order.json" | ".health.json" | ".probe.json")
 }
 
 /// 列出用户已导入的音源文件。
@@ -1399,6 +1399,188 @@ fn validate_failed_dir(dir: Option<&String>) -> Result<Option<String>, String> {
     Ok(Some(d.to_string()))
 }
 
+/// 更新检查结果（与引擎 --check-update 的 JSON 对应）。
+#[derive(Serialize, Clone, serde::Deserialize)]
+struct UpdateInfo {
+    #[serde(default)]
+    ok: bool,
+    #[serde(default)]
+    latest: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    notes: String,
+    #[serde(default, rename = "pageUrl")]
+    page_url: String,
+    #[serde(default, rename = "downloadUrl")]
+    download_url: String,
+    #[serde(default, rename = "assetName")]
+    asset_name: String,
+    #[serde(default, rename = "assetSize")]
+    asset_size: u64,
+    #[serde(default, rename = "publishedAt")]
+    published_at: String,
+    #[serde(default)]
+    error: String,
+}
+
+/// 当前应用版本（来自 tauri.conf.json，编译期确定）。
+#[tauri::command]
+fn app_version(app: AppHandle) -> String {
+    app.package_info().version.to_string()
+}
+
+/// 检查 GitHub 上是否有新版本。
+///
+/// 走 Node 而不是 Rust：本项目没有引入 HTTP 客户端依赖，而 Node 已在运行时里。
+/// 必须 async + spawn_blocking（要联网，同步会卡界面）。
+#[tauri::command]
+async fn check_update(python: Option<String>) -> Result<UpdateInfo, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        validate_python(python.as_ref())?;
+        let text = run_engine_json(python.as_ref(), vec!["--check-update".to_string()], 90,
+                                   "检查更新")?;
+        serde_json::from_str::<UpdateInfo>(&text)
+            .map_err(|e| format!("解析更新信息失败: {e}"))
+    })
+    .await
+    .map_err(|e| format!("任务执行失败: {e}"))?
+}
+
+/// 下载更新包到用户指定路径（由前端用系统对话框选位置）。
+///
+/// 只做「下载 + 落盘」，不自动替换自身——正在运行的程序无法安全覆盖自己的 exe，
+/// 由用户手动关闭后替换。这样也避免自动更新出错时把程序搞坏。
+#[tauri::command]
+async fn download_update(url: String, path: String) -> Result<String, String> {
+    if !url.starts_with("https://") {
+        return Err("更新包地址必须是 https".to_string());
+    }
+    if path.trim().is_empty() {
+        return Err("保存路径为空".to_string());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        // 用系统自带 curl.exe 下载：Windows 10+ 必带，支持 https 与重定向，
+        // 无需为一次性功能引入 HTTP 依赖。
+        let mut cmd = std::process::Command::new("curl.exe");
+        cmd.args(["-L", "--fail", "--silent", "--show-error",
+                  "-o", &path, &url]);
+        // 后台静默运行，不弹命令提示符窗口
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        let out = cmd.output().map_err(|e| format!("调用 curl 失败: {e}"))?;
+        if !out.status.success() {
+            let err = String::from_utf8_lossy(&out.stderr);
+            return Err(format!("下载失败: {}", err.trim()));
+        }
+        let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        if size < 1024 * 1024 {
+            return Err(format!("下载的文件过小（{size} 字节），可能不是有效安装包"));
+        }
+        Ok(path)
+    })
+    .await
+    .map_err(|e| format!("下载任务执行失败: {e}"))?
+}
+
+/// 音源体检结果（与引擎 --probe-sources 的 JSON 对应）。
+#[derive(Serialize, Clone, serde::Deserialize)]
+struct SourceProbe {
+    name: String,
+    /// ok / flaky / dead
+    status: String,
+    #[serde(default, rename = "okCount")]
+    ok_count: usize,
+    #[serde(default)]
+    total: usize,
+    /// 响应耗时（毫秒），没有成功样本时为 null
+    #[serde(default, rename = "speedMs")]
+    speed_ms: Option<u64>,
+    #[serde(default)]
+    error: String,
+}
+
+#[derive(Serialize, Clone, serde::Deserialize)]
+struct ProbeReport {
+    sources: Vec<SourceProbe>,
+    #[serde(rename = "probedAt")]
+    probed_at: u64,
+}
+
+/// 体检结果缓存文件名（放在音源目录，与 .order.json / .health.json 同级）。
+fn probe_cache_file() -> std::path::PathBuf {
+    user_sources_dir().join(".probe.json")
+}
+
+/// 音源体检：逐个实测能否取到可下载链接 + 测响应速度。
+///
+/// 必须 async + spawn_blocking：整个过程要真实联网，可能耗时数十秒。
+#[tauri::command]
+async fn probe_sources(python: Option<String>) -> Result<ProbeReport, String> {
+    tauri::async_runtime::spawn_blocking(move || probe_sources_blocking(python))
+        .await
+        .map_err(|e| format!("任务执行失败: {e}"))?
+}
+
+fn probe_sources_blocking(python: Option<String>) -> Result<ProbeReport, String> {
+    validate_python(python.as_ref())?;
+    // 9 个源 × 3 个样本 × 8s 超时，最坏约 3-4 分钟；给 300s 上限
+    let text = run_engine_json(python.as_ref(), vec!["--probe-sources".to_string()], 300,
+                               "音源体检")?;
+    let value: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("解析体检结果失败: {e}"))?;
+    let sources: Vec<SourceProbe> = serde_json::from_value(
+        value.get("sources").cloned().unwrap_or_else(|| serde_json::json!([])),
+    )
+    .map_err(|e| format!("解析音源列表失败: {e}"))?;
+    let probed_at = value.get("probedAt").and_then(|v| v.as_u64()).unwrap_or(0);
+    let report = ProbeReport { sources, probed_at };
+
+    // 落盘缓存：下次打开界面可以先展示上次结果，不必每次都等几十秒。
+    // 写失败不影响本次返回（只是少了个缓存）。
+    if let Ok(json) = serde_json::to_string(&report) {
+        let _ = std::fs::write(probe_cache_file(), json);
+    }
+    Ok(report)
+}
+
+/// 读取上次体检的缓存结果；没有缓存时返回空列表。
+#[tauri::command]
+fn load_probe_cache() -> Option<ProbeReport> {
+    let raw = std::fs::read_to_string(probe_cache_file()).ok()?;
+    serde_json::from_str::<ProbeReport>(&raw).ok()
+}
+
+/// 删除指定音源文件（体检后用户选择清理失活音源时调用）。
+///
+/// 与 remove_source 的区别：支持一次删多个，并且**只删真正存在的**，
+/// 返回实际删除的文件名，让前端能准确提示「删了 N 个」。
+#[tauri::command]
+async fn remove_sources(names: Vec<String>) -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let dir = user_sources_dir();
+        let mut removed = Vec::new();
+        for raw in names {
+            // 复用单文件校验：剥掉路径、限定 .js/.json
+            let name = match validate_source_name(&raw) {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
+            let target = dir.join(&name);
+            if target.is_file() && std::fs::remove_file(&target).is_ok() {
+                removed.push(name);
+            }
+        }
+        Ok::<Vec<String>, String>(removed)
+    })
+    .await
+    .map_err(|e| format!("删除任务执行失败: {e}"))?
+}
+
 /// 统计下载目录 failed.txt 里的失败歌曲数，供前端决定是否显示「重试」按钮。
 ///
 /// 必须 async + spawn_blocking：`resolve_engine` 首次运行会同步解压 41MB 引擎包，
@@ -1554,6 +1736,12 @@ pub fn run() {
             download_songs,
             retry_failed,
             count_failed,
+            probe_sources,
+            load_probe_cache,
+            remove_sources,
+            app_version,
+            check_update,
+            download_update,
             export_songs,
             save_text_file
         ])

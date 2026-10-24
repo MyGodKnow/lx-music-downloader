@@ -154,6 +154,13 @@ function failNoSources(msg) {
   process.exit(1);
 }
 
+// 「仅检查更新」模式：完全不加载音源，直接进入 stdin 循环。
+//
+// 为什么需要：failNoSources 在音源目录为空时会 exit(1)，而「检查更新」
+// 根本不依赖音源。没有这个模式，没导入音源的用户永远查不了更新——
+// 而这恰恰最需要提示「有新版本」（新装用户还没导入音源）。
+const UPDATE_ONLY = process.argv.includes('--update-only');
+
 function loadScriptSet() {
   if (apiFile) {
     if (!fs.existsSync(apiFile)) failNoSources('音源文件不存在: ' + apiFile);
@@ -165,7 +172,7 @@ function loadScriptSet() {
     .filter(name => /\.(js|json)$/i.test(name))
     // 元数据文件不是音源：.order.json 存拖拽顺序，.health.json 存健康度。
     // 不排除的话健康度文件会被当成音源脚本加载并报错。
-    .filter(name => name !== '.order.json' && name !== '.health.json');
+    .filter(name => name !== '.order.json' && name !== '.health.json' && name !== '.probe.json');
   if (!files.length) failNoSources('音源目录为空: ' + dir);
   // 排序规则：用户拖拽顺序优先；没排过则用内置优先级
   files.sort((a, b) => {
@@ -1534,10 +1541,23 @@ async function directFallbackCandidates(musicInfo, source) {
 
 // ========== 主流程 ==========
 (async () => {
-  const ok = await init();
-  if (!ok) {
+  let ok = false;
+  if (UPDATE_ONLY) {
+    // 仅检查更新：完全跳过音源加载。
+    // 这样即使音源目录为空/不存在，failNoSources 也不会被触发，
+    // 保证「没导入音源的新用户」也能收到版本更新提示。
+    process.stderr.write('[lx-url-server] 仅检查更新模式：跳过音源加载\n');
+  } else {
+    ok = await init();
+  }
+  if (!ok && !UPDATE_ONLY) {
     process.stderr.write('[lx-url-server] 所有音源加载失败: ' + (initError || '') + '\n');
-    process.exit(1);
+    // 注意：**不要直接 exit**。
+    // 「检查更新」这类命令完全不依赖音源，用户没导入音源时也应该能用。
+    // 这里改为继续启动 stdin 循环，由各命令自己判断音源是否可用
+    // （需要音源的命令会通过 getMusicUrls 里的 requestHandlers.length 检查报错）。
+    process.stderr.write('[lx-url-server] 继续以「无音源」模式运行，'
+      + '仅「检查更新」等不依赖音源的命令可用\n');
   }
 
   // 音源加载完成后才读历史健康度：此时才知道哪些名字是真的存在的源。
@@ -1560,6 +1580,199 @@ async function directFallbackCandidates(musicInfo, source) {
       } else if (msg.cmd === 'searchByName') {
         const r = await searchByName(msg.name, msg.singer || '', msg.interval);
         process.stdout.write(JSON.stringify({ id: msg.id, ok: true, ...r }) + '\n');
+      } else if (msg.cmd === 'checkUpdate') {
+        // 检查 GitHub 上是否有新版本。
+        //
+        // 放在这里而不是 Rust 侧，是因为本项目没有引入 HTTP 客户端依赖，
+        // 而 Node 已经在运行时里（内置 node.exe），复用它零成本。
+        //
+        // 两条路径，优先走「重定向」：
+        //   1. HEAD https://github.com/<repo>/releases/latest
+        //      302 的 Location 里就带 tag（.../releases/tag/v1.0.0）。
+        //      **不消耗 GitHub API 配额**——未认证的 api.github.com 只有 60 次/小时，
+        //      实测很容易被限流（403 API rate limit exceeded），一旦限流用户就再也
+        //      收不到更新提示，所以这条是主路径。
+        //   2. 兜底才用 api.github.com，可以拿到更新说明与附件直链。
+        //      即使被限流也不影响「有没有新版」这个核心判断。
+        const repo = msg.repo || 'MyGodKnow/lx-music-downloader';
+        const pageUrl = `https://github.com/${repo}/releases/latest`;
+
+        const parseTag = (loc) => {
+          const m = String(loc || '').match(/\/tag\/([^/?#]+)/);
+          return m ? decodeURIComponent(m[1]) : '';
+        };
+
+        try {
+          // ---- 主路径：看重定向 ----
+          //
+          // 不用 doRequest：它对 HEAD / 无 body 响应依赖 'end' 事件，
+          // 实测会一直挂到超时。这里用最小实现，只取 302 的 Location 头，
+          // 拿到就立刻 resolve，不等 body。
+          const headOnce = (urlStr, timeoutMs) => new Promise((resolve) => {
+            let done = false;
+            const finish = (v) => { if (!done) { done = true; resolve(v); } };
+            let u;
+            try { u = new URL(urlStr); } catch (e) { return finish({ loc: '', err: 'bad url' }); }
+            const req = https.request(u, {
+              method: 'GET',
+              rejectUnauthorized: true,
+              headers: { 'User-Agent': 'lx-music-downloader-updater' },
+            }, (res) => {
+              // 拿到响应头就够了，不必读 body
+              finish({ status: res.statusCode, loc: res.headers.location || '' });
+              res.resume();  // 丢弃 body，释放连接
+            });
+            req.on('error', (e) => finish({ loc: '', err: e.message }));
+            req.setTimeout(timeoutMs, () => { req.destroy(); finish({ loc: '', err: 'timeout' }); });
+            req.end();
+          });
+
+          let latest = '';
+          const head = await headOnce(pageUrl, 8000);
+          if (process.env.LX_DEBUG_UPDATE === '1') {
+            process.stderr.write(`[update] GET status=${head.status} loc=${head.loc} err=${head.err || ''}\n`);
+          }
+          latest = parseTag(head.loc);
+
+          // ---- 兜底：API（可能被限流，仅用于补充说明/直链）----
+          let detail = null;
+          if (msg.withDetail !== false) {
+            try {
+              const r = await doRequest(`https://api.github.com/repos/${repo}/releases/latest`, {
+                method: 'GET',
+                headers: {
+                  'Accept': 'application/vnd.github+json',
+                  'User-Agent': 'lx-music-downloader-updater',
+                },
+              }, 8000);
+              if (r.body && typeof r.body === 'object' && r.body.tag_name) {
+                detail = r.body;
+                if (!latest) latest = String(r.body.tag_name).replace(/^v/i, '');
+              }
+            } catch (_) { /* 限流/网络问题都忽略 */ }
+          }
+
+          if (!latest) {
+            throw new Error('无法确定最新版本（GitHub 重定向与 API 均失败）');
+          }
+
+          const assets = detail && Array.isArray(detail.assets) ? detail.assets : [];
+          const exe = assets.find((a) => /\.exe$/i.test(a.name || ''))
+            || assets.find((a) => /windows.*x64/i.test(a.name || ''));
+
+          process.stdout.write(JSON.stringify({
+            id: msg.id,
+            ok: true,
+            latest: String(latest).replace(/^v/i, ''),
+            name: detail ? (detail.name || '') : '',
+            notes: detail ? String(detail.body || '').slice(0, 4000) : '',
+            pageUrl: detail ? (detail.html_url || pageUrl) : pageUrl,
+            downloadUrl: exe ? exe.browser_download_url : '',
+            assetName: exe ? exe.name : '',
+            assetSize: exe ? exe.size : 0,
+            publishedAt: detail ? (detail.published_at || '') : '',
+          }) + '\n');
+        } catch (e) {
+          process.stdout.write(JSON.stringify({
+            id: msg.id, ok: false, error: String((e && e.message) || e).slice(0, 200),
+          }) + '\n');
+        }
+      } else if (msg.cmd === 'probeSources') {
+        // 音源体检：对每个音源单独实测「能不能真的取到可下载链接」，并测速度。
+        //
+        // 与 scanSources 的区别：
+        //   - scanSources 是「给若干首歌、看每个源能命中几首」（调试用）；
+        //   - probeSources 是「给一个探测样本、逐个源单独跑」，目的是判定
+        //     该音源是否失活 + 测出它的响应耗时，供 GUI 展示与排序。
+        //
+        // 判定规则（任一不满足即视为失活）：
+        //   1. 能在超时内返回 http(s) 链接
+        //   2. 该链接能通过 checkUrl（真实 HEAD/Range 探测，不是只看字符串）
+        // 测速口径：从调用 handler 到 checkUrl 通过的墙钟耗时（ms），
+        // 取多次探测的中位数，避免单次抖动。
+        const probes = Array.isArray(msg.probes) ? msg.probes : [];
+        const perSource = [];
+        for (const entry of requestHandlers) {
+          const samples = [];
+          let lastError = '';
+          let okCount = 0;
+
+          for (const probe of probes) {
+            if (sourceBlocked(entry.name)) { lastError = '冷却中'; break; }
+            const info = {
+              musicInfo: { ...(probe.musicInfo || {}) },
+              type: probe.quality || '320k',
+            };
+            const t0 = Date.now();
+            try {
+              const result = await callHandler(
+                entry, probe.source || 'kw', 'musicUrl', info, msg.timeoutMs || 8000,
+              );
+              let url = null;
+              if (typeof result === 'string' && /^https?:\/\//.test(result)) url = result;
+              else if (result && typeof result === 'object') {
+                url = result.url || (result.data && result.data.url) || (result.url && result.url.url);
+              }
+              if (!url || !/^https?:\/\//.test(url)) {
+                lastError = '未返回有效链接';
+                continue;
+              }
+              const valid = await checkUrl(url);
+              const dt = Date.now() - t0;
+              if (valid) {
+                okCount += 1;
+                samples.push(dt);
+                noteSourceOk(entry.name);
+                bumpSource(entry.name, 2);
+              } else {
+                lastError = '链接校验失败';
+                noteSourceFail(entry.name, true);
+                bumpSource(entry.name, -2);
+              }
+            } catch (e) {
+              lastError = String((e && e.message) || e).slice(0, 60);
+              noteSourceFail(entry.name, true);
+              bumpSource(entry.name, -1);
+            }
+          }
+
+          // 中位数耗时（没有成功样本时为 null）
+          let speedMs = null;
+          if (samples.length) {
+            const sorted = samples.slice().sort((a, b) => a - b);
+            speedMs = sorted[Math.floor(sorted.length / 2)];
+          }
+
+          // 一次都没成功 → 失活；部分成功 → 不稳定；全部成功 → 正常
+          let status = 'dead';
+          if (okCount > 0 && okCount === samples.length && samples.length === probes.length) {
+            status = 'ok';
+          } else if (okCount > 0) {
+            status = 'flaky';
+          }
+
+          perSource.push({
+            name: entry.name,
+            status,
+            okCount,
+            total: probes.length,
+            speedMs,
+            error: okCount === probes.length ? '' : lastError,
+          });
+        }
+
+        // 按速度排序（快的在前，无速度的垫底）——GUI 可直接用这个顺序展示
+        perSource.sort((a, b) => {
+          if (a.status === 'dead' && b.status !== 'dead') return 1;
+          if (b.status === 'dead' && a.status !== 'dead') return -1;
+          const sa = a.speedMs == null ? Number.MAX_SAFE_INTEGER : a.speedMs;
+          const sb = b.speedMs == null ? Number.MAX_SAFE_INTEGER : b.speedMs;
+          return sa - sb;
+        });
+
+        process.stdout.write(JSON.stringify({
+          id: msg.id, ok: true, sources: perSource, probedAt: Date.now(),
+        }) + '\n');
       } else if (msg.cmd === 'scanSources') {
         // 调试/健康检查：对若干歌曲逐个音源实测，返回每个音源成功命中的歌曲数
         const songs = msg.songs || [];

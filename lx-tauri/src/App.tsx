@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { getVersion } from "@tauri-apps/api/app";
 import { listen } from "@tauri-apps/api/event";
 import { open as openDialog, save } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -23,6 +24,37 @@ interface Playlist {
   id: string;
   name: string;
   cnt: number;
+}
+
+/** 单个音源的体检结果（与 Rust SourceProbe 对应） */
+interface SourceProbe {
+  name: string;
+  /** ok = 全部探测成功；flaky = 部分成功；dead = 一次都没成功 */
+  status: "ok" | "flaky" | "dead";
+  okCount: number;
+  total: number;
+  /** 响应耗时中位数（毫秒）；没有成功样本时为 null */
+  speedMs: number | null;
+  error: string;
+}
+
+interface ProbeReport {
+  sources: SourceProbe[];
+  probedAt: number;
+}
+
+/** 更新检查结果（与 Rust UpdateInfo 对应） */
+interface UpdateInfo {
+  ok: boolean;
+  latest: string;
+  name: string;
+  notes: string;
+  pageUrl: string;
+  downloadUrl: string;
+  assetName: string;
+  assetSize: number;
+  publishedAt: string;
+  error: string;
 }
 
 interface LogLine {
@@ -78,7 +110,41 @@ const AUTHOR = {
   email: "114514woguizhidaoya@gmail.com",
   repo: "https://github.com/MyGodKnow/lx-music-downloader",
   issues: "https://github.com/MyGodKnow/lx-music-downloader/issues",
+  /** GitHub 点 Star 直达链接（仓库主页即可，Star 按钮在右上角） */
+  star: "https://github.com/MyGodKnow/lx-music-downloader",
 };
+
+/**
+ * 应用版本号。
+ *
+ * 之前这里写死成 v0.2.0，后来升到 1.x 时忘了改，关于页一直显示旧版本。
+ * 现在改为启动时从 Tauri 读取（唯一来源是 tauri.conf.json），
+ * 读不到时才退回占位符——避免以后再出现「关于页版本号和实际不符」。
+ */
+let APP_VERSION = "…";
+
+/**
+ * 比较两个语义化版本号。
+ * 返回 1 表示 a > b，-1 表示 a < b，0 表示相等。
+ *
+ * 只比较前三段数字（major.minor.patch），忽略 `-beta` 之类的预发布后缀——
+ * 对本项目足够，且避免把 "1.1.0-beta" 误判成比 "1.1.0" 新。
+ * 解析失败时返回 0（宁可漏提示，也不要误报有新版本）。
+ */
+function compareVersion(a: string, b: string): number {
+  const parse = (v: string): number[] | null => {
+    const m = String(v || "").trim().replace(/^v/i, "").match(/^(\d+)\.(\d+)\.(\d+)/);
+    return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
+  };
+  const pa = parse(a);
+  const pb = parse(b);
+  if (!pa || !pb) return 0;
+  for (let i = 0; i < 3; i += 1) {
+    if (pa[i] > pb[i]) return 1;
+    if (pa[i] < pb[i]) return -1;
+  }
+  return 0;
+}
 
 const SOURCE_LABELS: Record<string, string> = {
   kw: "酷我",
@@ -145,6 +211,12 @@ function App() {
   const [importingLx, setImportingLx] = useState(false);
   const sourceInputRef = useRef<HTMLInputElement>(null);
 
+  // ===== 音源体检（失活检测 + 测速）=====
+  const [probing, setProbing] = useState(false);
+  const [probeReport, setProbeReport] = useState<ProbeReport | null>(null);
+  /** 体检后用户勾选要删除的失活音源 */
+  const [deadPicked, setDeadPicked] = useState<Set<string>>(new Set());
+
   // ===== 导出 =====
   const [exportLines, setExportLines] = useState<string[]>([]);
   const [exporting, setExporting] = useState(false);
@@ -154,6 +226,16 @@ function App() {
   // failedCount > 0 才显示按钮。数量由后端 count_failed 读 failed.txt 得出，
   // 前端不自己解析文件（解析逻辑只在引擎里维护一份，避免两处格式定义漂移）。
   const [failedCount, setFailedCount] = useState(0);
+
+  /** 版本号加载完成后 +1，用于触发关于页重渲染（APP_VERSION 是模块级变量） */
+  const [, setVersionReady] = useState(0);
+
+  // ===== 检查更新 =====
+  const [checkingUpdate, setCheckingUpdate] = useState(false);
+  const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
+  /** 用户点了「稍后再说」后不再提示（本次会话内） */
+  const [updateDismissed, setUpdateDismissed] = useState(false);
+  const [downloadingUpdate, setDownloadingUpdate] = useState(false);
 
   // 日志上限：批量下载 700+ 首会产出数千行，全量渲染 + 每行平滑滚动会明显掉帧。
   // 只保留最近 MAX_LOGS 行（超出后丢弃最旧的），既不影响排障也保证流畅。
@@ -252,6 +334,20 @@ function App() {
   useEffect(() => {
     loadPlaylists();
     refreshSources();
+    // 载入上次的体检缓存：不必每次进页面都等一两分钟
+    invoke<ProbeReport | null>("load_probe_cache")
+      .then((r) => { if (r) setProbeReport(r); })
+      .catch(() => { /* 没有缓存是正常状态 */ });
+    // 版本号从 Tauri 读（唯一来源 tauri.conf.json），避免手写漏改
+    getVersion()
+      .then((v) => {
+        APP_VERSION = v;
+        setVersionReady((n) => n + 1);
+        // 启动后静默检查更新：拿到版本号再查，才能正确比较。
+        // silent=true 表示「没新版/查失败都不打扰用户」。
+        checkForUpdate(true);
+      })
+      .catch(() => { APP_VERSION = "unknown"; setVersionReady((n) => n + 1); });
   }, [loadPlaylists, refreshSources]);
 
   // 自动滚到底部：节流到 200ms 一次，且只在用户没有手动上翻时滚动。
@@ -558,6 +654,109 @@ function App() {
     }
   }
 
+  /** 检查更新：有新版就提示用户，由用户决定是否下载 */
+  async function checkForUpdate(silent = false) {
+    if (checkingUpdate) return;
+    setCheckingUpdate(true);
+    try {
+      const info = await invoke<UpdateInfo>("check_update", {
+        python: pythonPath || null,
+      });
+      if (!info.ok) {
+        if (!silent) addLog("error", `检查更新失败: ${info.error || "未知原因"}`);
+        return;
+      }
+      // 版本比较：只在远端严格大于本地时提示
+      const cmp = compareVersion(info.latest, APP_VERSION);
+      if (cmp > 0) {
+        setUpdateInfo(info);
+        setUpdateDismissed(false);
+        addLog("ok", `发现新版本 ${info.latest}（当前 ${APP_VERSION}）`);
+      } else if (!silent) {
+        addLog("info", `已是最新版本（${APP_VERSION}）`);
+      }
+    } catch (err) {
+      if (!silent) addLog("error", String(err));
+    } finally {
+      setCheckingUpdate(false);
+    }
+  }
+
+  /** 下载更新包：让用户选保存位置，然后下载到那里 */
+  async function downloadUpdate() {
+    if (!updateInfo?.downloadUrl) {
+      addLog("error", "该版本没有提供安装包，请到发布页手动下载");
+      return;
+    }
+    const path = await save({
+      title: "保存更新包",
+      defaultPath: updateInfo.assetName || `落雪音乐下载器-${updateInfo.latest}.exe`,
+      filters: [{ name: "可执行文件", extensions: ["exe"] }],
+    });
+    if (!path) return;
+
+    setDownloadingUpdate(true);
+    addLog("info", `正在下载 ${updateInfo.latest}…`);
+    try {
+      await invoke<string>("download_update", {
+        url: updateInfo.downloadUrl,
+        path,
+      });
+      addLog("ok", `下载完成：${path}`);
+      addLog("info", "请关闭本程序后，用新下载的文件替换旧程序即可完成升级");
+    } catch (err) {
+      addLog("error", String(err));
+    } finally {
+      setDownloadingUpdate(false);
+    }
+  }
+
+  /** 音源体检：逐个实测能否取到可下载链接 + 测响应速度 */
+  async function probeSources() {
+    if (probing) return;
+    setProbing(true);
+    addLog("info", "开始音源体检（逐个实测取链接 + 测速），可能需要一两分钟…");
+    try {
+      const report = await invoke<ProbeReport>("probe_sources", { python: pythonPath || null });
+      setProbeReport(report);
+
+      const dead = report.sources.filter((s) => s.status === "dead");
+      const flaky = report.sources.filter((s) => s.status === "flaky");
+      const ok = report.sources.filter((s) => s.status === "ok");
+
+      addLog(
+        dead.length ? "error" : "ok",
+        `体检完成：正常 ${ok.length} 个，不稳定 ${flaky.length} 个，失活 ${dead.length} 个`,
+      );
+      for (const s of dead) {
+        addLog("error", `  失活: ${s.name}（${s.error || "取不到链接"}）`);
+      }
+      // 默认勾选失活音源，用户可自行取消
+      setDeadPicked(new Set(dead.map((s) => s.name)));
+    } catch (err) {
+      addLog("error", String(err));
+    } finally {
+      setProbing(false);
+    }
+  }
+
+  /** 删除体检中勾选的失活音源（用户确认后才会走到这里） */
+  async function deletePickedSources() {
+    const names = Array.from(deadPicked);
+    if (!names.length) return;
+    try {
+      const removed = await invoke<string[]>("remove_sources", { names });
+      addLog("ok", `已删除 ${removed.length} 个音源${removed.length ? "：" + removed.join("、") : ""}`);
+      setDeadPicked(new Set());
+      setProbeReport((prev) =>
+        prev ? { ...prev, sources: prev.sources.filter((s) => !removed.includes(s.name)) } : prev,
+      );
+      await refreshSources();
+    } catch (err) {
+      addLog("error", String(err));
+    }
+  }
+
   /** 从落雪音乐桌面端导入音源（自动探测 user_api.json，也可手动选文件） */
   async function importFromLxDesktop(manualPath?: string) {
     setImportingLx(true);
@@ -756,6 +955,38 @@ function App() {
             )}
           </div>
         </header>
+
+        {/* ===== 新版本提示条 ===== */}
+        {updateInfo && !updateDismissed && (
+          <div className="update-banner">
+            <div className="update-banner-text">
+              <strong>发现新版本 {updateInfo.latest}</strong>
+              <span>
+                当前版本 {APP_VERSION}
+                {updateInfo.name ? ` ｜ ${updateInfo.name}` : ""}
+              </span>
+            </div>
+            <div className="update-banner-actions">
+              <button
+                className="primary-btn small"
+                onClick={downloadUpdate}
+                disabled={downloadingUpdate || !updateInfo.downloadUrl}
+                title={updateInfo.downloadUrl ? "" : "该版本未提供安装包，请到发布页下载"}
+              >
+                {downloadingUpdate ? "下载中…" : "下载更新"}
+              </button>
+              <button
+                className="ghost-btn small"
+                onClick={() => openExternal(updateInfo.pageUrl || AUTHOR.repo + "/releases")}
+              >
+                查看详情
+              </button>
+              <button className="ghost-btn small" onClick={() => setUpdateDismissed(true)}>
+                稍后
+              </button>
+            </div>
+          </div>
+        )}
 
         {progress && (
           <div className="progressbar-wrap">
@@ -1225,6 +1456,14 @@ function App() {
                 <button className="ghost-btn" onClick={refreshSources}>
                   刷新
                 </button>
+                <button
+                  className="ghost-btn"
+                  onClick={probeSources}
+                  disabled={probing || sourceFiles.length === 0}
+                  title="逐个实测每个音源能否真的取到可下载链接，并测出响应速度"
+                >
+                  {probing ? "体检中…" : "音源体检"}
+                </button>
                 <input
                   ref={sourceInputRef}
                   type="file"
@@ -1233,6 +1472,79 @@ function App() {
                   onChange={onPickSource}
                 />
               </div>
+
+              {/* ===== 体检结果 ===== */}
+              {probeReport && probeReport.sources.length > 0 && (
+                <div className="probe-panel">
+                  <div className="probe-head">
+                    <strong>体检结果</strong>
+                    <span className="hint">
+                      {probeReport.probedAt
+                        ? new Date(probeReport.probedAt).toLocaleString("zh-CN")
+                        : ""}
+                      ｜按响应速度排序，快的在前
+                    </span>
+                  </div>
+
+                  <div className="probe-list">
+                    {probeReport.sources.map((s, i) => {
+                      const dead = s.status === "dead";
+                      const flaky = s.status === "flaky";
+                      return (
+                        <div
+                          key={s.name}
+                          className={`probe-row ${dead ? "dead" : flaky ? "flaky" : "ok"}`}
+                        >
+                          <span className="probe-rank">{i + 1}</span>
+                          <span className="probe-name" title={s.name}>{s.name}</span>
+                          <span className={`probe-badge ${s.status}`}>
+                            {dead ? "失活" : flaky ? "不稳定" : "正常"}
+                          </span>
+                          <span className="probe-speed">
+                            {s.speedMs != null ? `${s.speedMs} ms` : "—"}
+                          </span>
+                          <span className="probe-detail" title={s.error}>
+                            {dead
+                              ? s.error || "取不到链接"
+                              : `${s.okCount}/${s.total} 成功`}
+                          </span>
+                          {dead && (
+                            <label className="probe-pick">
+                              <input
+                                type="checkbox"
+                                checked={deadPicked.has(s.name)}
+                                onChange={(e) => {
+                                  setDeadPicked((prev) => {
+                                    const next = new Set(prev);
+                                    if (e.target.checked) next.add(s.name);
+                                    else next.delete(s.name);
+                                    return next;
+                                  });
+                                }}
+                              />
+                              删除
+                            </label>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+
+                  {deadPicked.size > 0 && (
+                    <div className="probe-actions">
+                      <span className="hint">
+                        已勾选 {deadPicked.size} 个失活音源
+                      </span>
+                      <button className="danger-btn" onClick={deletePickedSources}>
+                        删除勾选的音源
+                      </button>
+                      <button className="ghost-btn" onClick={() => setDeadPicked(new Set())}>
+                        取消勾选
+                      </button>
+                    </div>
+                  )}
+                </div>
+              )}
 
               {sourceFiles.length > 1 && (
                 <p className="hint">
@@ -1352,7 +1664,31 @@ function App() {
                   <p className="hint">
                     读取落雪音乐歌单，多音源批量下载无损音乐。个人学习与研究用途。
                   </p>
-                  <span className="about-version">v0.2.0</span>
+                  <span className="about-version">v{APP_VERSION}</span>
+                </div>
+              </div>
+
+              {/* ===== Star 引导 ===== */}
+              <div className="star-card">
+                <div className="star-emoji">⭐</div>
+                <div className="star-body">
+                  <h4>Star 滞销，帮帮我们</h4>
+                  <p>
+                    这个项目全靠业余时间用爱发电。如果它帮你省下了找歌的时间，
+                    点个 <strong>Star</strong> 就是最实在的支持——
+                    不花钱，但能让更多人看到它，也是我继续维护的动力。
+                  </p>
+                  <div className="star-actions">
+                    <button
+                      className="primary-btn star-btn"
+                      onClick={() => openExternal(AUTHOR.star)}
+                    >
+                      ⭐ 去 GitHub 点个 Star
+                    </button>
+                    <span className="hint">
+                      已经点过了？那也谢谢你，欢迎推荐给同样在找歌的朋友 😄
+                    </span>
+                  </div>
                 </div>
               </div>
 
@@ -1412,6 +1748,13 @@ function App() {
                   </button>
                   <button className="ghost-btn" onClick={() => openExternal(AUTHOR.repo)}>
                     项目仓库
+                  </button>
+                  <button
+                    className="ghost-btn"
+                    onClick={() => checkForUpdate(false)}
+                    disabled={checkingUpdate}
+                  >
+                    {checkingUpdate ? "检查中…" : "检查更新"}
                   </button>
                 </div>
               </div>

@@ -35,9 +35,11 @@ import ipaddress
 import json
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import queue
@@ -1888,6 +1890,16 @@ def run():
                         help='只重试上次失败的歌：读取该目录下 failed.txt 并只下载其中歌曲（省略目录则用 --dir）')
     parser.add_argument('--count-failed', nargs='?', const='', default=None, metavar='目录',
                         help='以 JSON 输出该目录 failed.txt 里的失败歌曲数量（GUI 用于显示重试按钮）')
+    parser.add_argument('--probe-sources', action='store_true',
+                        help='音源体检：逐个音源实测能否取到可下载链接，并测响应速度（JSON 输出）')
+    parser.add_argument('--probe-quality', default='320k',
+                        help='体检时请求的音质（默认 320k，避免无损源缺失造成误判）')
+    parser.add_argument('--probe-timeout-ms', type=int, default=8000,
+                        help='单个音源单次探测的超时毫秒数（默认 8000）')
+    parser.add_argument('--check-update', action='store_true',
+                        help='检查 GitHub 上是否有新版本（JSON 输出）')
+    parser.add_argument('--update-repo', default=None,
+                        help='检查更新用的仓库（默认 MyGodKnow/lx-music-downloader）')
     args = parser.parse_args()
 
     # 解析下载目录：命令行显式给了就用它，否则用设置里的默认值。
@@ -1905,6 +1917,12 @@ def run():
         return run_retry_failed(args)
     if args.count_failed is not None:
         return run_count_failed(args)
+    # 音源体检：不需要数据库/歌单，尽早处理
+    if getattr(args, 'probe_sources', False):
+        return run_probe_sources(args)
+    # 检查更新：同样不需要数据库
+    if getattr(args, 'check_update', False):
+        return run_check_update(args)
 
     # ---- 单曲搜索模式：不需要数据库，先于一切数据库探测处理 ----
     if args.search is not None:
@@ -2468,6 +2486,143 @@ def run_count_failed(args):
     directory = resolve_failed_dir(args)
     songs = load_failed_songs(directory)
     print(json.dumps({'count': len(songs), 'dir': str(directory)}, ensure_ascii=False), flush=True)
+    return 0
+
+
+# 音源体检用的探测样本：选几首不同平台、不同年代、命中率高的常见歌。
+# 用固定样本而不是随机歌，是为了让多次体检结果可比（同一把尺子）。
+_PROBE_SAMPLES = [
+    ('kw', '晴天', '周杰伦', '186016'),
+    ('kw', '夜曲', '周杰伦', '186021'),
+    ('wy', '晴天', '周杰伦', '186016'),
+]
+
+
+def run_check_update(args):
+    """检查 GitHub 上是否有新版本，输出一行 JSON。
+
+    只输出 JSON（stdout 是 GUI 的解析通道）。网络失败时返回 ok:false 而不是报错退出——
+    「检查更新失败」不应打断用户任何正常操作。
+    """
+    node_exe = args.node or find_node()
+    if not node_exe:
+        print(json.dumps({'ok': False, 'error': '未找到 Node.js'}, ensure_ascii=False), flush=True)
+        return 1
+
+    repo = getattr(args, 'update_repo', None) or 'MyGodKnow/lx-music-downloader'
+
+    # 注意：这里**不能**复用 UrlServer —— 它启动时必须加载音源目录里的脚本，
+    # 而「检查更新」根本不需要音源。之前误把引擎目录当音源目录传进去，
+    # 结果 Node 把 lx_url_server.js 自己当音源加载并报错。
+    # 因此直接起一个最小的 Node 子进程，只发 checkUpdate 一条指令。
+    # 注意：必须用 RESOURCE_DIR 而不是 dirname(__file__)。
+    # PyInstaller 打包后 __file__ 指向临时解压目录，与真实的资源目录不一致，
+    # 用错会导致找不到 lx_url_server.js（表现为「未收到响应」且 stderr 全空）。
+    script = URL_SERVER
+    if not os.path.isfile(script):
+        print(json.dumps({'ok': False, 'error': '找不到 lx_url_server.js'}, ensure_ascii=False), flush=True)
+        return 1
+
+    cmd = [node_exe]
+    # 注意：这里**刻意不加 --permission**。
+    # --permission 是给「加载第三方音源脚本」用的隔离；而检查更新不加载任何
+    # 第三方脚本，只发一个 HTTPS 请求。加上它反而会让 Node 内部某些 API
+    # （如读取临时目录）被拒绝，触发 uncaughtException 后进程直接退出，
+    # 表现为「未收到响应」且 stderr 只有一行 Access to this API has been restricted。
+    # 不开隔离不会降低安全性：这里执行的只有我们自己的 lx_url_server.js。
+    #
+    # --update-only：让 Node 完全跳过音源加载。否则音源目录为空时
+    # failNoSources 会 exit(1)，导致没导入音源的用户永远查不了更新。
+    cmd += [script, '--update-only']
+
+    proc = None
+    try:
+        if os.environ.get('LX_DEBUG_UPDATE') == '1':
+            print(f'[update] 命令: {cmd}', file=sys.stderr, flush=True)
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding='utf-8', errors='replace', bufsize=1,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
+            env=build_sandbox_env(),
+        )
+        # init() 失败时 Node 会 exit(1)，此时 stdout 只有 {"ready":true} 或什么都没有，
+        # 但 checkUpdate 的响应仍可能已写入 —— 所以先读完 stdout 再判断。
+        out, err = proc.communicate(
+            json.dumps({'id': 1, 'cmd': 'checkUpdate', 'repo': repo}) + '\n',
+            timeout=30,
+        )
+        if os.environ.get('LX_DEBUG_UPDATE') == '1':
+            print(f'[update] rc={proc.returncode} stdout={out[:300]!r}', file=sys.stderr, flush=True)
+            print(f'[update] stderr={err[:600]!r}', file=sys.stderr, flush=True)
+        payload = {'ok': False, 'error': '未收到响应'}
+        for line in (out or '').splitlines():
+            line = line.strip()
+            if not line.startswith('{'):
+                continue
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            if obj.get('id') == 1:
+                payload = obj
+        payload.pop('id', None)
+        print(json.dumps(payload, ensure_ascii=False), flush=True)
+        return 0 if payload.get('ok') else 1
+    except Exception as exc:
+        print(json.dumps({'ok': False, 'error': str(exc)[:200]}, ensure_ascii=False), flush=True)
+        return 1
+    finally:
+        if proc and proc.poll() is None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+
+def run_probe_sources(args):
+    """音源体检：逐个音源实测能否取到可下载链接，并测响应速度。
+
+    输出一行 JSON：
+      {"sources":[{"name","status","okCount","total","speedMs","error"}],"probedAt":...}
+    status: ok（全部成功）/ flaky（部分成功）/ dead（一次都没成功）
+
+    设计取舍：
+      - 每个源用同一组探测样本，保证横向可比；
+      - 样本故意跨平台（kw + wy），避免只测一个平台时把「只支持某平台」的源误判为死；
+      - 全失败才算 dead，部分成功记为 flaky —— 音源抖动很常见，一次失败不足以判死。
+    """
+    node_exe = args.node or find_node()
+    if not node_exe:
+        print('[错误] 未找到 Node.js', file=sys.stderr)
+        return 1
+    missing = check_sources(args.api, args.api_dir)
+    if missing:
+        print(missing, file=sys.stderr)
+        return 1
+
+    probes = [
+        {'source': src, 'quality': args.probe_quality or '320k',
+         'musicInfo': {'name': name, 'singer': singer, 'source': src,
+                       'songId': song_id, 'id': song_id}}
+        for src, name, singer, song_id in _PROBE_SAMPLES
+    ]
+
+    server = UrlServer(node_exe, args.api, args.api_dir).start()
+    try:
+        resp = server.request('probeSources', probes=probes,
+                              timeoutMs=getattr(args, 'probe_timeout_ms', 8000))
+    finally:
+        server.close()
+
+    if not resp.get('ok'):
+        print(json.dumps({'error': resp.get('error', '体检失败')}, ensure_ascii=False), flush=True)
+        return 1
+
+    print(json.dumps({
+        'sources': resp.get('sources', []),
+        'probedAt': resp.get('probedAt'),
+    }, ensure_ascii=False), flush=True)
     return 0
 
 
