@@ -597,29 +597,59 @@ def _failed_key(song):
     return (strict_song_key(song.get('name')), strict_song_key(song.get('singer')))
 
 
+# 引擎写 failed.txt 时，错误原因的开头几乎总是这些前缀之一
+# （来自 `f'{source}: {异常}'`、`按名搜索: ...`，或直接是校验失败文案）。
+# 用它来定位「歌名与错误原因」的分界点，比单纯取第一个 `: ` 更准。
+_V1_ERROR_PREFIXES = (
+    'kw:', 'wy:', 'tx:', 'kg:', 'mg:', 'local:',
+    '按名搜索:', '单曲时间预算耗尽', '无可用来源', '所有音质均失败',
+    '下载失败', '音质不达标', '时长校验失败', '歌手不符', '版本不符',
+    '获取链接失败', '链接无效',
+)
+
+
 def _parse_v1_line(line):
     """尽力解析 v1 的 `歌手 - 歌名: 错误原因` 行；无法解析时返回 None。
 
-    v1 本身有歧义（歌名里可能有 `:`，错误原因里也一定有 `:`），只做尽力而为：
-      1. 在**第一个** `: ` 处切开。
-         为什么取第一个而不是最后一个：引擎写的错误原因来自
-         `f'{source}: {异常}'` 再用 `; ` 拼接，几乎**每一条**都含 `: `；
-         而歌名含 `: ` 的情况很少。取最后一个会把错误文本吃进歌名，
-         导致重试时按名搜索必然找不到；取第一个最多截断带冒号的歌名，
-         这类歌本来也难救，代价更小。
-      2. 左半部分再在**第一个** ` - ` 处切开（歌手极少含 ` - `，歌名可能含）。
+    v1 本身有歧义：歌名里可能有 `: `（如 `AC/DC: Live`），错误原因里也一定有 `: `。
+    做法是**从左往右找第一个「右侧像错误原因」的 `: `**：
+      - 引擎写的错误来自 `f'{source}: {异常}'` 再用 `; ` 拼接，开头是已知前缀；
+      - 因此逐個候选切点检查右半是否以已知错误前缀开头，第一个命中的就是真分界。
+      - 全都不是已知前缀时，退回「第一个 `: `」——这样最多截断带冒号的歌名，
+        而不会把整段错误文本吃进歌名（那会导致重试时按名搜索必然找不到）。
+    左半部分再在**第一个** ` - ` 处切开（歌手极少含 ` - `，歌名可能含）。
     解析不出来的行直接跳过——宁可少重试一首，也不要把错误的歌塞进下载队列。
     """
     text = line.strip()
     if not text:
         return None
-    pos = text.find(': ')
-    if pos > 0:
-        head, error = text[:pos], text[pos + 2:]
-    elif text.endswith(':'):
-        head, error = text[:-1], ''
-    else:
-        head, error = text, ''
+
+    head, error = None, ''
+    start = 0
+    while True:
+        pos = text.find(': ', start)
+        if pos <= 0:
+            break
+        right = text[pos + 2:]
+        # 只在「右半部分确实像错误原因」时才认这个切点，
+        # 且要求左半部分已经含有 ` - `（即 `歌手 - 歌名` 结构完整）。
+        # 否则像 `AC/DC: Live - 某歌手: 音质不达标` 这种「歌手名自带冒号」的行
+        # 会在歌手名中间被切开，把歌手和歌名对调——比截断更难排查。
+        if right.startswith(_V1_ERROR_PREFIXES) and ' - ' in text[:pos]:
+            head, error = text[:pos], right
+            break
+        start = pos + 1
+
+    if head is None:
+        # 没有已知前缀：退回第一个 `: `（见 docstring 的取舍说明）
+        pos = text.find(': ')
+        if pos > 0:
+            head, error = text[:pos], text[pos + 2:]
+        elif text.endswith(':'):
+            head, error = text[:-1], ''
+        else:
+            head, error = text, ''
+
     if ' - ' in head:
         singer, name = head.split(' - ', 1)
     else:

@@ -504,6 +504,50 @@ class FailedListTest(unittest.TestCase):
         self.assertEqual(songs[0]['interval'], '04:29')
         self.assertEqual(songs[1]['name'], '出山')
 
+    # ===== v1 切分边界（真实错误串里几乎每行都含多个 ": "）=====
+
+    def test_v1_splits_on_error_prefix_not_first_colon(self):
+        # 引擎的错误来自 f'{source}: {异常}'，若按第一个 ": " 切，
+        # 会把 "kw: flac: ..." 整段错误吃进歌名，重试时按名搜索必然失败。
+        r = eng._parse_v1_line('周杰伦 - 晴天: kw: flac: 时长校验失败(预期04:29)')
+        self.assertEqual(r['singer'], '周杰伦')
+        self.assertEqual(r['name'], '晴天')
+        self.assertIn('时长校验失败', r['error'])
+
+    def test_v1_handles_semicolon_joined_errors(self):
+        r = eng._parse_v1_line(
+            '郑智化 - 水手: kw: flac: socket hang up; 320k: 音质不达标(低于 flac)')
+        self.assertEqual(r['singer'], '郑智化')
+        self.assertEqual(r['name'], '水手')
+
+    def test_v1_handles_search_error_prefix(self):
+        r = eng._parse_v1_line('周杰伦 - 晴天: 按名搜索: 按名搜索失败: 周杰伦 - 晴天')
+        self.assertEqual(r['singer'], '周杰伦')
+        self.assertEqual(r['name'], '晴天')
+
+    def test_v1_name_without_singer(self):
+        r = eng._parse_v1_line('只有歌名')
+        self.assertEqual(r['singer'], '')
+        self.assertEqual(r['name'], '只有歌名')
+
+    def test_v1_no_error_part(self):
+        r = eng._parse_v1_line('Unknown - Song')
+        self.assertEqual(r['singer'], 'Unknown')
+        self.assertEqual(r['name'], 'Song')
+        self.assertEqual(r['error'], '')
+
+    def test_v1_never_puts_error_text_into_name(self):
+        # 核心不变量：歌名里绝不能出现错误文案
+        bad_tokens = ('socket hang up', '音质不达标', '时长校验失败', '按名搜索')
+        for line in (
+            '周杰伦 - 晴天: kw: flac: 时长校验失败(预期04:29)',
+            'A - B: 音质不达标(低于 flac)',
+            'A - B: 按名搜索: 按名搜索失败: A - B',
+        ):
+            r = eng._parse_v1_line(line)
+            for tok in bad_tokens:
+                self.assertNotIn(tok, r['name'], f'{line} -> name={r["name"]!r}')
+
     def test_parse_v1_legacy(self):
         text = '\n'.join([
             '',
