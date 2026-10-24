@@ -150,6 +150,11 @@ function App() {
   const [exporting, setExporting] = useState(false);
   const exportText = exportLines.join("\n");
 
+  // ===== 重试上次失败的歌 =====
+  // failedCount > 0 才显示按钮。数量由后端 count_failed 读 failed.txt 得出，
+  // 前端不自己解析文件（解析逻辑只在引擎里维护一份，避免两处格式定义漂移）。
+  const [failedCount, setFailedCount] = useState(0);
+
   // 日志上限：批量下载 700+ 首会产出数千行，全量渲染 + 每行平滑滚动会明显掉帧。
   // 只保留最近 MAX_LOGS 行（超出后丢弃最旧的），既不影响排障也保证流畅。
   const MAX_LOGS = 800;
@@ -213,6 +218,35 @@ function App() {
       addLog("error", String(err));
     }
   }, [addLog]);
+
+  /**
+   * 查询下载目录里有多少首失败歌曲（决定是否显示「重试」按钮）。
+   *
+   * 目录留空时传 null：后端不传值，由引擎退回它自己的默认下载目录
+   * （与「开始下载」留空时的落点一致）——这是主路径，大多数用户不填目录。
+   * 任何错误都按 0 处理——「没有失败清单」是正常状态，不该在日志区刷错误。
+   */
+  const refreshFailedCount = useCallback(async () => {
+    try {
+      const n = await invoke<number>("count_failed", {
+        dir: dir.trim() || null,
+        python: pythonPath || null,
+      });
+      setFailedCount(n);
+    } catch {
+      setFailedCount(0);
+    }
+  }, [dir, pythonPath]);
+
+  // 三种时机会重新统计：目录变更、python 路径变更、任务结束（running 变 false）。
+  // 合成一个 effect 而不是两个，避免同一次变更触发两遍查询。
+  // 防抖 400ms：用户手打路径时不该每敲一个字符都起一次引擎子进程。
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      refreshFailedCount();
+    }, 400);
+    return () => window.clearTimeout(timer);
+  }, [refreshFailedCount, running]);
 
   // 首页自动加载
   useEffect(() => {
@@ -325,6 +359,26 @@ function App() {
           meta: s.meta ?? null,
         })),
         ...downloadArgs(),
+      });
+    } catch (err) {
+      addLog("error", String(err));
+      setRunning(false);
+    }
+  }
+
+  /** 只重试上次失败的歌：读 <下载目录>/failed.txt，只下载清单里的歌 */
+  async function retryFailed() {
+    setRunning(true);
+    setProgress({ done: 0, total: 0, success: 0, fail: 0, skip: 0 });
+    const where = dir.trim() || "默认下载目录";
+    addLog("info", `开始重试上次失败的 ${failedCount} 首歌（${where}，音质 ${quality}）`);
+    try {
+      // 目录留空时传 null，由引擎用默认目录（与「开始下载」留空时完全一致）。
+      // 不能用 downloadArgs() 展开后再覆盖 dir —— 同名字段会触发 TS2783。
+      const args = downloadArgs();
+      await invoke("retry_failed", {
+        ...args,
+        dir: dir.trim() || null,
       });
     } catch (err) {
       addLog("error", String(err));
@@ -1027,10 +1081,28 @@ function App() {
                 >
                   {stopping ? "正在停止…" : running ? "正在下载…" : "开始下载"}
                 </button>
+                {/* 只有下载目录里确实存在失败清单时才出现，避免常态干扰 */}
+                {failedCount > 0 && (
+                  <button
+                    className="ghost-btn"
+                    onClick={retryFailed}
+                    disabled={running || stopping}
+                    title="读取下载目录下的 failed.txt，只补下其中失败过的歌曲"
+                  >
+                    重试上次失败的 {failedCount} 首
+                  </button>
+                )}
                 {playlists.length === 0 && (
                   <span className="hint">请先在「我的歌单」页加载歌单</span>
                 )}
               </div>
+
+              {failedCount > 0 && (
+                <p className="hint">
+                  「重试」只下载 <code>failed.txt</code> 里记录的歌；已存在的会自动跳过，
+                  补下成功的会从清单中移除。
+                </p>
+              )}
 
               <LogView logs={logs} logEndRef={logEndRef} />
             </section>

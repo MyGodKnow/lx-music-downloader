@@ -799,6 +799,15 @@ fn get_sources_dir() -> String {
     user_sources_dir().to_string_lossy().to_string()
 }
 
+/// 音源目录里属于「程序自己的元数据文件」，不是音源，任何列表/排序/加载都要排除。
+///
+/// `.order.json` 存拖拽顺序，`.health.json` 存音源健康度。两者都是 `.json`，
+/// 若不显式排除会被当成音源脚本：既会出现在音源列表里让用户困惑，
+/// 又会被 Node 当脚本加载（内容不是合法音源，白白报错）。
+fn is_meta_file(name: &str) -> bool {
+    matches!(name, ".order.json" | ".health.json")
+}
+
 /// 列出用户已导入的音源文件。
 #[tauri::command]
 fn list_sources() -> Vec<String> {
@@ -808,7 +817,7 @@ fn list_sources() -> Vec<String> {
         for entry in rd.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
             let lower = name.to_lowercase();
-            if lower.ends_with(".js") || lower.ends_with(".json") {
+            if (lower.ends_with(".js") || lower.ends_with(".json")) && !is_meta_file(&name) {
                 out.push(name);
             }
         }
@@ -869,7 +878,7 @@ fn get_source_order() -> Vec<String> {
                 .map(|e| e.file_name().to_string_lossy().to_string())
                 .filter(|n| {
                     let l = n.to_lowercase();
-                    (l.ends_with(".js") || l.ends_with(".json")) && n != ".order.json"
+                    (l.ends_with(".js") || l.ends_with(".json")) && !is_meta_file(n)
                 })
                 .collect()
         })
@@ -1376,6 +1385,113 @@ fn download_songs_blocking(
     spawn_task(app.clone(), &state, "download-log", args, engine)
 }
 
+/// 校验失败清单目录参数（`--retry-failed` / `--count-failed` 的值直接进 argv）。
+///
+/// 返回 `None` 表示「用户没指定目录」——此时**不传值**，由引擎退回它自己的
+/// 默认下载目录（与「开始下载」留空时的落点完全一致）。这是主路径：
+/// 绝大多数用户不填下载目录，失败清单就在默认目录里。
+fn validate_failed_dir(dir: Option<&String>) -> Result<Option<String>, String> {
+    let d = dir.map(|s| s.trim()).unwrap_or("");
+    if d.is_empty() {
+        return Ok(None);
+    }
+    reject_flag_prefix("下载目录", d)?;
+    Ok(Some(d.to_string()))
+}
+
+/// 统计下载目录 failed.txt 里的失败歌曲数，供前端决定是否显示「重试」按钮。
+///
+/// 必须 async + spawn_blocking：`resolve_engine` 首次运行会同步解压 41MB 引擎包，
+/// 同步命令跑在主线程会冻结界面（本项目踩过的坑）。
+#[tauri::command]
+async fn count_failed(dir: Option<String>, python: Option<String>) -> Result<usize, String> {
+    tauri::async_runtime::spawn_blocking(move || count_failed_blocking(dir, python))
+        .await
+        .map_err(|e| format!("任务执行失败: {e}"))?
+}
+
+fn count_failed_blocking(dir: Option<String>, python: Option<String>) -> Result<usize, String> {
+    validate_python(python.as_ref())?;
+    let mut args = vec!["--count-failed".to_string()];
+    if let Some(d) = validate_failed_dir(dir.as_ref())? {
+        args.push(d);
+    }
+    // 超时给 60s：首次运行需要解压引擎包，之后是毫秒级
+    let text = run_engine_json(python.as_ref(), args, 60, "统计失败歌曲")?;
+    let value: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("解析失败歌曲数量失败: {e}"))?;
+    // 引擎返回 {"count":N,"dir":"..."}；字段缺失按 0 处理（没有清单是正常状态）
+    Ok(value.get("count").and_then(|v| v.as_u64()).unwrap_or(0) as usize)
+}
+
+/// 只重试上次失败的歌：调用引擎的 `--retry-failed`，下载日志走同一个 "download-log" 事件。
+///
+/// 与 start_download 一样必须 async + spawn_blocking，否则会阻塞主线程。
+#[tauri::command]
+async fn retry_failed(
+    app: AppHandle,
+    dir: Option<String>,
+    quality: String,
+    workers: usize,
+    fallback: bool,
+    min_quality: Option<String>,
+    python: Option<String>,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        retry_failed_blocking(app, dir, quality, workers, fallback, min_quality, python)
+    })
+    .await
+    .map_err(|e| format!("任务执行失败: {e}"))?
+}
+
+fn retry_failed_blocking(
+    app: AppHandle,
+    dir: Option<String>,
+    quality: String,
+    workers: usize,
+    fallback: bool,
+    min_quality: Option<String>,
+    python: Option<String>,
+) -> Result<String, String> {
+    validate_python(python.as_ref())?;
+    // quality 直接进 argv，必须做值域白名单（仅挡 `-` 前缀不足以防 `flac --dir X`）
+    validate_quality(&quality)?;
+    let dir_value = validate_failed_dir(dir.as_ref())?;
+    if let Some(mq) = min_quality.as_deref().map(|s| s.trim()) {
+        if !mq.is_empty() {
+            reject_flag_prefix("min_quality", mq)?;
+            validate_quality(mq)?;
+        }
+    }
+
+    let mut args = vec!["--retry-failed".to_string()];
+    if let Some(d) = &dir_value {
+        // 显式传 --dir：让下载落点与失败清单目录一致。
+        // 引擎侧也有兜底（未显式给 --dir 时取清单目录），两边都设防。
+        args.push(d.clone());
+        args.push("--dir".to_string());
+        args.push(d.clone());
+    }
+    args.push("--quality".to_string());
+    args.push(quality);
+    if workers > 0 {
+        args.push("--workers".to_string());
+        args.push(workers.to_string());
+    }
+    if fallback {
+        args.push("--fallback-quality".to_string());
+        if let Some(mq) = min_quality {
+            if !mq.trim().is_empty() {
+                args.push("--min-quality".to_string());
+                args.push(mq.trim().to_string());
+            }
+        }
+    }
+    let engine = resolve_engine(python.as_ref());
+    let state = app.state::<TaskState>();
+    spawn_task(app.clone(), &state, "download-log", args, engine)
+}
+
 /// 运行引擎并解析其 JSON 输出（取最后一行非空输出），供 search_songs / list_songs 复用。
 fn run_engine_json(
     python: Option<&String>,
@@ -1436,6 +1552,8 @@ pub fn run() {
             search_songs,
             list_songs,
             download_songs,
+            retry_failed,
+            count_failed,
             export_songs,
             save_text_file
         ])
@@ -1489,6 +1607,36 @@ mod tests {
         assert!(validate_quality("flac ").is_ok(), "首尾空白应被容忍");
     }
 
+    // ===== 失败清单目录（--retry-failed / --count-failed 的 argv 值）=====
+
+    #[test]
+    fn validate_failed_dir_accepts_normal_paths() {
+        assert_eq!(
+            validate_failed_dir(Some(&r"D:\Music".to_string())).unwrap(),
+            Some(r"D:\Music".to_string())
+        );
+        // 首尾空白应被裁掉，否则引擎会把带空白的路径当字面目录名
+        assert_eq!(
+            validate_failed_dir(Some(&"  D:\\Music  ".to_string())).unwrap(),
+            Some(r"D:\Music".to_string())
+        );
+    }
+
+    #[test]
+    fn validate_failed_dir_rejects_flag_injection() {
+        // 目录值直接进 argv，以 - 开头会被 argparse 当成另一个选项
+        assert!(validate_failed_dir(Some(&"--dir D:\\evil".to_string())).is_err());
+        assert!(validate_failed_dir(Some(&"-rf".to_string())).is_err());
+    }
+
+    #[test]
+    fn validate_failed_dir_empty_means_engine_default() {
+        // 空目录不是错误：绝大多数用户不填下载目录，此时不传值，
+        // 由引擎退回它自己的默认目录（与「开始下载」留空时落点一致）。
+        assert_eq!(validate_failed_dir(None).unwrap(), None);
+        assert_eq!(validate_failed_dir(Some(&"   ".to_string())).unwrap(), None);
+    }
+
     // ===== python 路径白名单 =====
 
     #[test]
@@ -1496,7 +1644,6 @@ mod tests {
         assert!(validate_python(None).is_ok());
         assert!(validate_python(Some(&"   ".to_string())).is_ok());
     }
-
     #[test]
     fn validate_python_rejects_missing_file() {
         assert!(validate_python(Some(&r"C:\nope\python.exe".to_string())).is_err());
@@ -1530,6 +1677,22 @@ mod tests {
     fn validate_source_name_accepts_js_and_json() {
         assert!(validate_source_name("音源 v1.2.js").is_ok());
         assert!(validate_source_name("user_api.JSON").is_ok());
+    }
+
+    // ===== 元数据文件排除（.order.json / .health.json 不是音源）=====
+
+    #[test]
+    fn is_meta_file_excludes_program_metadata() {
+        assert!(is_meta_file(".order.json"));
+        assert!(is_meta_file(".health.json"));
+    }
+
+    #[test]
+    fn is_meta_file_keeps_real_sources() {
+        // 真实的音源文件名（含以点开头的合法名）不能被误排除
+        for name in ["六音音源.js", "野草🌾.js", "user_api.json", "音源 v1.2.js"] {
+            assert!(!is_meta_file(name), "{name} 不应被当成元数据文件");
+        }
     }
 
     // ===== 歌单解析 =====

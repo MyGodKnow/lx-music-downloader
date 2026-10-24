@@ -15,6 +15,7 @@ import sys
 import json
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -148,6 +149,61 @@ class FilenameTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             p = eng.safe_join(td, '周杰伦 - 晴天.mp3')
             self.assertTrue(str(p).startswith(str(Path(td).resolve())))
+
+
+class SandboxEnvTest(unittest.TestCase):
+    """传给 Node 音源进程的环境变量必须是最小集合。
+
+    音源脚本可通过 vm 逃逸读到 process.env，若继承全部变量，
+    用户的 API key / 许可证路径会直接暴露给第三方脚本。
+    """
+
+    def test_keeps_runtime_essentials(self):
+        env = eng.build_sandbox_env()
+        upper = {k.upper() for k in env}
+        for need in ('SYSTEMROOT', 'APPDATA', 'PATH'):
+            self.assertIn(need, upper, f'{need} 必须保留，否则 Node 无法正常启动')
+
+    def test_drops_secrets(self):
+        # 构造一个含敏感变量的环境，确认不会被带过去
+        fake = {
+            'APPDATA': r'C:\Users\x\AppData\Roaming',
+            'SYSTEMROOT': r'C:\Windows',
+            'PATH': r'C:\Windows\System32',
+            'MY_API_TOKEN': 'sk-secret',
+            'GITHUB_TOKEN': 'ghp_secret',
+            'AWS_SECRET_ACCESS_KEY': 'secret',
+            'SOME_LICENSE': r'C:\ProgramData\x\a.lic',
+        }
+        with mock.patch.dict(os.environ, fake, clear=True):
+            env = eng.build_sandbox_env()
+        upper = {k.upper() for k in env}
+        self.assertIn('APPDATA', upper)
+        self.assertNotIn('MY_API_TOKEN', upper)
+        self.assertNotIn('GITHUB_TOKEN', upper)
+        self.assertNotIn('AWS_SECRET_ACCESS_KEY', upper)
+        self.assertNotIn('SOME_LICENSE', upper)
+
+    def test_case_insensitive_matching(self):
+        # Windows 环境变量名不区分大小写：小写 systemroot 也应被保留。
+        # （早期按大小写敏感比较，导致 SYSTEMROOT 被过滤，Node 直接起不来。）
+        #
+        # 注意：Windows 上 os.environ 本身会把键名归一化成大写，
+        # 所以这里用大小写无关的方式断言，不依赖键的字面形式。
+        fake = {'systemroot': r'C:\Windows', 'appdata': r'C:\Users\x\AppData\Roaming'}
+        with mock.patch.dict(os.environ, fake, clear=True):
+            env = eng.build_sandbox_env()
+        upper = {k.upper(): v for k, v in env.items()}
+        self.assertEqual(len(env), 2, f'小写形式的系统变量也应保留，实际 {env}')
+        self.assertEqual(upper['SYSTEMROOT'], r'C:\Windows')
+
+    def test_result_is_plain_dict(self):
+        # 返回必须是普通 dict（subprocess 的 env 参数要求），且值都是 str
+        env = eng.build_sandbox_env()
+        self.assertIsInstance(env, dict)
+        for k, v in env.items():
+            self.assertIsInstance(k, str)
+            self.assertIsInstance(v, str)
 
 
 class UrlSafetyTest(unittest.TestCase):
@@ -422,6 +478,134 @@ class StrictMatchTest(unittest.TestCase):
 
     def test_strict_key_handles_none(self):
         self.assertEqual(eng.strict_song_key(None), '')
+
+
+class FailedListTest(unittest.TestCase):
+    """failed.txt 的 v2 格式与 v1 向后兼容。
+
+    重点：旧格式是「歌手 - 歌名: 原因」，本身有歧义（歌名/原因里都可能有冒号），
+    只要求「尽力解析」，绝不要求 100% 还原；新格式必须完全可逆。
+    """
+
+    def test_parse_v2_jsonl(self):
+        text = '\n'.join([
+            eng.FAILED_HEADER_V2,
+            '# 2026-10-18 15:30',
+            json.dumps({'name': '晴天', 'singer': '周杰伦', 'source': 'kw',
+                        'interval': '04:29', 'error': '音质不达标'}, ensure_ascii=False),
+            json.dumps({'name': '出山', 'singer': '花粥', 'source': 'wy',
+                        'interval': '03:20', 'error': '按名搜索无候选'}, ensure_ascii=False),
+        ])
+        songs = eng.parse_failed_txt(text)
+        self.assertEqual(len(songs), 2)
+        self.assertEqual(songs[0]['name'], '晴天')
+        self.assertEqual(songs[0]['singer'], '周杰伦')
+        self.assertEqual(songs[0]['source'], 'kw')
+        self.assertEqual(songs[0]['interval'], '04:29')
+        self.assertEqual(songs[1]['name'], '出山')
+
+    def test_parse_v1_legacy(self):
+        text = '\n'.join([
+            '',
+            '--- 2026-10-18 15:30 ---',
+            '周杰伦 - 晴天: 音质不达标(低于 320k)',
+            '花粥 - 出山: 按名搜索无候选',
+        ])
+        songs = eng.parse_failed_txt(text)
+        self.assertEqual([s['name'] for s in songs], ['晴天', '出山'])
+        self.assertEqual([s['singer'] for s in songs], ['周杰伦', '花粥'])
+        self.assertEqual(songs[0]['error'], '音质不达标(低于 320k)')
+
+    def test_v1_name_with_colon_is_best_effort(self):
+        # v1 有歧义，只要求「尽量拿到正确的歌手 + 一个非空歌名」，不要求完美还原。
+        # 这里取第一个 ': ' 切开：错误原因里几乎必有 ': '，歌名里有则很少。
+        songs = eng.parse_failed_txt('A - 歌: 副标题: 失败原因: 细节')
+        self.assertEqual(len(songs), 1)
+        self.assertEqual(songs[0]['singer'], 'A')
+        self.assertEqual(songs[0]['name'], '歌')
+        self.assertEqual(songs[0]['error'], '副标题: 失败原因: 细节')
+
+    def test_v1_real_engine_error_text(self):
+        # 引擎真实写出的错误串形如 "kw: 音源未返回任何链接; 按名搜索: 无候选"，
+        # 必须整体留在 error 里，不能污染歌名（否则重试按名搜索必然失败）
+        songs = eng.parse_failed_txt('周杰伦 - 晴天: kw: 音源未返回任何链接; 按名搜索: 无候选')
+        self.assertEqual(songs[0]['name'], '晴天')
+        self.assertEqual(songs[0]['singer'], '周杰伦')
+        self.assertEqual(songs[0]['error'], 'kw: 音源未返回任何链接; 按名搜索: 无候选')
+
+    def test_mixed_v1_and_v2(self):
+        text = '\n'.join([
+            '--- 2026-10-18 15:30 ---',
+            '周杰伦 - 晴天: 音质不达标',
+            eng.FAILED_HEADER_V2,
+            json.dumps({'name': '出山', 'singer': '花粥', 'source': 'wy'}, ensure_ascii=False),
+        ])
+        songs = eng.parse_failed_txt(text)
+        self.assertEqual([s['name'] for s in songs], ['晴天', '出山'])
+        # v1 没有 source/interval，应给空串而不是缺字段
+        self.assertEqual(songs[0]['source'], '')
+        self.assertEqual(songs[0]['interval'], '')
+
+    def test_duplicate_songs_are_merged(self):
+        # 同一首歌失败多次（不同批次）只应出现一次，否则会重复下载
+        text = '\n'.join([
+            json.dumps({'name': '晴天', 'singer': '周杰伦'}, ensure_ascii=False),
+            json.dumps({'name': '晴天 ', 'singer': '周杰伦'}, ensure_ascii=False),
+        ])
+        self.assertEqual(len(eng.parse_failed_txt(text)), 1)
+
+    def test_garbage_lines_are_skipped(self):
+        text = '\n'.join([
+            '这不是任何已知格式',
+            json.dumps({'singer': '没有歌名'}, ensure_ascii=False),
+            json.dumps({'name': '有效', 'singer': 'X'}, ensure_ascii=False),
+        ])
+        songs = eng.parse_failed_txt(text)
+        # 「这不是任何已知格式」会被 v1 兜底成无歌手的歌名，这是可接受的尽力解析；
+        # 但没有 name 字段的 JSON 必须被丢弃
+        self.assertNotIn('没有歌名', [s['name'] for s in songs])
+        self.assertIn('有效', [s['name'] for s in songs])
+
+    def test_empty_input(self):
+        self.assertEqual(eng.parse_failed_txt(''), [])
+        self.assertEqual(eng.parse_failed_txt(None), [])
+
+    def test_write_and_reload_roundtrip(self):
+        with tempfile.TemporaryDirectory() as td:
+            items = [{
+                'name': '晴天', 'singer': '周杰伦', 'source': 'kw',
+                'interval': '04:29', 'error': '音质不达标(低于 320k)',
+            }]
+            eng.write_failed_file(td, items)
+            path = Path(td) / eng.FAILED_FILE_NAME
+            self.assertTrue(path.is_file())
+            raw = path.read_text(encoding='utf-8')
+            self.assertIn(eng.FAILED_HEADER_V2, raw)
+            self.assertEqual(eng.load_failed_songs(td), items)
+
+    def test_write_empty_removes_file(self):
+        with tempfile.TemporaryDirectory() as td:
+            eng.write_failed_file(td, [{'name': 'A', 'singer': 'B'}])
+            path = Path(td) / eng.FAILED_FILE_NAME
+            self.assertTrue(path.is_file())
+            # 全部成功时必须删掉文件，否则 GUI 会一直显示「重试」按钮
+            eng.write_failed_file(td, [])
+            self.assertFalse(path.exists())
+
+    def test_load_missing_file_returns_empty(self):
+        with tempfile.TemporaryDirectory() as td:
+            self.assertEqual(eng.load_failed_songs(td), [])
+
+    def test_failed_to_song_shape(self):
+        song = eng.failed_to_song({
+            'name': '晴天', 'singer': '周杰伦', 'source': 'kw',
+            'interval': '04:29', 'error': 'x',
+        })
+        # 必须与 run_download 期望的字段完全一致，否则 process_song 会 KeyError
+        for key in ('id', 'name', 'singer', 'source', 'interval', 'meta'):
+            self.assertIn(key, song)
+        self.assertEqual(song['name'], '晴天')
+        self.assertEqual(json.loads(song['meta']), {})
 
 
 if __name__ == '__main__':

@@ -28,6 +28,7 @@ lx_music_downloader.py - 落雪音乐歌单一键下载器
   python lx_music_downloader.py --list               # 列出歌单
   python lx_music_downloader.py --playlist <id>      # 下载指定歌单
   python lx_music_downloader.py --playlist <id> --quality flac --dir D:/Music --workers 4
+  python lx_music_downloader.py --retry-failed D:/Music   # 只补下该目录 failed.txt 里的歌
 """
 import argparse
 import ipaddress
@@ -78,6 +79,39 @@ USER_SOURCES_DIR = os.path.join(os.environ.get('APPDATA', APP_DIR), 'lx-download
 # None = 尚未探测；True = 可用；False = 该环境不支持，已回退到无隔离模式。
 # 音源脚本是第三方代码且 vm 可被逃逸，--permission 是进程级的兜底防线。
 _NODE_PERMISSION_SUPPORTED = None
+
+# 传给 Node 音源进程的环境变量白名单（**必须大写**：Windows 环境变量名不区分大小写，
+# 用原样大小写比较会漏掉 SYSTEMROOT 这类以全大写存在的变量，导致 Node 起不来）。
+#
+# 背景：音源脚本可通过 vm 逃逸读到 process.env。若继承全部环境变量，
+# 用户的各类 API key / 许可证路径 / 会话信息会直接暴露给第三方脚本。
+# 这份白名单只保留：Node 运行必需的系统变量 + 音源可能用到的代理/TLS/时区设置。
+# 实测（71 项 → 35 项）音源取链功能完全正常。
+_SANDBOX_ENV_KEYS = frozenset(s.upper() for s in (
+    # —— Node / Windows 运行必需 ——
+    'PATH', 'PATHEXT', 'COMSPEC', 'OS', 'SYSTEMROOT', 'WINDIR', 'SYSTEMDRIVE',
+    'APPDATA', 'LOCALAPPDATA', 'TEMP', 'TMP', 'USERPROFILE',
+    'HOMEDRIVE', 'HOMEPATH', 'USERNAME', 'USERDOMAIN', 'COMPUTERNAME',
+    'NUMBER_OF_PROCESSORS', 'PROCESSOR_ARCHITECTURE', 'PROCESSOR_IDENTIFIER',
+    'PROCESSOR_LEVEL', 'PROCESSOR_REVISION',
+    'PROGRAMDATA', 'PROGRAMFILES', 'PROGRAMFILES(X86)', 'PROGRAMW6432',
+    'COMMONPROGRAMFILES', 'COMMONPROGRAMFILES(X86)', 'COMMONPROGRAMW6432',
+    'ALLUSERSPROFILE', 'PUBLIC', 'SESSIONNAME', 'LOGONSERVER',
+    # —— 音源可能依赖的网络/区域设置 ——
+    'TZ', 'LANG', 'NO_COLOR',
+    'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY',
+    'http_proxy', 'https_proxy', 'no_proxy',
+    'NODE_TLS_REJECT_UNAUTHORIZED',
+))
+
+
+def build_sandbox_env():
+    """构造传给 Node 音源进程的最小环境变量集合。
+
+    只保留白名单内的变量，其余（API key、许可证路径、会话 ID 等）一律不传。
+    保留变量名原有大小写，避免 Windows 上某些程序对大小写敏感。
+    """
+    return {k: v for k, v in os.environ.items() if k.upper() in _SANDBOX_ENV_KEYS}
 
 # 落雪音乐数据库候选路径：官方版 / 便携版 / 不同 fork / 历史版本，
 # 保证不同安装方式的用户都能自动识别到歌单。
@@ -276,7 +310,7 @@ class UrlServer:
         # Node 22 的 --permission 能从进程层面兜住这个逃逸：
         # 实测开启后，即使 vm 已逃逸，写文件与 spawn 仍被拒绝（ERR_ACCESS_DENIED）。
         # 这里只授予「读音源目录 + 读本脚本所在目录（node 需要读 lx_url_server.js）」，
-        # 不授予写权限、不授予 child_process 权限。
+        # 写权限**只开一个文件**：音源健康度 .health.json（见下方说明）。
         #
         # 若运行环境不支持该参数（Node < 20 或某些打包环境），自动回退到
         # 无隔离模式并打印警告，绝不因为加固而导致功能不可用。
@@ -291,6 +325,18 @@ class UrlServer:
             for p in dict.fromkeys(read_paths):  # 去重且保序
                 if p and os.path.isdir(p):
                     perm_args.append(f'--allow-fs-read={p}')
+
+            # 音源健康度需要跨进程持久化，必须能写 .health.json。
+            # 关键：只授权这一个**文件**，而不是整个目录 ——
+            # 实测 `--allow-fs-write=<目录>/.health.json` 时，
+            # 写 .health.json 成功，写同目录下的其它文件仍被 ERR_ACCESS_DENIED 拒绝，
+            # 因此不会给音源脚本留下「往音源目录丢恶意 .js」的能力。
+            health_dir = os.path.abspath(self.api_dir) if self.api_dir else (
+                os.path.dirname(os.path.abspath(self.api_file)) if self.api_file else None
+            )
+            if health_dir and os.path.isdir(health_dir):
+                perm_args.append(f'--allow-fs-write={os.path.join(health_dir, ".health.json")}')
+
             if perm_args:
                 cmd += ['--permission'] + perm_args
 
@@ -309,6 +355,10 @@ class UrlServer:
             errors='replace',
             bufsize=1,
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
+            # 只传白名单环境变量：音源脚本可逃逸 vm 拿到 process.env，
+            # 继承全部 71 项会把用户的各类 API key / 许可证路径直接暴露给第三方脚本。
+            # 白名单保留 Node 运行必需 + 音源可能用到的代理/TLS/时区设置（实测功能不受影响）。
+            env=build_sandbox_env(),
         )
         # 等待 ready 行
         ready = self.proc.stdout.readline()
@@ -511,6 +561,189 @@ def norm_song_key_match(a, b):
         return True
     short, long = (na, nb) if len(na) <= len(nb) else (nb, na)
     return long.startswith(short)
+
+
+# ============ 失败清单 failed.txt（v2 格式：人类可读 + 可解析） ============
+#
+# 旧格式（v1）是给人看的：
+#     --- 2026-10-18 15:30 ---
+#     周杰伦 - 晴天: 音质不达标(低于 320k)
+# 问题是**不可逆地有歧义**：歌名里可能有 `:`，错误原因里也有 `:`，
+# 「歌手 - 歌名」里还可能有 ` - `。无论怎么切都无法可靠还原字段，
+# 导致「只重试上次失败的歌」这件事做不了。
+#
+# v2 改为「注释行 + 每首一行 JSON（JSONL）」：
+#     # lx-downloader failed list v2
+#     # 2026-10-18 15:30
+#     {"name":"晴天","singer":"周杰伦","source":"kw","interval":"04:29","error":"音质不达标"}
+# 为什么选 JSONL 而不是 TSV：
+#   1. JSON 有转义，歌名/错误原因里的 `\t`、换行、引号都不会破坏结构；
+#   2. 单行即完整记录，用户用记事本打开仍是一行一首，可读性不输 TSV；
+#   3. 引擎已有 json 依赖，解析失败时可逐行跳过，坏一行不影响其它行。
+# 注释行（`#` 开头）记录版本与批次时间，既保留「这批是什么时候失败的」信息，
+# 又不会干扰解析。
+FAILED_FILE_NAME = 'failed.txt'
+FAILED_HEADER_V2 = '# lx-downloader failed list v2'
+# v1 的时间戳分隔行，例如 `--- 2026-10-18 15:30 ---`
+_V1_BATCH_RE = re.compile(r'^-{3,}\s*(.*?)\s*-{3,}$')
+
+
+def _failed_key(song):
+    """失败清单的去重键：歌名 + 歌手（严格归一化）。
+
+    不含 source/interval：同一首歌在不同批次里可能来自不同平台，
+    去重时应视为同一首，否则清单里会留下重复项。
+    """
+    return (strict_song_key(song.get('name')), strict_song_key(song.get('singer')))
+
+
+def _parse_v1_line(line):
+    """尽力解析 v1 的 `歌手 - 歌名: 错误原因` 行；无法解析时返回 None。
+
+    v1 本身有歧义（歌名里可能有 `:`，错误原因里也一定有 `:`），只做尽力而为：
+      1. 在**第一个** `: ` 处切开。
+         为什么取第一个而不是最后一个：引擎写的错误原因来自
+         `f'{source}: {异常}'` 再用 `; ` 拼接，几乎**每一条**都含 `: `；
+         而歌名含 `: ` 的情况很少。取最后一个会把错误文本吃进歌名，
+         导致重试时按名搜索必然找不到；取第一个最多截断带冒号的歌名，
+         这类歌本来也难救，代价更小。
+      2. 左半部分再在**第一个** ` - ` 处切开（歌手极少含 ` - `，歌名可能含）。
+    解析不出来的行直接跳过——宁可少重试一首，也不要把错误的歌塞进下载队列。
+    """
+    text = line.strip()
+    if not text:
+        return None
+    pos = text.find(': ')
+    if pos > 0:
+        head, error = text[:pos], text[pos + 2:]
+    elif text.endswith(':'):
+        head, error = text[:-1], ''
+    else:
+        head, error = text, ''
+    if ' - ' in head:
+        singer, name = head.split(' - ', 1)
+    else:
+        # 没有歌手时 v1 只写歌名
+        singer, name = '', head
+    name = name.strip()
+    if not name:
+        return None
+    return {
+        'name': name,
+        'singer': singer.strip(),
+        'source': '',
+        'interval': '',
+        'error': error.strip(),
+    }
+
+
+def parse_failed_txt(text):
+    """解析 failed.txt 内容，返回歌曲字典列表（按出现顺序去重）。
+
+    同时兼容 v2（JSONL）与 v1（`歌手 - 歌名: 原因`）：
+      - `#` 开头 → 注释，跳过
+      - `{` 开头 → 尝试按 JSON 解析；成功即采纳，失败则退回 v1 解析
+        （v1 的歌名理论上可能以 `{` 开头，不能因为首字符就丢弃）
+      - `--- ... ---` → v1 批次分隔，跳过
+      - 其它 → 按 v1 尽力解析
+    任何单行解析失败都只跳过该行，绝不让整份清单报废。
+    """
+    songs = []
+    seen = set()
+    for raw in str(text or '').splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith('#'):
+            continue
+        if _V1_BATCH_RE.match(line):
+            continue
+        item = None
+        if line.startswith('{'):
+            try:
+                obj = json.loads(line)
+            except Exception:
+                obj = None
+            if isinstance(obj, dict):
+                name = str(obj.get('name') or '').strip()
+                if name:
+                    item = {
+                        'name': name,
+                        'singer': str(obj.get('singer') or '').strip(),
+                        'source': str(obj.get('source') or '').strip(),
+                        'interval': str(obj.get('interval') or '').strip(),
+                        'error': str(obj.get('error') or '').strip(),
+                    }
+        if item is None:
+            item = _parse_v1_line(line)
+        if not item:
+            continue
+        key = _failed_key(item)
+        if not key[0] or key in seen:
+            continue
+        seen.add(key)
+        songs.append(item)
+    return songs
+
+
+def load_failed_songs(directory):
+    """读取 <目录>/failed.txt 并解析成歌曲列表；文件不存在返回空列表。"""
+    path = Path(directory) / FAILED_FILE_NAME
+    try:
+        text = path.read_text(encoding='utf-8', errors='replace')
+    except FileNotFoundError:
+        return []
+    except OSError as exc:
+        print(f'[错误] 读取失败清单失败: {exc}', file=sys.stderr, flush=True)
+        return []
+    return parse_failed_txt(text)
+
+
+def failed_to_song(item):
+    """把失败清单条目转换成 run_download 认识的歌曲结构。
+
+    关键：**不写 meta**。失败清单里没有原始平台 ID（也不该存，ID 会失效），
+    所以重试时走「原源 + 按名搜索兜底」：source 只用于决定先问哪个平台，
+    真正的 ID 由 searchByName 现场搜出来，这比拿旧 ID 直查更可靠。
+    """
+    return {
+        'id': '',
+        'name': item['name'],
+        'singer': item.get('singer', ''),
+        'source': item.get('source', ''),
+        'interval': item.get('interval', ''),
+        'meta': '{}',
+    }
+
+
+def write_failed_file(directory, items):
+    """用 v2 格式重写 failed.txt（items 为空则删除该文件）。
+
+    为什么整份重写而不是追加：重试成功后必须把成功的歌**移出**清单，
+    否则清单只增不减，用户点「重试」永远在重下已经下好的歌。
+    写入用「临时文件 + 替换」，避免写到一半崩溃留下半份清单。
+    """
+    path = Path(directory) / FAILED_FILE_NAME
+    if not items:
+        safe_unlink(path)
+        return
+    lines = [FAILED_HEADER_V2, f"# {time.strftime('%Y-%m-%d %H:%M')}"]
+    for item in items:
+        record = {
+            'name': item.get('name', ''),
+            'singer': item.get('singer', ''),
+            'source': item.get('source', ''),
+            'interval': item.get('interval', ''),
+            'error': item.get('error', ''),
+        }
+        lines.append(json.dumps(record, ensure_ascii=False))
+    tmp = path.with_name(path.name + '.tmp')
+    try:
+        tmp.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+        os.replace(tmp, path)
+    except OSError as exc:
+        safe_unlink(tmp)
+        print(f'[警告] 写入失败清单失败: {exc}', file=sys.stderr, flush=True)
 
 
 # ============ 落雪数据库（只读访问） ============
@@ -1595,7 +1828,10 @@ def run():
                         help='下载失败时自动逐级降低音质')
     parser.add_argument('--min-quality', default='320k', choices=['128k', '192k', '320k', 'flac', 'flac24bit'],
                         help='降级时允许的最低音质（默认 320k，不降到其下）')
-    parser.add_argument('--dir', '-d', default=config['dir'], help='下载目录')
+    # --dir 默认留空（而不是直接取设置值），是为了区分「用户显式指定」与「用默认」：
+    # --retry-failed 没带目录时，下载目录必须等于失败清单所在目录，
+    # 否则读的是一份清单、写的又是另一份，成功的歌永远移不出去。
+    parser.add_argument('--dir', '-d', default=None, help='下载目录（默认使用设置值）')
     parser.add_argument('--workers', '-w', type=int, default=config['workers'], help='同时下载歌曲数（默认使用设置值）')
     parser.add_argument('--node', default=config['node'] or None, help='Node.js 可执行文件路径（EXE 已内置）')
     parser.add_argument('--api', default=config['api'] or None, help='音源脚本路径（JS 文件或 user_api.json）')
@@ -1615,11 +1851,30 @@ def run():
                         help='以 JSON 输出指定歌单的歌曲列表（与 --playlist 搭配）')
     parser.add_argument('--song-file', default=None,
                         help='从 JSON 文件读取待下载歌曲列表（GUI 单曲下载用；绕过数据库/歌单）')
+    # 用 nargs='?'：`--retry-failed <目录>` 与 `--retry-failed`（不带值，用 --dir/默认目录）
+    # 都支持。GUI 传的是显式目录；手动跑时省略即可复用 --dir。
+    # 不带值时 const='' 而不是 None —— None 是「未启用该模式」的哨兵，两者必须能区分。
+    parser.add_argument('--retry-failed', nargs='?', const='', default=None, metavar='目录',
+                        help='只重试上次失败的歌：读取该目录下 failed.txt 并只下载其中歌曲（省略目录则用 --dir）')
+    parser.add_argument('--count-failed', nargs='?', const='', default=None, metavar='目录',
+                        help='以 JSON 输出该目录 failed.txt 里的失败歌曲数量（GUI 用于显示重试按钮）')
     args = parser.parse_args()
+
+    # 解析下载目录：命令行显式给了就用它，否则用设置里的默认值。
+    # 注意顺序——必须先确定 args.dir，失败清单模式要用它当兜底目录。
+    if not str(args.dir or '').strip():
+        args.dir = config['dir']
 
     # GUI 优雅停止：先挂上信号文件监听，再做后续耗时操作。
     if args.stop_file:
         watch_stop_file(args.stop_file)
+
+    # ---- 失败清单模式：不碰数据库/歌单，先于一切探测处理 ----
+    # （放在 --search 之前：两者都走「无歌单」路径，且重试最需要尽快拉起下载）
+    if args.retry_failed is not None:
+        return run_retry_failed(args)
+    if args.count_failed is not None:
+        return run_count_failed(args)
 
     # ---- 单曲搜索模式：不需要数据库，先于一切数据库探测处理 ----
     if args.search is not None:
@@ -1806,7 +2061,15 @@ def run_download(args, songs, db_path=None, title=None):
     stats = {'success': 0, 'fail': 0, 'skip': 0}
     fail_list = []
     failed_songs = []
+    # 本次已「解决」的歌（成功落盘或已存在被跳过）。结束时要按这些键把旧清单里的
+    # 同名条目摘掉，否则重试成功后清单还在，用户会反复重下已经下好的歌。
+    resolved_keys = set()
+    resolved_lock = threading.Lock()
     print_lock = threading.Lock()
+
+    def mark_resolved(song):
+        with resolved_lock:
+            resolved_keys.add(_failed_key(song))
 
     def process_song(idx, song, retry=False):
         _t0 = time.time()
@@ -1832,7 +2095,10 @@ def run_download(args, songs, db_path=None, title=None):
                 sanitize_filename(f"{song['singer']} - {song['name']}"),
             )
             # 尝试原源 + 替代源
-            candidates_queue = [song]
+            # 清单里来源为空（老 v1 格式没有记录 source）时不把这首歌当候选：
+            # 空 source 会让音源报「不支持的平台: 」，白白耗掉 3 次退避重试（约 30s/首），
+            # 而且每个 worker 都这样卡一遍。直接走按名搜索，又快又准。
+            candidates_queue = [song] if song.get('source') else []
             # 只有歌单下载（有数据库）才查同名替代源；单曲下载没有数据库上下文
             if db_path:
                 candidates_queue += get_alternative_sources(db_path, song)
@@ -1977,9 +2243,14 @@ def run_download(args, songs, db_path=None, title=None):
                 if result == 'success':
                     stats['success'] += 1
                     recent.append(True)
+                    if song_obj:
+                        mark_resolved(song_obj)
                 elif result == 'skip':
                     stats['skip'] += 1
                     recent.append(True)
+                    # 已存在也算解决：这首不需要再出现在失败清单里
+                    if song_obj:
+                        mark_resolved(song_obj)
                 elif result == 'stopped':
                     continue
                 else:
@@ -2071,10 +2342,12 @@ def run_download(args, songs, db_path=None, title=None):
                     stats['fail'] -= 1
                     stats['success'] += 1
                     fail_list = [item for item in fail_list if not (item[0] == song['name'] and item[1] == song['singer'])]
+                    mark_resolved(song)
                 elif retry_result == 'skip':
                     stats['fail'] -= 1
                     stats['skip'] += 1
                     fail_list = [item for item in fail_list if not (item[0] == song['name'] and item[1] == song['singer'])]
+                    mark_resolved(song)
                 elif retry_result != 'stopped':
                     retry_failures.append(retry_result)
         for retry_server in retry_servers:
@@ -2093,23 +2366,116 @@ def run_download(args, songs, db_path=None, title=None):
         print('下载完成！')
     print(f'成功 {stats["success"]} 首，失败 {stats["fail"]} 首，跳过 {stats["skip"]} 首')
     print(f'保存位置: {download_dir}')
+    report_path = download_dir / FAILED_FILE_NAME
     if fail_list:
         print('\n失败的歌曲：')
-        report_path = download_dir / 'failed.txt'
-        # 追加而非覆盖，保留历次失败记录；每批前写时间戳分隔。
-        with open(report_path, 'a', encoding='utf-8') as f:
-            f.write(f"\n--- {time.strftime('%Y-%m-%d %H:%M')} ---\n")
-            for name, singer, err in fail_list:
-                line = f'{singer} - {name}: {err}'
-                print(f'  {line}')
-                f.write(line + '\n')
-        print(f'\n失败清单已追加到: {report_path}')
-        print('提示：失败可能是音源临时不可用，稍后可重新运行本程序重试。')
+        for name, singer, err in fail_list:
+            print(f'  {singer} - {name}: {err}')
+
+    # 统一维护失败清单（v2）：
+    #   1. 先读回旧清单，保留历次失败记录（用户可能还没重试过）
+    #   2. 把本次已解决的歌（成功落盘 / 已存在跳过）摘掉，清单不会越滚越大
+    #   3. 本次仍失败的歌以最新错误原因写回，并补上 source/interval
+    #      （重试时先问原平台，比纯按名搜索命中率高）
+    if resolved_keys or fail_list:
+        merged = {}
+        for old in load_failed_songs(download_dir):
+            merged[_failed_key(old)] = old
+        for key in resolved_keys:
+            merged.pop(key, None)
+        # failed_songs 是 (song_obj, failure) 列表，用它还原 source/interval
+        origin_by_key = {}
+        for song_obj, _failure in failed_songs:
+            if isinstance(song_obj, dict):
+                origin_by_key[_failed_key(song_obj)] = song_obj
+        for name, singer, err in fail_list:
+            item = {
+                'name': name,
+                'singer': singer,
+                'source': '',
+                'interval': '',
+                'error': err,
+            }
+            origin = origin_by_key.get((strict_song_key(name), strict_song_key(singer)))
+            if origin:
+                item['source'] = str(origin.get('source') or '')
+                item['interval'] = str(origin.get('interval') or '')
+            merged[_failed_key(item)] = item
+        write_failed_file(download_dir, list(merged.values()))
+        if fail_list:
+            print(f'\n失败清单已写入: {report_path}（共 {len(merged)} 首）')
+            print('提示：失败可能是音源临时不可用，稍后可在「下载歌曲」页点「重试上次失败的歌」。')
+        elif merged:
+            print(f'\n失败清单还剩 {len(merged)} 首历史记录（本次未涉及）。')
+        else:
+            print('\n失败清单已清空（之前的失败歌曲本次都已补齐）。')
+
+
+def resolve_failed_dir(args):
+    """确定失败清单所在目录。
+
+    取值顺序：`--retry-failed` / `--count-failed` 显式给的目录 → `--dir` → 设置里的默认目录。
+    最后一级兜底很关键：GUI 的「重试」按钮在用户没填下载目录时**不传值**，
+    此时必须落到引擎自己的默认目录，才能读到「开始下载」留在那里的 failed.txt。
+    """
+    explicit = getattr(args, 'retry_failed', None)
+    if explicit is None:
+        explicit = getattr(args, 'count_failed', None)
+    text = str(explicit or '').strip()
+    if text:
+        return Path(text)
+    if str(getattr(args, 'dir', '') or '').strip():
+        return Path(args.dir)
+    return Path(load_config()['dir'])
+
+
+def run_count_failed(args):
+    """输出失败清单里可重试的歌曲数量（JSON），供 GUI 决定是否显示重试按钮。
+
+    只输出一行 JSON：stdout 是 GUI 的解析通道，任何多余输出都会破坏解析。
+    文件不存在时输出 0（而不是报错）——「没有失败清单」是正常状态。
+    """
+    directory = resolve_failed_dir(args)
+    songs = load_failed_songs(directory)
+    print(json.dumps({'count': len(songs), 'dir': str(directory)}, ensure_ascii=False), flush=True)
+    return 0
+
+
+def run_retry_failed(args):
+    """只重试上次失败的歌：读 <目录>/failed.txt，只下载其中歌曲。
+
+    与普通歌单下载的区别：
+      1. 歌单来源是失败清单，不需要数据库/歌单（但数据库仍可用于查替代源）
+      2. 已存在的歌由 process_song 里的 song_exists_in_dir 直接跳过
+      3. 下载完成后 run_download 会把成功的歌从清单里摘掉
+    """
+    directory = resolve_failed_dir(args)
+    items = load_failed_songs(directory)
+    if not items:
+        print(f'[提示] {directory / FAILED_FILE_NAME} 里没有待重试的歌曲，无需重试。')
+        return 0
+    songs = [failed_to_song(item) for item in items]
+    # 关键：重试时下载目录**必须**与清单目录一致，否则「成功的歌从清单移除」会写错地方
+    # （读 X 的清单、写 Y 的清单，成功的歌永远移不出去，清单只增不减）。
+    # 因此即使显式传了不同的 --dir 也以清单目录为准，并明确告知用户。
+    if str(getattr(args, 'dir', '') or '').strip() and \
+            Path(args.dir).resolve() != directory.resolve():
+        print(f'[提示] --dir 已按失败清单目录覆盖为: {directory}')
+    args.dir = str(directory)
+    print(f'\n重试失败歌曲：共 {len(songs)} 首（来自 {directory / FAILED_FILE_NAME}）')
+    # 清单里没有平台 ID，但如果有数据库，仍可查「同名其他平台版本」当替代源
+    db_path = None
+    try:
+        detected = detect_database(args.db)
+        if detected and not is_lxmc_file(detected):
+            db_path = detected
+    except Exception:
+        db_path = None
+    return run_download(args, songs, db_path=db_path, title=None)
 
 
 def run_search(args):
     """单曲搜索模式：按关键词搜索歌曲，以 JSON 输出候选列表（不下载）。
-
     输出为单行 JSON 数组，字段与 GUI 搜索结果表对应：
       [{name, singer, source, interval, id, via, album, qualitys}]
     出错时以 [错误] 前缀输出到 stderr 并返回非零码。

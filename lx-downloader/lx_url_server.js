@@ -163,7 +163,9 @@ function loadScriptSet() {
   if (!fs.existsSync(dir)) failNoSources('未找到音源目录: ' + dir);
   const files = fs.readdirSync(dir)
     .filter(name => /\.(js|json)$/i.test(name))
-    .filter(name => name !== '.order.json');
+    // 元数据文件不是音源：.order.json 存拖拽顺序，.health.json 存健康度。
+    // 不排除的话健康度文件会被当成音源脚本加载并报错。
+    .filter(name => name !== '.order.json' && name !== '.health.json');
   if (!files.length) failNoSources('音源目录为空: ' + dir);
   // 排序规则：用户拖拽顺序优先；没排过则用内置优先级
   files.sort((a, b) => {
@@ -1006,6 +1008,332 @@ async function neteaseSearch(kw) {
   }
 }
 
+// ========== 音源健康度（跨进程持久化） ==========
+// 为什么需要落盘：Python 每个下载线程都会单独起一个 Node 进程（8 线程 = 8 个进程），
+// 而 sourceCooldown / sourceScore 都只活在各自进程里，互不相通。结果是每个新进程
+// 都要从零开始试错，失效音源会被一遍遍重新撞（每次白等一个超时）。把历史成败
+// 累计到磁盘后，新进程一启动就能把死源排到后面，直接省掉这轮无谓等待。
+//
+// 注意：这里只做「排序参考」，不改任何取链/冷却逻辑。健康度是纯优化项，
+// 文件缺失、损坏、不可写都必须安静降级，绝不能影响下载本身。
+const HEALTH_FILE = path.join(
+  // 路径必须与 Python 侧 --allow-fs-write 授权的那一个文件完全一致，
+  // 否则在 --permission 模式下写入会被 ERR_ACCESS_DENIED 拒绝。
+  // 引擎的推导顺序是「api_dir → api_file 所在目录」，这里保持同样顺序。
+  apiDir || (apiFile
+    ? path.dirname(path.resolve(apiFile))
+    : path.join(process.env.APPDATA || '', 'lx-downloader-sources')),
+  '.health.json',
+);
+const HEALTH_VERSION = 1;
+const HEALTH_FLUSH_MS = 5000;      // 兜底轮询：极端情况下（去抖被饿死）也能落盘
+const HEALTH_DEBOUNCE_MS = 200;    // 变更后合并写回的窗口，避免一次取链写十几次
+const HEALTH_JITTER_MS = 300;      // 多进程错开写回时刻，降低并发覆盖概率
+const HEALTH_DEBUG = process.env.LX_DEBUG_HEALTH === '1';
+
+const sourceHealth = new Map();  // name -> { ok, fail, lastOk, lastFail }（磁盘历史 + 本进程累计）
+const healthWritten = new Map(); // name -> 我们认为「已经落盘」的计数快照，用来算增量
+let healthLoaded = false;
+let healthWriteFails = 0;
+let healthAtomicBroken = false;  // --permission 下 .tmp 写不了，记住后直接走覆盖写
+let healthDirtyTimer = null;
+
+function healthLog(msg) {
+  if (!HEALTH_DEBUG) return;
+  try { process.stderr.write('[health] ' + msg + '\n'); } catch (_) { /* 忽略 */ }
+}
+
+// 读取必须容错：上一个进程可能刚好在写入途中被强杀（Windows 上 terminate() 就是强杀），
+// 留下一个被截断的半截 JSON。健康度坏了顶多是排序退化，绝不能让进程崩掉。
+function healthReadFile() {
+  try {
+    if (!fs.existsSync(HEALTH_FILE)) return null;
+    const obj = JSON.parse(fs.readFileSync(HEALTH_FILE, 'utf-8'));
+    if (!obj || typeof obj !== 'object') return null;
+    if (obj.version && obj.version > HEALTH_VERSION) {
+      // 未来版本的格式可能不兼容：当作没有数据，避免用错字段污染统计
+      healthLog(`文件版本 ${obj.version} 高于当前 ${HEALTH_VERSION}，忽略`);
+      return null;
+    }
+    const src = (obj.sources && typeof obj.sources === 'object') ? obj.sources : {};
+    const out = {};
+    for (const name of Object.keys(src)) {
+      const r = src[name];
+      if (!r || typeof r !== 'object') continue;
+      const num = (v) => Math.max(0, Number(v) || 0);
+      out[name] = {
+        ok: num(r.ok),
+        fail: num(r.fail),
+        lastOk: num(r.lastOk),
+        lastFail: num(r.lastFail),
+      };
+    }
+    return out;
+  } catch (e) {
+    healthLog('读取失败，按空数据处理: ' + String((e && e.message) || e).slice(0, 120));
+    return null;
+  }
+}
+
+// 历史成败 → 排序分数（范围与 bumpSource 一致，避免两套量纲打架）。
+// 用 (ok+1)/(ok+fail+2) 做拉普拉斯平滑：1 次成功（2/3）不该压过 50 次里成 45 次（0.9），
+// 否则新源只要侥幸成功一次就会霸占榜首，把真正稳定的源挤到后面。
+function healthScoreOf(rec) {
+  const ok = Math.max(0, Number(rec && rec.ok) || 0);
+  const fail = Math.max(0, Number(rec && rec.fail) || 0);
+  const total = ok + fail;
+  if (!total) return 0;
+  const ratio = (ok + 1) / (total + 2);
+  let score = Math.round((ratio - 0.5) * 20); // 0.5 → 0；全成功 → +10；全失败 → -10
+  // 最近一次是失败（且没有更近的成功）时再扣 1 分：刚挂掉的源应该比「老账本好看
+  // 但已经很久没验证过」的源更快沉底。只影响排序，不动计数。
+  if (rec.lastFail && rec.lastFail > (rec.lastOk || 0)) score -= 1;
+  return Math.max(-5, Math.min(10, score));
+}
+
+function healthGet(name) {
+  let r = sourceHealth.get(name);
+  if (!r) {
+    r = { ok: 0, fail: 0, lastOk: 0, lastFail: 0 };
+    sourceHealth.set(name, r);
+  }
+  return r;
+}
+
+function healthNoteOk(name) {
+  if (!name) return;
+  const now = Date.now();
+  const r = healthGet(name);
+  r.ok += 1;
+  r.lastOk = now;
+  healthMarkDirty();
+}
+function healthNoteFail(name) {
+  if (!name) return;
+  const now = Date.now();
+  const r = healthGet(name);
+  r.fail += 1;
+  r.lastFail = now;
+  healthMarkDirty();
+}
+
+function healthSummary() {
+  if (!sourceHealth.size) return '(空)';
+  return Array.from(sourceHealth.entries())
+    .map(([name, r]) => {
+      const s = sourceScore.has(name) ? sourceScore.get(name) : healthScoreOf(r);
+      return `${name}(ok=${r.ok},fail=${r.fail},score=${s})`;
+    })
+    .join(', ');
+}
+
+// 每个源相对「上次落盘快照」的增量；没有变化则返回 null。
+function healthDeltaOf(name, rec) {
+  const base = healthWritten.get(name) || { ok: 0, fail: 0, lastOk: 0, lastFail: 0 };
+  const d = {
+    ok: rec.ok - base.ok,
+    fail: rec.fail - base.fail,
+    lastOk: rec.lastOk,
+    lastFail: rec.lastFail,
+  };
+  if (d.ok <= 0 && d.fail <= 0) return null;
+  return d;
+}
+
+// 合并策略：读磁盘最新值 + 只加「本进程自上次落盘以来的增量」。
+//
+// 为什么是增量相加，而不是取较大值：8 个进程统计到的是互不重叠的事件，
+// 取 max 会把别人的成绩直接吃掉（两个进程各成功 5 次，max 后只剩 5）。
+//
+// 为什么不用「内存总数相加」：同一进程重复写回时会把自己之前的数字再加一遍，
+// 计数会指数膨胀。增量法两头都避开。
+//
+// 为什么记 healthWritten 快照而不是「写成功就清零 pending」：多进程并发时
+// 存在丢更新窗口（A 读 → B 读 → A 写 → B 写，A 的增量被 B 的覆盖丢掉）。
+// 用快照的话，只要增量还在，下一次写回会自然把它重新加回去，能自愈。
+// 前提是进程内 pending 不被清零，所以只有「写成功后把快照推进到当前值」。
+//
+// 单次写入 + 回读校验。返回 true 表示「我们写的增量确实还在文件里」，
+// false 表示被并发写覆盖了（需要立刻重试，见 healthFlush）。
+function healthFlushOnce(reason) {
+  const deltas = new Map();
+  for (const [name, rec] of sourceHealth) {
+    const d = healthDeltaOf(name, rec);
+    if (d) deltas.set(name, d);
+  }
+  if (!deltas.size) return true; // 没有新数据，视为成功
+
+  const disk = healthReadFile() || {};
+  const merged = {};
+  for (const name of Object.keys(disk)) merged[name] = disk[name];
+  for (const [name, d] of deltas) {
+    const cur = merged[name] || { ok: 0, fail: 0, lastOk: 0, lastFail: 0 };
+    merged[name] = {
+      ok: cur.ok + d.ok,
+      fail: cur.fail + d.fail,
+      // 时间戳取较大值：并发写时保留「更晚发生的那次」，不会被别的进程写旧
+      lastOk: Math.max(cur.lastOk, d.lastOk),
+      lastFail: Math.max(cur.lastFail, d.lastFail),
+    };
+  }
+  const payload = JSON.stringify({ version: HEALTH_VERSION, sources: merged });
+
+  try {
+    // 目录通常已存在（就是音源目录）；这里只是兜底，被权限模型拒绝也无所谓
+    try { fs.mkdirSync(path.dirname(HEALTH_FILE), { recursive: true }); } catch (_) { /* 忽略 */ }
+    if (!healthAtomicBroken) {
+      try {
+        // 非 --permission 场景优先「临时文件 + rename」原子替换，读者不会读到半个文件。
+        const tmp = HEALTH_FILE + '.tmp';
+        fs.writeFileSync(tmp, payload, 'utf-8');
+        fs.renameSync(tmp, HEALTH_FILE);
+      } catch (eAtomic) {
+        // 引擎用 --permission 启动时只授权了 .health.json 这一个路径，
+        // 写 .tmp 必然被 ERR_ACCESS_DENIED。记住这个结论，之后直接走覆盖写，
+        // 不再每次白试一遍（读取端的 JSON 容错就是为这条回退路径准备的）。
+        healthAtomicBroken = true;
+        try { fs.unlinkSync(HEALTH_FILE + '.tmp'); } catch (_) { /* 可能压根没建出来 */ }
+        healthLog('原子替换不可用，回退为直接覆盖写: ' + String((eAtomic && eAtomic.code) || ''));
+        fs.writeFileSync(HEALTH_FILE, payload, 'utf-8');
+      }
+    } else {
+      fs.writeFileSync(HEALTH_FILE, payload, 'utf-8');
+    }
+
+    // 回读校验：并发写没有锁，另一个进程可能拿着更旧的快照把我们刚写的覆盖掉。
+    // 判断依据是「文件里是否还包含我们刚写进去的数值」——包含了才推进快照，
+    // 没包含说明这次增量丢了，快照保持不动，下一次 flush 会把它重新加回去。
+    const back = healthReadFile();
+    let lost = false;
+    if (back) {
+      for (const name of deltas.keys()) {
+        const rec = sourceHealth.get(name);
+        const got = back[name];
+        if (got && got.ok >= merged[name].ok && got.fail >= merged[name].fail) {
+          healthWritten.set(name, {
+            ok: rec.ok, fail: rec.fail, lastOk: rec.lastOk, lastFail: rec.lastFail,
+          });
+        } else {
+          lost = true;
+        }
+      }
+    } else {
+      // 回读失败（文件被占用/权限）时保守认为已写入，避免无限重试；
+      // 真正的写失败上面已经抛异常了，走不到这里。
+      for (const [name, rec] of sourceHealth) {
+        healthWritten.set(name, {
+          ok: rec.ok, fail: rec.fail, lastOk: rec.lastOk, lastFail: rec.lastFail,
+        });
+      }
+    }
+    healthWriteFails = 0;
+    healthLog(`写回 ${Object.keys(merged).length} 条(${reason}) → ${HEALTH_FILE}`);
+    healthLog('摘要: ' + healthSummary());
+    return !lost;
+  } catch (e) {
+    healthWriteFails += 1;
+    // 权限不足 / 磁盘满 / 只读目录：静默忽略，下一次再试（退出时还会最后试一次）。
+    // 注意快照不推进，这部分增量会一直留着，等写权限恢复后自动补上。
+    healthLog(`写回失败(${reason}) 第 ${healthWriteFails} 次: `
+      + String((e && e.message) || e).slice(0, 120));
+    return false;
+  }
+}
+
+function healthFlush(reason) {
+  // 最多两轮：第一轮被并发覆盖时，第二轮会重新读盘（此时已包含对方的增量）
+  // 再把自己的增量补上去，最终两边都不丢。两轮仍失败就留给下一次 flush。
+  try {
+    if (healthFlushOnce(reason)) return;
+    if (healthWriteFails > 0) return; // 是写失败而非并发覆盖，重试也没用
+    healthFlushOnce(reason + '-retry');
+  } catch (_) { /* 健康度是纯优化项，任何异常都不能影响主流程 */ }
+}
+
+// 启动读取：音源加载完成后调用一次，把历史分数灌进 sourceScore。
+function healthLoad() {
+  if (healthLoaded) return;
+  healthLoaded = true;
+  const disk = healthReadFile();
+  if (!disk) {
+    healthLog(`无历史数据，按全新状态启动: ${HEALTH_FILE}`);
+    return;
+  }
+  let hit = 0;
+  for (const name of Object.keys(disk)) {
+    sourceHealth.set(name, disk[name]);
+    // 关键：把「已落盘快照」直接置为读到的值。
+    // 否则快照从 0 起算，本次写回会把磁盘上已有的历史再累加一遍（计数翻倍）。
+    healthWritten.set(name, {
+      ok: disk[name].ok, fail: disk[name].fail,
+      lastOk: disk[name].lastOk, lastFail: disk[name].lastFail,
+    });
+    if (requestHandlers.some((h) => h.name === name)) hit += 1;
+  }
+  // 只给「当前确实加载了的音源」打分：历史里已删除的源留着不碍事，
+  // 但没必要写进 sourceScore 占位。
+  for (const entry of requestHandlers) {
+    const rec = sourceHealth.get(entry.name);
+    if (rec) sourceScore.set(entry.name, healthScoreOf(rec));
+  }
+  healthLog(`读取 ${Object.keys(disk).length} 条历史（命中 ${hit}/${requestHandlers.length} 个已加载音源）→ ${HEALTH_FILE}`);
+  healthLog('摘要: ' + healthSummary());
+}
+
+function healthInstallExitHooks() {
+  // 退出路径必须**同步**写：异步写在事件循环关闭时会被直接丢弃，
+  // 而 Python 的 close() 是 terminate() → wait(3s)，没有给我们留异步收尾的时间。
+  const flush = (reason) => {
+    try { healthFlush(reason); } catch (_) { /* 退出路径绝不能抛 */ }
+  };
+  process.on('exit', () => flush('exit'));
+  // Windows 上 SIGTERM 不会被投递（terminate 走 TerminateProcess 直接杀），
+  // 但类 Unix 环境 / Ctrl+C 仍会走到这里，保留处理并主动退出。
+  for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+    try {
+      process.on(sig, () => {
+        flush(sig);
+        process.exit(0);
+      });
+    } catch (_) { /* 个别平台不支持某信号，忽略 */ }
+  }
+  // 事件循环自然空转时补一次（此时 readline 已关闭，属于正常收尾）
+  process.on('beforeExit', () => flush('beforeExit'));
+}
+
+function healthScheduleFlush() {
+  // 为什么光有退出钩子不够：Windows 上 Python 调 proc.terminate() 是 TerminateProcess，
+  // 进程被强杀，exit / SIGTERM 回调**一个都不会执行**。只靠退出钩子会丢掉整个进程的统计。
+  //
+  // 也不能只靠「每 5s 轮询一次」：下载线程的生命周期可能只有几秒
+  // （取完链接就 terminate），轮询还没触发就被杀，统计全丢。
+  // 因此改为「变更后 200ms 去抖立即写」，再留 5s 轮询兜底。
+  const timer = setInterval(() => {
+    // 连续写失败（权限/磁盘满）就不再徒劳重试，留到退出时最后试一次
+    if (healthWriteFails >= 3) return;
+    healthFlush('timer');
+  }, HEALTH_FLUSH_MS);
+  // 不因为这个定时器把进程钉住：没活干时该退出就退出
+  if (timer.unref) timer.unref();
+}
+
+// 标记有未落盘的变更：去抖后写一次。
+function healthMarkDirty() {
+  if (healthDirtyTimer) return; // 窗口内已有待写任务，合并进去
+  // 抖动很重要：8 个下载线程几乎同时启动、同时产生第一次成败，
+  // 若去抖时长完全一致，8 个进程会同一毫秒一起「读-改-写」，丢更新最严重。
+  // 随机错开后各进程的写窗口自然分开，实测能显著减少互相覆盖。
+  const delay = HEALTH_DEBOUNCE_MS + Math.floor(Math.random() * HEALTH_JITTER_MS);
+  healthDirtyTimer = setTimeout(() => {
+    healthDirtyTimer = null;
+    // 权限/磁盘问题连续失败后不再刷屏重试，等退出时最后试一次
+    if (healthWriteFails >= 3) return;
+    healthFlush('debounce');
+  }, delay);
+  // 去抖定时器不能把进程钉住：进程要退出时立刻走 exit 钩子的同步写
+  if (healthDirtyTimer.unref) healthDirtyTimer.unref();
+}
+
 // ========== 获取播放链接（多候选，带音源级冷却） ==========
 // 某个音源连续多次拿不到有效链接时，暂时跳过它（冷却），避免死源反复拖慢整体。
 const sourceCooldown = new Map(); // name -> { fails, until }
@@ -1016,7 +1344,12 @@ function sourceBlocked(name) {
   const c = sourceCooldown.get(name);
   return !!(c && c.until > Date.now());
 }
-function noteSourceOk(name) { sourceCooldown.delete(name); }
+function noteSourceOk(name) {
+  sourceCooldown.delete(name);
+  // 冷却（进程内的短期状态）与健康计数（跨进程长期统计）分开维护：
+  // 前者会被瞬时错误清零/恢复，后者要能累计、能相加，两者语义不同不能混用。
+  healthNoteOk(name);
+}
 function noteSourceFail(name, transient = false) {
   const c = sourceCooldown.get(name) || { fails: 0, until: 0 };
   if (transient) {
@@ -1027,6 +1360,9 @@ function noteSourceFail(name, transient = false) {
     if (c.fails >= COOLDOWN_FAILS) { c.until = Date.now() + COOLDOWN_MS; c.fails = 0; }
   }
   sourceCooldown.set(name, c);
+  // 瞬时错误同样记一次失败：跨进程统计看的是「这个源长期靠不靠谱」，
+  // 与冷却逻辑（瞬时错误不累计）刻意采用不同的口径。
+  healthNoteFail(name);
 }
 
 // ========== 音源成功榜（剪枝核心） ==========
@@ -1043,6 +1379,12 @@ function rankedHandlers() {
 function bumpSource(name, delta) {
   const cur = sourceScore.get(name) || 0;
   sourceScore.set(name, Math.min(10, Math.max(-5, cur + delta)));
+  // 这里**不**累计 ok/fail：bumpSource 在本文件里总是紧跟 noteSourceOk / noteSourceFail
+  // 调用（两者成对出现），在这里再记一次会把每次成败都算成两次，成功次数直接翻倍。
+  // 计数的唯一入口是 noteSourceOk / noteSourceFail；bumpSource 只负责排序分。
+  if (HEALTH_DEBUG) {
+    healthLog(`bumpSource ${name} ${delta > 0 ? '+' : ''}${delta} → ${sourceScore.get(name)}`);
+  }
 }
 
 // 音质档位排序：用户明确请求 128k 时不应再把 128k 结果丢掉。
@@ -1197,6 +1539,12 @@ async function directFallbackCandidates(musicInfo, source) {
     process.stderr.write('[lx-url-server] 所有音源加载失败: ' + (initError || '') + '\n');
     process.exit(1);
   }
+
+  // 音源加载完成后才读历史健康度：此时才知道哪些名字是真的存在的源。
+  // 钩子先装好，保证即使读历史出问题也还有退出写回的路径。
+  healthLoad();
+  healthInstallExitHooks();
+  healthScheduleFlush();
 
   const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
   rl.on('line', async (line) => {
