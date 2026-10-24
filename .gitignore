@@ -47,3 +47,7 @@ LXMusicDownloader.exe
 # ============ 内部工作区（AI 记忆 / 设计系统，不属于项目本体） ============
 .workbuddy/
 design-system/
+# 临时调试脚本（不要提交）
+_*.py
+lx-tauri/_*.py
+lx-downloader/_*.py

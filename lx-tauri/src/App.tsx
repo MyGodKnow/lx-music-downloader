@@ -153,7 +153,60 @@ function compareVersion(a: string, b: string): number {
   return 0;
 }
 
-/** 版本号是否可解析（用于区分「确实是最新」与「无法比较」） */
+/**
+ * 给体检结果算「综合得分」，用于一键按体检结果重排音源优先级。
+ *
+ * 两个维度，权重刻意拉开：
+ *   - 稳定性（主导）：全部探测成功 > 部分成功（flaky）> 全失败（dead）
+ *   - 速度（次要）：同等稳定性下，响应快的优先
+ *
+ * 分数区间：稳定性 ok=1000 / flaky=500 / dead=0，速度最多再加 0~100。
+ * 这样「稳定但慢」永远排在「不稳定但快」之前——一个偶尔抽风的源哪怕很快，
+ * 中途失败要重试，代价远大于多等几百毫秒。
+ */
+function scoreProbe(status: SourceProbe["status"], speedMs: number | null, maxSpeed: number): number {
+  const stability = status === "ok" ? 1000 : status === "flaky" ? 500 : 0;
+  if (stability === 0) return 0;
+  if (speedMs == null || maxSpeed <= 0) return stability;
+  return stability + Math.max(0, 100 * (1 - speedMs / maxSpeed));
+}
+
+/**
+ * 按「稳定性 → 速度」生成新的音源优先级顺序。
+ *
+ * 返回的文件名数组用于写回 .order.json（即用户拖拽用的同一份优先级）。
+ * 处理三类源：
+ *   1. 体检里存活（ok/flaky）：按得分降序
+ *   2. 体检里失活（dead）：排在最后（保留但不建议用；用户可自行删除）
+ *   3. 没参与本次体检的（体检后新导入）：保持原有相对顺序，插在存活源之后
+ * 这样既落实了排序结果，又不会把用户其它的源弄丢。
+ */
+function buildSortedOrder(report: ProbeReport, existing: string[]): string[] {
+  const alive = report.sources.filter((s) => s.status !== "dead");
+  const maxSpeed = Math.max(
+    ...alive.filter((s) => s.speedMs != null).map((s) => s.speedMs as number),
+    1,
+  );
+
+  const ranked = alive
+    .map((s) => ({ name: s.name, score: scoreProbe(s.status, s.speedMs, maxSpeed) }))
+    .sort((a, b) => b.score - a.score || a.name.localeCompare(b.name))
+    .map((x) => x.name);
+
+  const seen = new Set(ranked);
+  const deadSet = new Set(report.sources.filter((s) => s.status === "dead").map((s) => s.name));
+
+  // 未参与体检的源：保持原有相对顺序
+  const untouched = existing.filter((n) => !seen.has(n) && !deadSet.has(n));
+  // 失活的源：也按原顺序排在最末
+  const dead = existing.filter((n) => deadSet.has(n));
+
+  return [...ranked, ...untouched, ...dead];
+}
+
+/**
+ * 版本号是否可解析（用于区分「确实是最新」与「无法比较」）
+ */
 function isComparableVersion(v: string): boolean {
   return /^\d+(\.\d+){0,2}/.test(String(v || "").trim().replace(/^v/i, ""));
 }
@@ -875,6 +928,34 @@ function App() {
       setProbing(false);
     }
   }
+  /**
+   * 按体检结果重排音源优先级（稳定性 → 速度），并写入 .order.json。
+   *
+   * 这会改变实际下载时的音源尝试顺序——不只是界面上好看：
+   * 排在前面的源会被优先调用，稳定又快的源先上，能减少失败重试。
+   */
+  async function applyProbeOrder() {
+    if (!probeReport || reordering) return;
+    const next = buildSortedOrder(probeReport, sourceFiles);
+    if (!next.length) {
+      addLog("error", "没有可用于排序的音源");
+      return;
+    }
+    setReordering(true);
+    try {
+      await invoke("set_source_order", { order: next });
+      await refreshSources();
+      const alive = probeReport.sources.filter((s) => s.status !== "dead").length;
+      addLog("ok", `已按体检结果排序：${alive} 个可用音源按「稳定 → 快」重排，优先尝试靠前的源`);
+    } catch (err) {
+      addLog("error", `保存排序失败: ${err}`);
+      await refreshSources();
+    } finally {
+      setReordering(false);
+    }
+  }
+
+
 
   /** 删除体检中勾选的失活音源（用户确认后才会走到这里） */
   async function deletePickedSources() {
@@ -1809,6 +1890,25 @@ let path: string | null = null;
                       </button>
                     </div>
                   )}
+
+                  {/* 按体检结果一键排序：稳定性优先、同档内按速度 */}
+                  {!probing && probeReport && probeReport.sources.some((s) => s.status !== "dead") && (
+                    <div className="probe-sort-row">
+                      <button
+                        className="primary-btn small"
+                        onClick={applyProbeOrder}
+                        disabled={reordering}
+                        title="按「稳定优先、同档内按速度」重排音源优先级，并保存生效"
+                      >
+                        {reordering ? "排序中…" : "按体检结果排序"}
+                      </button>
+                      <span className="hint">
+                        稳定优先，同档内速度快的靠前；失活的排最后。
+                        排序结果会保存为实际下载时的音源尝试顺序。
+                      </span>
+                    </div>
+                  )}
+
 
                   {/* 勾选框：跑完后对每个失活音源显示，让用户决定删不删 */}
                   {!probing && probeReport && probeReport.sources.some((s) => s.status === "dead") && (

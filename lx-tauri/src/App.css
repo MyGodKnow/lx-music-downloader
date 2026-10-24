@@ -1289,6 +1289,27 @@ nav {
   white-space: nowrap;
 }
 
+.probe-sort-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  border-top: 1px dashed var(--panel-border);
+  padding-top: 10px;
+}
+
+.probe-sort-row .small {
+  padding: 5px 13px;
+  font-size: 12.5px;
+  flex-shrink: 0;
+}
+
+.probe-sort-row .hint {
+  margin: 0;
+  flex: 1;
+  min-width: 200px;
+}
+
 .probe-pick-row {
   display: flex;
   align-items: center;
