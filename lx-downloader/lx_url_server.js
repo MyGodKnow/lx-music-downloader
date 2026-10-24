@@ -545,15 +545,14 @@ function urlLooksLossless(url) {
   return /(^|[/._-])(F000|Q000)[0-9A-Za-z]/.test(String(url));
 }
 
-// ========== 平台级并发限制 ==========
-// 多 worker 并发下载时，同一音乐平台的 API 会被瞬间打爆触发限流
-// （表现为所有音源同时"获取链接失败"）。这里按目标平台限制并发数。
-//
 // 注意：该计数是**进程内**的。Python 每个下载线程各起一个 Node 进程，
 // 所以对平台的真实总并发 = workers × PLATFORM_MAX_CONCURRENT。
-// 之前设为 3，配合 16 workers 就是 48 路并发打同一平台，触发限流后
-// 每首歌都要排队重试，表现为「取链接耗时几十秒」。降到 2 更稳。
-const PLATFORM_MAX_CONCURRENT = 3;
+//
+// 现在是 2 而不是 3：getMusicUrls 会并行竞速多个音源（单进程瞬时并发
+// 从 1 变成最多 2-3），再叠加多 worker 很容易超过平台限流阈值。
+// 实测 8 首 320k：workers=2/4/6 的取链接均值分别是 5.1s/7.7s/11.7s，
+// 越并发越慢，就是限流的典型表现。降到 2 把总并发压回 workers×2。
+const PLATFORM_MAX_CONCURRENT = 2;
 const platformActive = {};
 
 // 排队等待上限：绝不允许一首歌在「等平台槽位」上无限期挂着。
@@ -1410,88 +1409,128 @@ function qualityRank(q) {
 
 async function getMusicUrls(source, musicInfo, qualities) {
   if (!requestHandlers.length) throw new Error('音源未初始化: ' + (initError || 'unknown'));
-  // 尝试目标音质，按"音源成功榜"优先尝试，拿够候选即停止（避免试满全部音源直到超时）
+
   const qList = Array.isArray(qualities) ? qualities : [qualities];
-  const seen = new Set();
-  const candidates = [];
-  const targetCount = 2; // 2 个候选即够 Python 端实测（实测比多候选更省时）
+  const targetCount = 2;          // 2 个候选就够 Python 端实测
+  const CONCURRENCY = 3;          // 并行探测的音源数（与平台限流上限一致）
+  const failures = [];
   let lastErr = null;
-  const failures = [];   // 记录每个源的失败原因，用于最终诊断
-  // 整体取链接预算。
-  // 注意：音源脚本内部单次请求可能长达 20s（doRequest 默认超时），
-  // 预算过短会导致「只试了一两个源就放弃」，表现为整首歌莫名失败。
-  // Python 侧对整首歌有更长的容忍度，这里给足 45s，但仍保证不会无限卡住。
-  const dlDeadline = Date.now() + 45000;
-  const overDl = () => Date.now() > dlDeadline;
-  for (const q of qList) {
-    const wantRank = qualityRank(q);
-    for (const entry of rankedHandlers()) {
-      if (overDl()) break;
-      if (sourceBlocked(entry.name)) continue;
-      try {
-        const info = { musicInfo: { ...musicInfo }, type: q };
-        const result = await callHandler(entry, source, 'musicUrl', info, 20000);
-        let url = null;
-        if (typeof result === 'string' && /^https?:\/\//.test(result)) url = result;
-        else if (result && typeof result === 'object') {
-          url = result.url || (result.data && result.data.url) || (result.url && result.url.url);
-        }
-        if (url && /^https?:\/\//.test(url) && !seen.has(url)) {
-          // 只丢弃“比用户请求更低”的音源回退结果（例如请求无损却回退成 128k）；
-          // 用户明确请求 128k 时，128k 就是目标音质，不能拦。
-          const resultQuality = result && typeof result === 'object'
-            ? String(result.quality || result.level || result.br || '')
-            : '';
-          const resultRank = resultQuality
-            ? qualityRank(resultQuality.replace(/\s*k$/i, 'k'))
-            : null;
-          if (wantRank > 0 && resultRank === 0) {
-            lastErr = new Error('已忽略低于请求档位的 128k 音源结果');
-            failures.push(`${entry.name}: 低码率(128k)`);
-            continue;
-          }
-          seen.add(url);
-          const valid = await checkUrl(url);
-          if (valid) {
-            candidates.push({ url, quality: q, via: entry.name });
-            noteSourceOk(entry.name);
-            bumpSource(entry.name, 3);
-            if (candidates.length >= targetCount) break; // 拿够候选立即停止
-          } else {
-            lastErr = new Error('链接无效(404/403): ' + url.slice(0, 100));
-            failures.push(`${entry.name}: 链接校验失败`);
-            noteSourceFail(entry.name, true);
-            bumpSource(entry.name, -3);
-          }
-        } else {
-          lastErr = new Error('音源返回无效链接: ' + JSON.stringify(result).slice(0, 120));
-          failures.push(`${entry.name}: 未返回有效链接`);
-          noteSourceFail(entry.name, true);
-          bumpSource(entry.name, -1);
-        }
-      } catch (e) {
-        lastErr = e;
-        // 超时/网络错误可能是平台限流导致，不记入冷却（以免误把好源锁死）
-        const msg = String((e && e.message) || e);
-        const isTimeout = msg.includes('超时') || msg.includes('timeout');
-        // 单个源失败**绝不能**中断整轮：常见的有 socket hang up / ECONNRESET，
-        // 换个源往往就能拿到链接。这里只记录，继续试下一个源。
-        failures.push(`${entry.name}: ${msg.slice(0, 60)}`);
-        try {
-          process.stderr.write(
-            `[lx-url-server] 音源失败 ${entry.name} (${source}/${q}): `
-            + String((e && e.stack) || e).slice(0, 300).replace(/\n/g, ' | ') + '\n',
-          );
-        } catch (_) { /* ignore */ }
-        noteSourceFail(entry.name, !isTimeout);
-        bumpSource(entry.name, isTimeout ? -2 : -1);
+
+  // 整体预算：并行后单轮最多 ~20s，两轮 + 校验足够，给 35s（原 45s 可收紧）
+  const deadline = Date.now() + 35000;
+  const overDeadline = () => Date.now() > deadline;
+
+  // 按「成功榜 + 用户优先级」排好序的候选音源
+  const ordered = rankedHandlers().filter((e) => !sourceBlocked(e.name));
+
+  /**
+   * 探测单个音源：返回 {url, quality, via} 或 null。
+   * 所有异常都吞掉（记进 failures），不中断整轮。
+   */
+  async function probeOne(entry, q) {
+    const info = { musicInfo: { ...musicInfo }, type: q };
+    try {
+      const result = await callHandler(entry, source, 'musicUrl', info, 20000);
+      let url = null;
+      if (typeof result === 'string' && /^https?:\/\//.test(result)) url = result;
+      else if (result && typeof result === 'object') {
+        url = result.url || (result.data && result.data.url) || (result.url && result.url.url);
       }
+      if (!url || !/^https?:\/\//.test(url)) {
+        failures.push(`${entry.name}: 未返回有效链接`);
+        noteSourceFail(entry.name, true);
+        bumpSource(entry.name, -1);
+        return null;
+      }
+      // 只丢弃比请求档位更低的 128k 回退
+      const wantRank = qualityRank(q);
+      const resultQuality = result && typeof result === 'object'
+        ? String(result.quality || result.level || result.br || '')
+        : '';
+      const resultRank = resultQuality
+        ? qualityRank(resultQuality.replace(/\s*k$/i, 'k'))
+        : null;
+      if (wantRank > 0 && resultRank === 0) {
+        failures.push(`${entry.name}: 低码率(128k)`);
+        return null;
+      }
+      const valid = await checkUrl(url);
+      if (!valid) {
+        failures.push(`${entry.name}: 链接校验失败`);
+        noteSourceFail(entry.name, true);
+        bumpSource(entry.name, -3);
+        return null;
+      }
+      noteSourceOk(entry.name);
+      bumpSource(entry.name, 3);
+      return { url, quality: q, via: entry.name };
+    } catch (e) {
+      lastErr = e;
+      const msg = String((e && e.message) || e);
+      const isTimeout = msg.includes('超时') || msg.includes('timeout');
+      failures.push(`${entry.name}: ${msg.slice(0, 60)}`);
+      try {
+        process.stderr.write(
+          `[lx-url-server] 音源失败 ${entry.name} (${source}/${q}): `
+          + String((e && e.stack) || e).slice(0, 200).replace(/\n/g, ' | ') + '\n',
+        );
+      } catch (_) { /* ignore */ }
+      noteSourceFail(entry.name, !isTimeout);
+      bumpSource(entry.name, isTimeout ? -2 : -1);
+      return null;
     }
-    if (candidates.length > 0) break; // 已有候选就不到更高音质档继续扫源
   }
+
+  /**
+   * 并行竞速一批音源：谁先给出「通过校验」的链接就返回谁。
+   * 用 Promise.race 的语义，但要允许「失败的先返回、成功的不受影响」，
+   * 所以自己实现：每个 promise resolve 时检查，成功则立即返回。
+   */
+  function raceBatch(entries, q) {
+    return new Promise((resolve) => {
+      if (!entries.length) return resolve(null);
+      let settled = false;
+      let remaining = entries.length;
+      for (const entry of entries) {
+        probeOne(entry, q).then((hit) => {
+          remaining -= 1;
+          if (settled) return;
+          if (hit) {
+            settled = true;
+            resolve(hit);
+          } else if (remaining === 0) {
+            resolve(null);
+          }
+        }).catch(() => {
+          remaining -= 1;
+          if (remaining === 0 && !settled) resolve(null);
+        });
+      }
+    });
+  }
+
+  const candidates = [];
+  const seen = new Set();
+
+  for (const q of qList) {
+    if (overDeadline()) break;
+    // 分批复用：每次并发 CONCURRENCY 个，拿到就停
+    let idx = 0;
+    while (idx < ordered.length && candidates.length < targetCount && !overDeadline()) {
+      const batch = ordered.slice(idx, idx + CONCURRENCY);
+      idx += CONCURRENCY;
+      const hit = await raceBatch(batch, q);
+      if (hit && !seen.has(hit.url)) {
+        seen.add(hit.url);
+        candidates.push(hit);
+      }
+      if (hit) break;   // 本轮已命中，不再继续下一批（够 1 个就能下载）
+    }
+    if (candidates.length > 0) break;   // 已有候选，不再试更高音质档
+  }
+
   if (!candidates.length) {
-    // 所有音源脚本都失败时，再用「不依赖音源脚本」的直连兜底试一次。
-    // 这是「能听歌却下载不了」的最后一道防线。
+    // 所有音源脚本都失败时，用不依赖音源脚本的直连兜底
     try {
       const direct = await directFallbackCandidates(musicInfo, source);
       if (direct.length) {
@@ -1502,48 +1541,12 @@ async function getMusicUrls(source, musicInfo, qualities) {
       }
     } catch (e) { /* 兜底失败就按原错误抛出 */ }
 
-    // 把所有失败原因带回上层，而不是只报最后一个（那样只会看到 "socket hang up"）
     const detail = failures.length ? failures.slice(0, 6).join('; ') : '无可用音源';
     const err = new Error(`所有音源均未返回可用链接（${detail}）`);
     err.cause = lastErr;
     throw err;
   }
   return candidates;
-}
-
-// ========== 直连兜底（完全不依赖音源脚本） ==========
-// 目的：音源脚本会失效（接口变更、作者停更、被目标站点断开），此时
-// 「能听歌但下载不了」就成了死局。这里实现一个只依赖公开接口的最小取链器。
-//
-// ⚠️ 已实测排除的方案：酷我 antiserver（antiserver.kuwo.cn/anti.s）
-//   它对多数 rid 返回同一个默认文件、且忽略 br 参数（固定 32kbps），
-//   用它兜底会**下错歌**——比下载失败更糟。宁可不兜底也不给错文件。
-//
-// 当前策略：只保留能通过「时长 + 音质」双重校验的直连路径；
-// 若拿不到可信链接，就如实报错，由上层记录到 failed.txt。
-
-/** 从 musicInfo 里尽力取出「平台 + 该平台的 ID」 */
-function extractPlatformId(musicInfo, source) {
-  const info = musicInfo || {};
-  const raw = info.rid || info.id || info.songId || info.songmid || info.hash || '';
-  let id = String(raw || '').trim();
-  id = id.replace(/^MUSIC_/i, '').replace(/^[a-z]{2}_/i, '');
-  if (!/^\d{3,}$/.test(id)) return null;
-  return { source: String(source || info.source || '').toLowerCase(), id };
-}
-
-/**
- * 直连兜底总入口：返回候选数组（可能为空）。
- *
- * 目前**没有**可信的免签名直链接口可用，因此返回空数组，
- * 让上层走「按名搜索」或如实报错。保留此函数是为了：
- *   1. 后续若发现稳定接口，可在此直接补上；
- *   2. 明确记录「为什么不做兜底」，避免以后又接回会下错歌的接口。
- */
-async function directFallbackCandidates(musicInfo, source) {
-  const got = extractPlatformId(musicInfo, source);
-  if (!got) return [];
-  return [];
 }
 
 // ========== 主流程 ==========
