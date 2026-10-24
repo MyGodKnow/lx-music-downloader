@@ -1243,6 +1243,83 @@ nav {
   background: linear-gradient(135deg, #fbbf24, #ea580c) !important;
 }
 
+/* ===== 体检日志 ===== */
+.probe-log-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  border-top: 1px dashed var(--panel-border);
+  padding-top: 10px;
+}
+
+.probe-log-wrap .small {
+  align-self: flex-start;
+  padding: 4px 11px;
+  font-size: 12px;
+}
+
+.probe-log {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  max-height: 260px;
+  overflow-y: auto;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: #0f1c17;
+  border: 1px solid rgba(16, 185, 129, 0.18);
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 11.5px;
+  line-height: 1.65;
+}
+
+.probe-log-line {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  color: #cfe9df;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.probe-log-mark {
+  flex-shrink: 0;
+  font-weight: 700;
+}
+
+.probe-log-line.ok .probe-log-mark {
+  color: #34d399;
+}
+
+.probe-log-line.flaky .probe-log-mark {
+  color: #fbbf24;
+}
+
+.probe-log-line.dead .probe-log-mark {
+  color: #f87171;
+}
+
+.probe-log-name {
+  color: #e6f4ef;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 46%;
+}
+
+.probe-log-detail {
+  color: #8fb3a6;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.probe-log-foot {
+  margin-top: 6px;
+  padding-top: 7px;
+  border-top: 1px dashed rgba(16, 185, 129, 0.22);
+  color: #6f9488;
+  font-size: 11px;
+}
+
 /* ===== 音源体检 ===== */
 .probe-panel {
   margin-top: 16px;

@@ -216,6 +216,8 @@ function App() {
   const [probeReport, setProbeReport] = useState<ProbeReport | null>(null);
   /** 体检后用户勾选要删除的失活音源 */
   const [deadPicked, setDeadPicked] = useState<Set<string>>(new Set());
+  /** 体检日志面板是否展开 */
+  const [probeLogOpen, setProbeLogOpen] = useState(false);
 
   // ===== 导出 =====
   const [exportLines, setExportLines] = useState<string[]>([]);
@@ -1547,6 +1549,42 @@ function App() {
                       </button>
                     </div>
                   )}
+
+                  {/* 体检日志：默认折叠，需要时展开看每个源的详细结果 */}
+                  <div className="probe-log-wrap">
+                    <button
+                      className="ghost-btn small"
+                      onClick={() => setProbeLogOpen((v) => !v)}
+                    >
+                      {probeLogOpen ? "收起体检日志" : "查看体检日志"}
+                    </button>
+                    {probeLogOpen && (
+                      <div className="probe-log">
+                        {probeReport.sources.map((s) => {
+                          const mark =
+                            s.status === "dead" ? "失活" : s.status === "flaky" ? "不稳定" : "正常";
+                          const speed = s.speedMs != null ? `  ${s.speedMs}ms` : "";
+                          return (
+                            <div key={`log-${s.name}`} className={`probe-log-line ${s.status}`}>
+                              <span className="probe-log-mark">[{mark}]</span>
+                              <span className="probe-log-name">{s.name}</span>
+                              <span className="probe-log-detail">
+                                {s.okCount}/{s.total} 成功{speed}
+                                {s.error ? ` ｜ ${s.error}` : ""}
+                              </span>
+                            </div>
+                          );
+                        })}
+                        <div className="probe-log-foot">
+                          体检时间：
+                          {probeReport.probedAt
+                            ? new Date(probeReport.probedAt).toLocaleString("zh-CN")
+                            : "未知"}
+                          ｜探测样本：晴天、夜曲（酷我）+ 晴天（网易云）
+                        </div>
+                      </div>
+                    )}
+                  </div>
                 </div>
               )}
 
@@ -1678,7 +1716,7 @@ function App() {
                 <div className="star-body">
                   <h4>Star 滞销，帮帮我们</h4>
                   <p>
-                    这个项目全靠业余时间用爱发电。如果它帮你省下了找歌的时间，
+                    这个项目全靠业余时间用爱发电。如果它帮你省下了下歌的时间，
                     点个 <strong>Star</strong> 就是最实在的支持——
                     不花钱，但能让更多人看到它，也是我继续维护的动力。
                   </p>
@@ -1690,7 +1728,7 @@ function App() {
                       ⭐ 去 GitHub 点个 Star
                     </button>
                     <span className="hint">
-                      已经点过了？那也谢谢你，欢迎推荐给同样在找歌的朋友 😄
+                      已经点过了？那也谢谢你，欢迎推荐给同样在下歌的朋友 😄
                     </span>
                   </div>
                 </div>
