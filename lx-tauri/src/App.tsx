@@ -218,6 +218,23 @@ function App() {
   const [deadPicked, setDeadPicked] = useState<Set<string>>(new Set());
   /** 体检日志面板是否展开 */
   const [probeLogOpen, setProbeLogOpen] = useState(false);
+  /**
+   * 体检过程中的实时日志行。
+   *
+   * 为什么需要单独一份：体检面板原本以 probeReport 为渲染条件，
+   * 而 probeReport 要等全部跑完才有值，导致「运行中看不到任何东西」。
+   * 这里把引擎写 stderr 的 [体检] 行实时收集起来，体检期间就能滚动显示。
+   */
+  const [probeLiveLines, setProbeLiveLines] = useState<string[]>([]);
+  /** 体检进行中（与 probing 的区别：probing 表示整个流程，这里表示日志流是否活跃） */
+  const probeLogRef = useRef<HTMLDivElement | null>(null);
+
+  // 体检日志实时滚动到底部：新行进来就跟着走，不用手动拖
+  useEffect(() => {
+    const box = probeLogRef.current;
+    if (!box) return;
+    box.scrollTop = box.scrollHeight;
+  }, [probeLiveLines]);
 
   // ===== 导出 =====
   const [exportLines, setExportLines] = useState<string[]>([]);
@@ -261,6 +278,15 @@ function App() {
   const handleLog = useCallback(
     (line: LogLine) => {
       pushLog(line);
+      // 体检期间把 [体检] 开头的行同步收集到面板里，实现实时滚动。
+      // 引擎把这些进度写 stderr，Rust 的 spawn_task 会按行推成 download-log。
+      if (line.data.includes("[体检]")) {
+        setProbeLiveLines((prev) => {
+          const next = prev.concat(line.data.trim());
+          // 上限保护：一次体检最多几十行，留 200 足够
+          return next.length > 200 ? next.slice(next.length - 200) : next;
+        });
+      }
       if (line.kind === "done") {
         setRunning(false);
         setStopping(false);
@@ -714,14 +740,42 @@ function App() {
   }
 
   /** 音源体检：逐个实测能否取到可下载链接 + 测响应速度 */
+  /**
+   * 等待体检子进程真正结束。
+   *
+   * 为什么不用 done 事件：done 由 stdout 读到 EOF 时触发，
+   * 而体检的结果是在进程退出前最后才写的——两者时序接近但不可靠；
+   * 更稳妥的是轮询 is_task_running（纯内存读，开销极小）。
+   * 同时设 10 分钟上限，避免引擎异常时永久挂住界面。
+   */
+  async function waitForProbeDone() {
+    const deadline = Date.now() + 10 * 60 * 1000;
+    // 先等 300ms，避开「刚 spawn 还没登记 child」的窗口
+    await new Promise((r) => setTimeout(r, 300));
+    while (Date.now() < deadline) {
+      try {
+        const busy = await invoke<boolean>("is_task_running");
+        if (!busy) return;
+      } catch {
+        /* 查询失败按「还在跑」处理，下一轮再试 */
+      }
+      await new Promise((r) => setTimeout(r, 400));
+    }
+  }
+
   async function probeSources() {
     if (probing) return;
     setProbing(true);
+    // 清空上一轮实时日志，并自动展开面板让用户能看到进度
+    setProbeLiveLines([]);
+    setProbeLogOpen(true);
     addLog("info", "开始音源体检（逐个实测取链接 + 测速），可能需要一两分钟…");
     try {
       // 流式跑：日志由 download-log 事件实时推过来（引擎把进度写 stderr），
-      // 这里只负责等它跑完，然后读引擎落盘的缓存拿结果。
+      // probe_sources 只负责「启动」，会立刻返回 "started"；
+      // 必须等 done 事件（进程真正结束）再去读缓存，否则读到的是空文件。
       await invoke<string>("probe_sources", { python: pythonPath || null });
+      await waitForProbeDone();
       const report = await invoke<ProbeReport | null>("load_probe_cache");
       if (!report) {
         addLog("error", "体检未产出结果，请查看上方日志");
@@ -1479,19 +1533,47 @@ function App() {
                 />
               </div>
 
-              {/* ===== 体检结果 ===== */}
-              {probeReport && probeReport.sources.length > 0 && (
+              {/* ===== 体检面板 =====
+                  渲染条件放宽：体检进行中也要显示（此时只有实时日志，没有结果列表），
+                  否则用户点了「音源体检」会看到界面毫无反应。 */}
+              {(probing || (probeReport && probeReport.sources.length > 0)) && (
                 <div className="probe-panel">
                   <div className="probe-head">
-                    <strong>体检结果</strong>
+                    <strong>{probing ? "体检中…" : "体检结果"}</strong>
                     <span className="hint">
-                      {probeReport.probedAt
-                        ? new Date(probeReport.probedAt).toLocaleString("zh-CN")
-                        : ""}
-                      ｜按响应速度排序，快的在前
+                      {probing
+                        ? "正在逐个音源实测，日志实时刷新"
+                        : probeReport?.probedAt
+                          ? new Date(probeReport.probedAt).toLocaleString("zh-CN")
+                          : ""}
+                      {!probing && "｜按响应速度排序，快的在前"}
                     </span>
                   </div>
 
+                  {/* 实时日志：体检期间自动显示并滚动到底部 */}
+                  {(probing || probeLiveLines.length > 0) && (
+                    <div className="probe-log" ref={probeLogRef}>
+                      {probeLiveLines.length === 0 ? (
+                        <div className="probe-log-line">
+                          <span className="probe-log-detail">正在启动引擎…</span>
+                        </div>
+                      ) : (
+                        probeLiveLines.map((text, i) => {
+                          const isDead = text.includes("失活");
+                          const isFlaky = text.includes("不稳定");
+                          const cls = isDead ? "dead" : isFlaky ? "flaky" : "ok";
+                          return (
+                            <div key={`live-${i}`} className={`probe-log-line ${cls}`}>
+                              <span className="probe-log-detail">{text}</span>
+                            </div>
+                          );
+                        })
+                      )}
+                    </div>
+                  )}
+
+                  {!probing && probeReport && probeReport.sources.length > 0 && (
+                    <>
                   <div className="probe-list">
                     {probeReport.sources.map((s, i) => {
                       const dead = s.status === "dead";
@@ -1585,6 +1667,8 @@ function App() {
                       </div>
                     )}
                   </div>
+                    </>
+                  )}
                 </div>
               )}
 
