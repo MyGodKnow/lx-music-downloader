@@ -52,6 +52,16 @@ const readline = require('readline');
 
 // ========== 参数解析 ==========
 const args = process.argv.slice(2);
+
+// 「仅检查更新」模式。
+//
+// **必须放在最前面**：下面第 68-78 行「找不到音源就 exit(1)」在
+// loadScriptSet 之前就执行了，如果 UPDATE_ONLY 定义在后面，
+// 「没导入音源的新用户」会先被那个 exit 干掉，--update-only 根本没机会生效——
+// 而这恰恰是最需要提示「有新版本」的人群。这是审查中实测发现的问题
+// （空 APPDATA + 空 sources 时 EXIT=1，stdout 为空）。
+const UPDATE_ONLY = process.argv.includes('--update-only');
+
 let apiFile = null;
 let apiDir = null;
 for (let i = 0; i < args.length; i++) {
@@ -65,14 +75,15 @@ function findDefaultApi() {
   const userApi = path.join(process.env.APPDATA || '', 'lx-music-desktop', 'LxDatas', 'user_api.json');
   return fs.existsSync(userApi) ? userApi : null;
 }
-if (!apiFile && !apiDir) {
+if (!UPDATE_ONLY && !apiFile && !apiDir) {
   const builtinDir = path.join(__dirname, 'sources');
   const hasBuiltin = fs.existsSync(builtinDir)
     && fs.readdirSync(builtinDir).some(name => /\.(js|json)$/i.test(name));
   if (hasBuiltin) apiDir = builtinDir;
   else apiFile = findDefaultApi();
 }
-if (!apiFile && !apiDir) {
+// UPDATE_ONLY 时不要求音源存在（检查更新不依赖音源）
+if (!UPDATE_ONLY && !apiFile && !apiDir) {
   console.error('未找到音源脚本，请用 --api 或 --api-dir 指定');
   process.exit(1);
 }
@@ -154,14 +165,10 @@ function failNoSources(msg) {
   process.exit(1);
 }
 
-// 「仅检查更新」模式：完全不加载音源，直接进入 stdin 循环。
-//
-// 为什么需要：failNoSources 在音源目录为空时会 exit(1)，而「检查更新」
-// 根本不依赖音源。没有这个模式，没导入音源的用户永远查不了更新——
-// 而这恰恰最需要提示「有新版本」（新装用户还没导入音源）。
-const UPDATE_ONLY = process.argv.includes('--update-only');
 
 function loadScriptSet() {
+  // 仅检查更新模式：不需要也不应该加载音源
+  if (UPDATE_ONLY) return [];
   if (apiFile) {
     if (!fs.existsSync(apiFile)) failNoSources('音源文件不存在: ' + apiFile);
     return loadScripts(apiFile);
@@ -1698,7 +1705,10 @@ async function directFallbackCandidates(musicInfo, source) {
           let okCount = 0;
 
           for (const probe of probes) {
-            if (sourceBlocked(entry.name)) { lastError = '冷却中'; break; }
+            // 注意用 continue 而不是 break：某个样本恰好遇到冷却，
+            // 不该直接放弃该源后面的全部样本（那会把 total 算成 1 个、
+            // 把本来正常的源误判成 flaky/dead）。跳过这一个样本继续测。
+            if (sourceBlocked(entry.name)) { lastError = '冷却中'; continue; }
             const info = {
               musicInfo: { ...(probe.musicInfo || {}) },
               type: probe.quality || '320k',
@@ -1743,9 +1753,13 @@ async function directFallbackCandidates(musicInfo, source) {
             speedMs = sorted[Math.floor(sorted.length / 2)];
           }
 
-          // 一次都没成功 → 失活；部分成功 → 不稳定；全部成功 → 正常
+          // 判定：全部样本成功 → ok；部分成功 → flaky；一次都没成功 → dead。
+          //
+          // 注意不能用 `okCount === samples.length` —— samples 里只存成功样本，
+          // 那个条件恒为真，会把「3 个样本只成功 1 个」也判成 ok。
+          // 正确做法是直接比 okCount 与 probes.length。
           let status = 'dead';
-          if (okCount > 0 && okCount === samples.length && samples.length === probes.length) {
+          if (okCount > 0 && okCount === probes.length) {
             status = 'ok';
           } else if (okCount > 0) {
             status = 'flaky';

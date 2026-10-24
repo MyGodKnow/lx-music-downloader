@@ -425,6 +425,45 @@ class SongFileTest(unittest.TestCase):
             eng.load_song_file(path)
 
 
+class ProbeStatusLogicTest(unittest.TestCase):
+    """音源体检的状态判定逻辑。
+
+    这段逻辑在 lx_url_server.js 里（JS），Python 测试无法直接调用，
+    所以这里用等价实现做「规则回归」：确保规则本身没被改错。
+
+    历史 bug：原判定用 `okCount === samples.length`，但 samples 只装成功样本，
+    该条件恒为真，会把「3 个样本只成功 1 个」误判成 ok。
+    """
+
+    @staticmethod
+    def judge(ok_count, total):
+        """与 lx_url_server.js 中 probeSources 的判定保持一致。"""
+        if ok_count > 0 and ok_count == total:
+            return 'ok'
+        if ok_count > 0:
+            return 'flaky'
+        return 'dead'
+
+    def test_all_success_is_ok(self):
+        self.assertEqual(self.judge(3, 3), 'ok')
+
+    def test_partial_success_is_flaky(self):
+        # 这是历史 bug 的核心场景：部分成功必须判 flaky，不能判 ok
+        for ok_n, total in ((1, 3), (2, 3), (1, 2), (2, 5)):
+            self.assertEqual(self.judge(ok_n, total), 'flaky', f'{ok_n}/{total} 应为 flaky')
+
+    def test_none_success_is_dead(self):
+        for total in (1, 2, 3):
+            self.assertEqual(self.judge(0, total), 'dead', f'0/{total} 应为 dead')
+
+    def test_never_ok_unless_all_passed(self):
+        # 不变量：只有 100% 成功才是 ok
+        for total in range(1, 6):
+            for ok_n in range(total):
+                self.assertNotEqual(self.judge(ok_n, total), 'ok',
+                                    f'{ok_n}/{total} 不应判为 ok')
+
+
 class SearchApiTest(unittest.TestCase):
     """搜索/列歌相关的纯逻辑（不联网）。"""
 

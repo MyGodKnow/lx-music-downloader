@@ -1,0 +1,85 @@
+fix: 全量审查后修复 10 处真实 bug
+
+本轮做了前后端双路独立审查，以下是确认并修复的问题。
+
+## 必须修（会导致功能错误/数据丢失）
+
+1) `--update-only` 在没有音源时根本起不来
+   `lx_url_server.js:68-78` 的「找不到音源就 exit(1)」早于 UPDATE_ONLY 定义执行，
+   导致**没导入音源的新用户永远查不了更新**——而这正是最需要提示新版的人群。
+   修复：UPDATE_ONLY 判定提到最前，并让 loadScriptSet 在该模式下直接返回空。
+   实测：空 APPDATA 下由「EXIT=1 无输出」变为正常返回 latest。
+
+2) 体检与下载共用 TaskState.child，会互相静默杀掉
+   `spawn_task` 无条件 kill 上一个 child。下载中点体检会杀掉下载（且不走优雅停止：
+   不写 failed.txt、不清理 .part）；体检中点下载同理，且体检的 done 事件还会把
+   新下载的 running 误置 false。
+   修复：
+   - spawn_task 增加 reject_if_busy 参数，体检传 true（有任务在跑就拒绝）
+   - 前端 6 处下载按钮的 disabled 全部加上 probing
+   - probeSources 再加一层运行期拦截
+
+3) 体检状态判定有 bug，会把「部分成功」误判为「正常」
+   原条件 `okCount === samples.length && samples.length === probes.length`：
+   samples 只装成功样本，前半段恒为真，导致 1/3 成功也可能判 ok。
+   修复：直接比 `okCount === probes.length`。
+   另：`sourceBlocked` 分支由 break 改为 continue（原来会跳过剩余样本、把 total 算少）。
+
+4) starting 标记覆盖不到 resolve_engine 的解压期
+   首次运行解压 41MB 引擎包需数秒，这期间 starting=false、child=None，
+   stop_task 会误报 "idle"，前端据此解锁并允许再次开始 → 两个引擎抢同一目录。
+   修复：starting 的置位提前到 resolve_engine 之前。
+
+5) 快速切换歌单会让「下载整张歌单」下错歌
+   `toggleSongs` 无请求序号：点 A → 立刻点 B，若 A 后返回会覆盖 B 的列表，
+   标题显示 B 而内容是 A 的歌。
+   修复：加 songsRequestRef 序号，过期响应直接丢弃。
+
+6) 体检失败后 deadPicked 残留，可一键删掉看不见的音源
+   probeReport 被清空但 deadPicked 还在，界面显示「已勾选 N 个失活音源」
+   却没有任何复选框（复选框依赖 probeReport）。
+   修复：体检开始时清空 deadPicked；删除条渲染条件加 probeReport。
+
+7) 启动时加载的体检缓存永远不显示
+   面板 gate 是 `probing || probeLiveLines.length > 0`，漏了 probeReport，
+   重开程序读到的缓存结果根本渲染不出来。
+   修复：gate 补上 probeReport。
+
+8) 环境白名单外的元数据文件可被删
+   `remove_source` / `remove_sources` 只校验 .js/.json 后缀，
+   .order.json / .health.json / .probe.json 都能被当音源删掉。
+   修复：两处都加 is_meta_file 排除（remove_sources 早先已加，这次补上单个删除）。
+
+## 建议修（健壮性/体验）
+
+9) stop() 失败后界面永久卡在「任务运行中」
+   catch 只记日志，running 仍 true、stopping 仍 false，28s 兜底定时器依赖 stopping
+   不会启动。修复：catch 里也 setStopping(true)，交给兜底解锁。
+
+10) 启动 effect 随输入框每次按键重跑全套任务
+    依赖 [loadPlaylists, refreshSources]，而 loadPlaylists 依赖 dbPath/pythonPath，
+    在输入框每敲一个字符就重新 list_playlists（最长 60s 子进程）+ getVersion
+    + 联网 check_update + 读缓存。
+    修复：拆成 mount-only effect（版本/更新/体检缓存/音源列表）+ 歌单 effect 加 600ms 防抖。
+
+## 其他修复
+
+- `.probe.json` 改为原子写（tmp + os.replace + fsync），避免被强杀时留下半截 JSON
+- 体检支持响应停止信号（原来只能等 20s 后被 taskkill 强杀）
+- `download_update` 失败/文件过小时删除残留文件，并加 `--proto-redir '=https'`
+  防止 https→http 降级下载
+- `run_check_update` 超时后 kill + communicate 回收子进程，输出中文错误
+- `APP_VERSION` 由模块级 let 改为 React state（原来靠强制重渲染，易读到旧值）
+- checkForUpdate 增加 currentVersion 参数，避免 setState 异步导致拿旧版本比较
+- compareVersion 支持两段版本号；新增 isComparableVersion，
+  无法解析当前版本时不再误报「已是最新」
+- listen 注册加 cancelled 标志，修复 StrictMode 下重复订阅
+- workers 输入钳制为 0-32 整数（原来 1.5 会让 Rust usize 反序列化失败）
+- 两处 save() 对话框加 try/catch（原来异常会变成未处理的 rejection）
+- 删除一处空操作 setStopping((s) => (s ? true : false))
+
+## 验证
+
+Python 92 tests / Rust 40 tests / clippy -D warnings / tsc / npm build 全通过。
+新增 4 项测试：is_meta_file 覆盖 .probe.json、元数据文件能通过扩展名校验
+（说明必须额外排除）、体检状态判定规则（含「部分成功不得判 ok」的不变量）。

@@ -121,7 +121,6 @@ const AUTHOR = {
  * 现在改为启动时从 Tauri 读取（唯一来源是 tauri.conf.json），
  * 读不到时才退回占位符——避免以后再出现「关于页版本号和实际不符」。
  */
-let APP_VERSION = "…";
 
 /**
  * 比较两个语义化版本号。
@@ -133,17 +132,30 @@ let APP_VERSION = "…";
  */
 function compareVersion(a: string, b: string): number {
   const parse = (v: string): number[] | null => {
-    const m = String(v || "").trim().replace(/^v/i, "").match(/^(\d+)\.(\d+)\.(\d+)/);
-    return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
+    // 允许两段版本（如 "1.0"）与三段版本，"1.0" 等价于 "1.0.0"。
+    // 原实现要求必须三段，遇到 "1.0" 会解析成 null → 返回 0 → 漏掉更新提示。
+    const m = String(v || "")
+      .trim()
+      .replace(/^v/i, "")
+      .match(/^(\d+)(?:\.(\d+))?(?:\.(\d+))?/);
+    if (!m) return null;
+    return [Number(m[1] || 0), Number(m[2] || 0), Number(m[3] || 0)];
   };
   const pa = parse(a);
   const pb = parse(b);
+  // 任一版本无法解析时返回 0（"无法比较"），由调用方决定提示文案，
+  // 不要在这里假装"相等"——那会被上层当成"已是最新"。
   if (!pa || !pb) return 0;
   for (let i = 0; i < 3; i += 1) {
     if (pa[i] > pb[i]) return 1;
     if (pa[i] < pb[i]) return -1;
   }
   return 0;
+}
+
+/** 版本号是否可解析（用于区分「确实是最新」与「无法比较」） */
+function isComparableVersion(v: string): boolean {
+  return /^\d+(\.\d+){0,2}/.test(String(v || "").trim().replace(/^v/i, ""));
 }
 
 const SOURCE_LABELS: Record<string, string> = {
@@ -202,6 +214,8 @@ function App() {
   // ===== 歌单歌曲展开 =====
   const [songs, setSongs] = useState<Song[]>([]);
   const [songsOf, setSongsOf] = useState<string>("");
+  /** 歌单列表请求序号：用于丢弃过期响应，避免快速切换时内容错位 */
+  const songsRequestRef = useRef(0);
   const [loadingSongs, setLoadingSongs] = useState(false);
 
   // ===== 音源管理 =====
@@ -245,8 +259,8 @@ function App() {
   // 前端不自己解析文件（解析逻辑只在引擎里维护一份，避免两处格式定义漂移）。
   const [failedCount, setFailedCount] = useState(0);
 
-  /** 版本号加载完成后 +1，用于触发关于页重渲染（APP_VERSION 是模块级变量） */
-  const [, setVersionReady] = useState(0);
+  /** 应用版本号（启动时从 Tauri 读，唯一来源 tauri.conf.json） */
+  const [appVersion, setAppVersion] = useState("…");
 
   // ===== 检查更新 =====
   const [checkingUpdate, setCheckingUpdate] = useState(false);
@@ -357,10 +371,10 @@ function App() {
     return () => window.clearTimeout(timer);
   }, [refreshFailedCount, running]);
 
-  // 首页自动加载
+  // 首页自动加载（只在挂载时跑一次）。
+  // 注意依赖**故意为空**：版本号、更新检查、体检缓存都只该在启动时做一次。
+  // 歌曲列表的加载由下面的 effect 单独负责（它才需要跟随 dbPath/pythonPath 变化）。
   useEffect(() => {
-    loadPlaylists();
-    refreshSources();
     // 载入上次的体检缓存：不必每次进页面都等一两分钟
     invoke<ProbeReport | null>("load_probe_cache")
       .then((r) => { if (r) setProbeReport(r); })
@@ -368,14 +382,29 @@ function App() {
     // 版本号从 Tauri 读（唯一来源 tauri.conf.json），避免手写漏改
     getVersion()
       .then((v) => {
-        APP_VERSION = v;
-        setVersionReady((n) => n + 1);
+        setAppVersion(v);
         // 启动后静默检查更新：拿到版本号再查，才能正确比较。
         // silent=true 表示「没新版/查失败都不打扰用户」。
-        checkForUpdate(true);
+        // 直接传 v，不依赖 state（setState 是异步的，此刻读 appVersion 还是旧值）
+        void checkForUpdate(true, v);
       })
-      .catch(() => { APP_VERSION = "unknown"; setVersionReady((n) => n + 1); });
-  }, [loadPlaylists, refreshSources]);
+      .catch(() => setAppVersion("unknown"));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // 歌单：跟随数据库路径 / Python 路径变化重新加载，但加 600ms 防抖。
+  // 不加防抖的话，用户在输入框每敲一个字符都会触发一次 list_playlists
+  // —— 那是一个最长 60 秒的引擎子进程，输入一个路径等于起几十个进程。
+  useEffect(() => {
+    const timer = window.setTimeout(() => { loadPlaylists(); }, 600);
+    return () => window.clearTimeout(timer);
+  }, [loadPlaylists]);
+
+  // 音源列表只需在挂载时加载一次（导入/删除后会显式 refreshSources）
+  useEffect(() => {
+    refreshSources();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // 自动滚到底部：节流到 200ms 一次，且只在用户没有手动上翻时滚动。
   // 每条日志都 smooth scroll 会在批量下载时明显掉帧。
@@ -393,33 +422,42 @@ function App() {
 
   // 订阅下载日志
   useEffect(() => {
+    // cancelled 标志：listen() 是异步的，若在它 resolve 之前组件就卸载，
+    // 原写法 unH 还没被赋值，cleanup 里的 unH?.() 是空操作，
+    // 监听器会永久残留（StrictMode 双挂载时会重复订阅，日志每条触发两次）。
+    let cancelled = false;
     let unH: (() => void) | undefined;
     (async () => {
-      unH = await listen<LogLine>("download-log", (e) => handleLog(e.payload));
+      const off = await listen<LogLine>("download-log", (e) => handleLog(e.payload));
+      if (cancelled) off();        // 已卸载：立刻注销
+      else unH = off;
     })();
     return () => {
+      cancelled = true;
       unH?.();
     };
   }, [handleLog]);
 
   // 订阅进度
   useEffect(() => {
+    let cancelled = false;
     let unH: (() => void) | undefined;
     (async () => {
-      unH = await listen<string>("progress", (e) => {
+      const off = await listen<string>("progress", (e) => {
         try {
           const p = JSON.parse(e.payload) as Progress;
           setProgress(p);
           // 注意：进度到 100% 不代表进程已退出（还有二次重试、写失败清单）。
-          // 这里只标记「下载完成」，真正的 running 由 done 事件解除，
-          // 否则停止后引擎仍在收尾时按钮就会提前变为可点。
-          if (p.done >= p.total && p.total > 0) setStopping((s) => (s ? true : false));
+          // running 只由 done 事件解除，否则停止后引擎仍在收尾时按钮会提前可点。
         } catch {
           /* ignore badly-formed progress */
         }
       });
+      if (cancelled) off();
+      else unH = off;
     })();
     return () => {
+      cancelled = true;
       unH?.();
     };
   }, []);
@@ -539,6 +577,11 @@ function App() {
       setStopping(false);
     } catch (err) {
       addLog("error", String(err));
+      // 停止请求本身失败（IPC 异常等）时不能什么都不做：
+      // running 仍为 true、stopping 为 false，而 28s 兜底定时器依赖 stopping，
+      // 界面会永久停在「任务运行中」且所有按钮禁用。
+      // 退一步进入「正在停止」，让兜底定时器接管解锁。
+      setStopping(true);
     }
   }
 
@@ -627,6 +670,10 @@ function App() {
       setSongs([]);
       return;
     }
+    // 请求序号：快速点 A→B 时，若 A 的响应后到会覆盖 B 的歌曲列表，
+    // 造成「标题是 B、内容却是 A 的歌」，点「下载整张歌单」就会下错歌。
+    // 每次请求递增，await 回来后只接受最新一次的结果。
+    const token = ++songsRequestRef.current;
     setLoadingSongs(true);
     setSongs([]);
     setSongsOf(playlistId);
@@ -636,14 +683,17 @@ function App() {
         db: dbPath || null,
         python: pythonPath || null,
       });
+      // 已有更新的请求发出 → 丢弃这次结果（连日志一起丢弃，避免误导）
+      if (token !== songsRequestRef.current) return;
       setSongs(list);
       const pl = playlists.find((p) => p.id === playlistId);
-      addLog("info", `歌单「${pl?.name ?? playlistId}」共 ${list.length} 首`);
+      addLog("info", `歌单\u300c${pl?.name ?? playlistId}\u300d共 ${list.length} 首`);
     } catch (err) {
+      if (token !== songsRequestRef.current) return;
       addLog("error", String(err));
       setSongsOf("");
     } finally {
-      setLoadingSongs(false);
+      if (token === songsRequestRef.current) setLoadingSongs(false);
     }
   }
 
@@ -682,8 +732,9 @@ function App() {
   }
 
   /** 检查更新：有新版就提示用户，由用户决定是否下载 */
-  async function checkForUpdate(silent = false) {
+  async function checkForUpdate(silent = false, currentVersion?: string) {
     if (checkingUpdate) return;
+    const cur = currentVersion ?? appVersion;
     setCheckingUpdate(true);
     try {
       const info = await invoke<UpdateInfo>("check_update", {
@@ -694,13 +745,21 @@ function App() {
         return;
       }
       // 版本比较：只在远端严格大于本地时提示
-      const cmp = compareVersion(info.latest, APP_VERSION);
+      // 若当前版本读不到（getVersion 失败 / 值异常），compareVersion 返回 0，
+      // 不能把它当成「已是最新」——那会让用户以为已经最新而错过更新。
+      if (!isComparableVersion(cur)) {
+        if (!silent) {
+          addLog("error", `无法获取当前版本（${cur}），已跳过比较；最新版本为 ${info.latest}`);
+        }
+        return;
+      }
+      const cmp = compareVersion(info.latest, cur);
       if (cmp > 0) {
         setUpdateInfo(info);
         setUpdateDismissed(false);
-        addLog("ok", `发现新版本 ${info.latest}（当前 ${APP_VERSION}）`);
+        addLog("ok", `发现新版本 ${info.latest}（当前 ${cur}）`);
       } else if (!silent) {
-        addLog("info", `已是最新版本（${APP_VERSION}）`);
+        addLog("info", `已是最新版本（${cur}）`);
       }
     } catch (err) {
       if (!silent) addLog("error", String(err));
@@ -715,12 +774,20 @@ function App() {
       addLog("error", "该版本没有提供安装包，请到发布页手动下载");
       return;
     }
-    const path = await save({
-      title: "保存更新包",
-      defaultPath: updateInfo.assetName || `落雪音乐下载器-${updateInfo.latest}.exe`,
-      filters: [{ name: "可执行文件", extensions: ["exe"] }],
-    });
-    if (!path) return;
+    let path: string | null = null;
+    try {
+      path = await save({
+        title: "保存更新包",
+        defaultPath: updateInfo.assetName || `落雪音乐下载器-${updateInfo.latest}.exe`,
+        filters: [{ name: "可执行文件", extensions: ["exe"] }],
+      });
+    } catch (err) {
+      // 对话框本身失败（权限/后端异常）时给出明确反馈，
+      // 否则会变成未处理的 Promise rejection，用户点了没反应。
+      addLog("error", `打开保存对话框失败: ${err}`);
+      return;
+    }
+    if (!path) return;   // 用户取消
 
     setDownloadingUpdate(true);
     addLog("info", `正在下载 ${updateInfo.latest}…`);
@@ -738,7 +805,6 @@ function App() {
     }
   }
 
-  /** 音源体检：逐个实测能否取到可下载链接 + 测响应速度 */
   /**
    * 等待体检子进程真正结束。
    *
@@ -764,11 +830,21 @@ function App() {
 
   async function probeSources() {
     if (probing) return;
+    // 双重保险（按钮已 disabled，这里再拦一次）：体检会杀掉后端正在跑的任务，
+    // 所以下载中/停止中绝不允许开始体检。
+    if (running || stopping) {
+      addLog("info", "请等当前下载任务结束后再体检");
+      return;
+    }
     setProbing(true);
     // 清空上一轮实时日志（面板会自动出现在音源列表下方）
     setProbeLiveLines([]);
     // 清掉上一轮结果：否则重新体检期间会一直显示旧结果，看不出在跑
     setProbeReport(null);
+    // 同时清掉上一轮的勾选。否则体检失败/超时后 probeReport 为 null，
+    // 但 deadPicked 还留着上次的音源名 —— 界面会出现「已勾选 N 个失活音源」
+    // 却看不到任何复选框（复选框依赖 probeReport），点删除会删掉看不见的文件。
+    setDeadPicked(new Set());
     addLog("info", "开始音源体检（逐个实测取链接 + 测速），可能需要一两分钟…");
     try {
       // 流式跑：日志由 download-log 事件实时推过来（引擎把进度写 stderr），
@@ -895,11 +971,17 @@ function App() {
   async function saveExport() {
     if (!exportText) return;
     const pl = playlists.find((p) => p.id === selected);
-    const path = await save({
-      title: "另存歌单歌曲清单",
-      defaultPath: `${pl?.name || "歌单"}.txt`,
-      filters: [{ name: "文本文件", extensions: ["txt"] }],
-    });
+let path: string | null = null;
+    try {
+        path = await save({
+        title: "另存歌单歌曲清单",
+        defaultPath: `${pl?.name || "歌单"}.txt`,
+        filters: [{ name: "文本文件", extensions: ["txt"] }],
+      });
+    } catch (err) {
+      addLog("error", `打开保存对话框失败: ${err}`);
+      return;
+    }
     if (!path) return;
     try {
       await invoke("save_text_file", { path, content: exportText + "\n" });
@@ -1022,7 +1104,7 @@ function App() {
             <div className="update-banner-text">
               <strong>发现新版本 {updateInfo.latest}</strong>
               <span>
-                当前版本 {APP_VERSION}
+                当前版本 {appVersion}
                 {updateInfo.name ? ` ｜ ${updateInfo.name}` : ""}
               </span>
             </div>
@@ -1141,7 +1223,7 @@ function App() {
                     <span className="hint">共 {songs.length} 首</span>
                     <button
                       className="primary-btn small"
-                      disabled={running || stopping || songs.length === 0}
+                      disabled={running || stopping || probing || songs.length === 0}
                       onClick={() =>
                         downloadSongs(
                           songs,
@@ -1173,7 +1255,7 @@ function App() {
                           <button
                             className="icon-btn"
                             title="下载这首"
-                            disabled={running || stopping}
+                            disabled={running || stopping || probing}
                             onClick={() => downloadSongs([s], `单曲「${s.name}」`)}
                           >
                             <DownloadIcon size={16} />
@@ -1210,7 +1292,7 @@ function App() {
                 {picked.size > 0 && (
                   <button
                     className="primary-btn"
-                    disabled={running || stopping}
+                    disabled={running || stopping || probing}
                     onClick={() => downloadSongs(pickedSongs, "搜索结果选中项")}
                   >
                     下载选中 {picked.size} 首
@@ -1262,7 +1344,7 @@ function App() {
                           <button
                             className="icon-btn"
                             title="下载这首"
-                            disabled={running || stopping}
+                            disabled={running || stopping || probing}
                             onClick={() => downloadSongs([s], `单曲「${s.name}」`)}
                           >
                             <DownloadIcon size={16} />
@@ -1359,7 +1441,19 @@ function App() {
                     min={0}
                     max={32}
                     value={workers}
-                    onChange={(e) => setWorkers(Number(e.target.value))}
+                    onChange={(e) => {
+                      // 必须钳制成整数：Rust 侧参数是 usize，输入 1.5 或空串会在
+                      // 反序列化阶段失败，前端只能看到一条难以理解的 invoke 错误。
+                      // 0 表示「自动」，上限 32（与引擎内的 clamp 一致）。
+                      const raw = e.target.value.trim();
+                      if (raw === "") {
+                        setWorkers(0);
+                        return;
+                      }
+                      const n = Math.trunc(Number(raw));
+                      if (Number.isNaN(n)) return;
+                      setWorkers(Math.max(0, Math.min(32, n)));
+                    }}
                   />
                 </label>
               </div>
@@ -1368,7 +1462,7 @@ function App() {
                 <button
                   className="primary-btn big"
                   onClick={startPlaylistDownload}
-                  disabled={running || stopping || playlists.length === 0}
+                  disabled={running || stopping || probing || playlists.length === 0}
                 >
                   {stopping ? "正在停止…" : running ? "正在下载…" : "开始下载"}
                 </button>
@@ -1377,7 +1471,7 @@ function App() {
                   <button
                     className="ghost-btn"
                     onClick={retryFailed}
-                    disabled={running || stopping}
+                    disabled={running || stopping || probing}
                     title="读取下载目录下的 failed.txt，只补下其中失败过的歌曲"
                   >
                     重试上次失败的 {failedCount} 首
@@ -1519,8 +1613,15 @@ function App() {
                 <button
                   className="ghost-btn"
                   onClick={probeSources}
-                  disabled={probing || sourceFiles.length === 0}
-                  title="逐个实测每个音源能否真的取到可下载链接，并测出响应速度"
+                  // 关键：下载中/停止中也必须禁用。
+                  // 体检和下载共用后端的 TaskState.child（spawn_task 会先杀掉上一个任务），
+                  // 允许在下载时体检 = 静默杀掉用户正在跑的下载。
+                  disabled={probing || running || stopping || sourceFiles.length === 0}
+                  title={
+                    running || stopping
+                      ? "请等当前下载任务结束后再体检"
+                      : "逐个实测每个音源能否真的取到可下载链接，并测出响应速度"
+                  }
                 >
                   {probing ? "体检中…" : "音源体检"}
                 </button>
@@ -1599,7 +1700,9 @@ function App() {
                   只有一份日志：
                     - 体检中：显示实时滚动的进度行
                     - 跑完：同一块区域改为显示结果明细（不再重复出现第二份日志） */}
-              {(probing || probeLiveLines.length > 0) && (
+              {(probing ||
+                probeLiveLines.length > 0 ||
+                (probeReport && probeReport.sources.length > 0)) && (
                 <div className="probe-panel">
                   <div className="probe-head">
                     <strong>{probing ? "体检中…" : "体检日志"}</strong>
@@ -1695,7 +1798,7 @@ function App() {
                   )}
 
                   {/* 失活音源：勾选后可批量删除 */}
-                  {!probing && deadPicked.size > 0 && (
+                  {!probing && probeReport && deadPicked.size > 0 && (
                     <div className="probe-actions">
                       <span className="hint">已勾选 {deadPicked.size} 个失活音源</span>
                       <button className="danger-btn" onClick={deletePickedSources}>
@@ -1791,7 +1894,7 @@ function App() {
                   <p className="hint">
                     读取落雪音乐歌单，多音源批量下载无损音乐。个人学习与研究用途。
                   </p>
-                  <span className="about-version">v{APP_VERSION}</span>
+                  <span className="about-version">v{appVersion}</span>
                 </div>
               </div>
 

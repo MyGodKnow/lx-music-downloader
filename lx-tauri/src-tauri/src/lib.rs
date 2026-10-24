@@ -385,13 +385,46 @@ const GRACEFUL_STOP_WAIT_SECS: u64 = 20;
 
 /// 组装命令行，启动子进程并起读取线程推日志。
 /// engine = (程序, 前置参数)：内置引擎直接执行 EXE；开发模式为 python + 脚本。
+///
+/// `reject_if_busy`：为 true 时，若已有任务在跑就返回错误，而不是杀掉它。
+///
+/// 为什么需要它：TaskState 只有一个 child 槽位，体检 / 下载 / 重试全写这里。
+/// 原实现无条件 kill 上一个任务——「下载中点体检」会静默杀掉下载，
+/// 而且不走优雅停止（不写 failed.txt、不清理 .part）。
+/// 下载类任务之间"新任务顶掉旧任务"是合理的（用户主动重开），
+/// 但**不同种类**的任务（尤其体检 vs 下载）必须互斥。
 fn spawn_task(
     app: AppHandle,
     state: &TaskState,
     event_name: &'static str,
     args: Vec<String>,
     engine: (String, Vec<String>),
+    reject_if_busy: bool,
 ) -> Result<String, String> {
+    if reject_if_busy {
+        let running = state
+            .child
+            .lock()
+            .map(|mut g| {
+                // 顺手回收已退出的 child，避免"僵尸"状态导致永远拒绝
+                match g.as_mut() {
+                    Some(c) => match c.try_wait() {
+                        Ok(Some(_)) => {
+                            *g = None;
+                            false
+                        }
+                        Ok(None) => true,
+                        Err(_) => false,
+                    },
+                    None => false,
+                }
+            })
+            .unwrap_or(false);
+        if running {
+            return Err("已有任务在运行，请等它结束后再试".to_string());
+        }
+    }
+
     // 先取走上一次任务的 child，**在锁外**再杀。
     // 绝不能持锁调用 kill_process_tree：它内部有 taskkill 与进程回收，
     // 持锁期间会堵死 stop_task / 窗口退出等所有路径。
@@ -645,9 +678,16 @@ fn start_download_blocking(
             args.push(d.trim().into());
         }
     }
-    let engine = resolve_engine(python.as_ref());
+    // 标记「正在启动」要覆盖 resolve_engine（首次运行会解压 41MB
+    // 引擎包，数秒）。原来只在 spawn_task 内部标记，解压期间
+    // stop_task 会误报 "idle"，前端据此解锁并允许再次开始，
+    // 两个引擎就会抢同一个目录与停止信号文件。
     let state = app.state::<TaskState>();
-    spawn_task(app.clone(), &state, "download-log", args, engine)
+    state
+        .starting
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let engine = resolve_engine(python.as_ref());
+    spawn_task(app.clone(), &state, "download-log", args, engine, false)
 }
 
 /// 停止当前任务：先写停止信号让引擎自行收尾，后台线程等待，超时才强杀进程树。
@@ -848,6 +888,11 @@ async fn import_source(file_name: String, content: String) -> Result<String, Str
 #[tauri::command]
 async fn remove_source(file_name: String) -> Result<(), String> {
     let name = validate_source_name(&file_name)?;
+    // 元数据文件不是音源，不能通过本命令删除
+    // （.order.json / .health.json / .probe.json 也是 .json，扩展名校验拦不住）
+    if is_meta_file(&name) {
+        return Err("该文件是程序元数据，不能作为音源删除".to_string());
+    }
     let dest = user_sources_dir().join(&name);
     tauri::async_runtime::spawn_blocking(move || {
         if dest.exists() {
@@ -1380,9 +1425,16 @@ fn download_songs_blocking(
             }
         }
     }
-    let engine = resolve_engine(python.as_ref());
+    // 标记「正在启动」要覆盖 resolve_engine（首次运行会解压 41MB
+    // 引擎包，数秒）。原来只在 spawn_task 内部标记，解压期间
+    // stop_task 会误报 "idle"，前端据此解锁并允许再次开始，
+    // 两个引擎就会抢同一个目录与停止信号文件。
     let state = app.state::<TaskState>();
-    spawn_task(app.clone(), &state, "download-log", args, engine)
+    state
+        .starting
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let engine = resolve_engine(python.as_ref());
+    spawn_task(app.clone(), &state, "download-log", args, engine, false)
 }
 
 /// 校验失败清单目录参数（`--retry-failed` / `--count-failed` 的值直接进 argv）。
@@ -1462,8 +1514,13 @@ async fn download_update(url: String, path: String) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
         // 用系统自带 curl.exe 下载：Windows 10+ 必带，支持 https 与重定向，
         // 无需为一次性功能引入 HTTP 依赖。
+        //
+        // --proto-redir '=https'：限制**重定向目标**也必须是 https。
+        // 只校验起始 URL 不够——GitHub 若 302 到 http，curl -L 会照跟，
+        // 更新包就会被明文传输（可被中间人替换成恶意 exe）。
         let mut cmd = std::process::Command::new("curl.exe");
         cmd.args(["-L", "--fail", "--silent", "--show-error",
+                  "--proto", "=https", "--proto-redir", "=https",
                   "-o", &path, &url]);
         // 后台静默运行，不弹命令提示符窗口
         #[cfg(windows)]
@@ -1475,10 +1532,14 @@ async fn download_update(url: String, path: String) -> Result<String, String> {
         let out = cmd.output().map_err(|e| format!("调用 curl 失败: {e}"))?;
         if !out.status.success() {
             let err = String::from_utf8_lossy(&out.stderr);
+            // 失败时清掉可能残留的半截文件，避免用户误以为下好了
+            let _ = std::fs::remove_file(&path);
             return Err(format!("下载失败: {}", err.trim()));
         }
         let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         if size < 1024 * 1024 {
+            // 同上：过小的文件基本是错误页，删掉免得留着误导用户
+            let _ = std::fs::remove_file(&path);
             return Err(format!("下载的文件过小（{size} 字节），可能不是有效安装包"));
         }
         Ok(path)
@@ -1533,9 +1594,16 @@ async fn probe_sources(app: AppHandle, python: Option<String>) -> Result<String,
         // 先删旧缓存：避免「本次体检失败、界面却显示上次结果」造成误解
         let _ = std::fs::remove_file(probe_cache_file());
         let args = vec!["--probe-sources".to_string()];
-        let engine = resolve_engine(python.as_ref());
+        // 标记「正在启动」要覆盖 resolve_engine（首次运行会解压 41MB
+        // 引擎包，数秒）。原来只在 spawn_task 内部标记，解压期间
+        // stop_task 会误报 "idle"，前端据此解锁并允许再次开始，
+        // 两个引擎就会抢同一个目录与停止信号文件。
         let state = app.state::<TaskState>();
-        spawn_task(app.clone(), &state, "download-log", args, engine)
+        state
+            .starting
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let engine = resolve_engine(python.as_ref());
+        spawn_task(app.clone(), &state, "download-log", args, engine, false)
     })
     .await
     .map_err(|e| format!("任务执行失败: {e}"))?
@@ -1566,6 +1634,12 @@ async fn remove_sources(names: Vec<String>) -> Result<Vec<String>, String> {
                 Ok(n) => n,
                 Err(_) => continue,
             };
+            // 元数据文件不是音源，绝不能通过这个命令删掉。
+            // （.order.json 存拖拽顺序、.health.json 存健康度、.probe.json 存体检缓存，
+            //   它们刚好也是 .json，光靠扩展名校验拦不住。）
+            if is_meta_file(&name) {
+                continue;
+            }
             let target = dir.join(&name);
             if target.is_file() && std::fs::remove_file(&target).is_ok() {
                 removed.push(name);
@@ -1665,9 +1739,16 @@ fn retry_failed_blocking(
             }
         }
     }
-    let engine = resolve_engine(python.as_ref());
+    // 标记「正在启动」要覆盖 resolve_engine（首次运行会解压 41MB
+    // 引擎包，数秒）。原来只在 spawn_task 内部标记，解压期间
+    // stop_task 会误报 "idle"，前端据此解锁并允许再次开始，
+    // 两个引擎就会抢同一个目录与停止信号文件。
     let state = app.state::<TaskState>();
-    spawn_task(app.clone(), &state, "download-log", args, engine)
+    state
+        .starting
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let engine = resolve_engine(python.as_ref());
+    spawn_task(app.clone(), &state, "download-log", args, engine, false)
 }
 
 /// 运行引擎并解析其 JSON 输出（取最后一行非空输出），供 search_songs / list_songs 复用。
@@ -1876,6 +1957,24 @@ mod tests {
         // 真实的音源文件名（含以点开头的合法名）不能被误排除
         for name in ["六音音源.js", "野草🌾.js", "user_api.json", "音源 v1.2.js"] {
             assert!(!is_meta_file(name), "{name} 不应被当成元数据文件");
+        }
+    }
+
+    #[test]
+    fn is_meta_file_covers_probe_cache() {
+        // .probe.json 存体检缓存，也是 .json，必须一并排除，
+        // 否则会被 list_sources 当成音源、或被 remove_sources 误删
+        assert!(is_meta_file(".probe.json"));
+    }
+
+    #[test]
+    fn meta_files_all_have_json_ext() {
+        // 这几个元数据文件之所以需要专门排除，是因为它们的扩展名同样匹配
+        // 「.js / .json 即音源」的规则——光靠扩展名校验拦不住。
+        for name in [".order.json", ".health.json", ".probe.json"] {
+            assert!(name.ends_with(".json"), "{name} 应以 .json 结尾");
+            assert!(validate_source_name(name).is_ok(),
+                    "{name} 能通过扩展名校验（这正是必须额外排除的原因）");
         }
     }
 

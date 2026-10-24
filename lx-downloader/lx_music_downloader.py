@@ -427,6 +427,10 @@ class UrlServer:
                     if on_event:
                         try:
                             on_event(line)
+                        except InterruptedError:
+                            # 停止请求必须能穿透：否则体检会一直跑完才响应 stop，
+                            # 只能等 20 秒后被 taskkill 强杀。
+                            raise
                         except Exception:
                             pass
                     continue
@@ -2576,10 +2580,23 @@ def run_check_update(args):
         )
         # init() 失败时 Node 会 exit(1)，此时 stdout 只有 {"ready":true} 或什么都没有，
         # 但 checkUpdate 的响应仍可能已写入 —— 所以先读完 stdout 再判断。
-        out, err = proc.communicate(
-            json.dumps({'id': 1, 'cmd': 'checkUpdate', 'repo': repo}) + '\n',
-            timeout=30,
-        )
+        try:
+            out, err = proc.communicate(
+                json.dumps({'id': 1, 'cmd': 'checkUpdate', 'repo': repo}) + '\n',
+                timeout=30,
+            )
+        except subprocess.TimeoutExpired:
+            # 超时必须把子进程收干净：只 kill 不 wait 会留下句柄与管道（Windows 上
+            # 表现为句柄泄漏），而且旧代码会掉到通用 except 里、
+            # 把英文的 "Command ... timed out" 原样丢给用户。
+            proc.kill()
+            try:
+                proc.communicate(timeout=5)
+            except Exception:
+                pass
+            print(json.dumps({'ok': False, 'error': '检查更新超时（网络较慢或 GitHub 不可达）'},
+                             ensure_ascii=False), flush=True)
+            return 0
         if os.environ.get('LX_DEBUG_UPDATE') == '1':
             print(f'[update] rc={proc.returncode} stdout={out[:300]!r}', file=sys.stderr, flush=True)
             print(f'[update] stderr={err[:600]!r}', file=sys.stderr, flush=True)
@@ -2649,8 +2666,19 @@ def run_probe_sources(args):
 
     server = UrlServer(node_exe, args.api, args.api_dir).start()
     try:
+        # 体检也要响应停止：否则用户在别处触发 stop_task 时，本进程只能被
+        # 20 秒后强杀（taskkill /T /F），既无收尾也不写缓存。
+        if DOWNLOAD_STOP_EVENT.is_set():
+            log('[体检] 已收到停止请求，取消体检')
+            print(json.dumps({'error': '已停止'}, ensure_ascii=False), flush=True)
+            return 1
+
         # 边跑边把进度写 stderr：Node 侧每完成一个音源就发一行 probeProgress
         def on_progress(line):
+            # 回调里检查停止事件：Node 每测完一个源就会调一次，
+            # 是最自然的检查点（不需要额外线程）。
+            if DOWNLOAD_STOP_EVENT.is_set():
+                raise InterruptedError('用户请求停止')
             try:
                 obj = json.loads(line)
             except Exception:
@@ -2666,9 +2694,14 @@ def run_probe_sources(args):
             tail = f'  {speed}ms' if speed is not None else ''
             log(f'[体检] {mark:<6} {name}（{ok_n}/{total}）{tail}')
 
-        resp = server.request('probeSources', probes=probes,
-                              timeoutMs=getattr(args, 'probe_timeout_ms', 8000),
-                              on_event=on_progress)
+        try:
+            resp = server.request('probeSources', probes=probes,
+                                  timeoutMs=getattr(args, 'probe_timeout_ms', 8000),
+                                  on_event=on_progress)
+        except InterruptedError:
+            log('[体检] 已收到停止请求，取消体检')
+            print(json.dumps({'error': '已停止'}, ensure_ascii=False), flush=True)
+            return 1
     finally:
         server.close()
 
@@ -2687,16 +2720,32 @@ def run_probe_sources(args):
     # 自己把结果写进缓存文件（.probe.json）。
     # GUI 侧是流式跑体检的（为了实时显示日志），拿不到返回值，
     # 所以由引擎负责落盘，前端在收到 done 事件后读这个文件。
+    tmp_path = None
     try:
         cache_dir = args.api_dir or USER_SOURCES_DIR
         if cache_dir and os.path.isdir(cache_dir):
             cache_path = os.path.join(cache_dir, '.probe.json')
-            with open(cache_path, 'w', encoding='utf-8') as f:
+            # 原子写：先写 .tmp 再 os.replace。
+            # 直接 open('w') 会先截断——若此刻进程被强杀（体检无停止响应，
+            # stop_task 20s 后 taskkill /T /F），就会留下半截 JSON，
+            # 前端 load_probe_cache 解析失败、结果白跑。
+            tmp_path = cache_path + '.tmp'
+            with open(tmp_path, 'w', encoding='utf-8') as f:
                 json.dump(result, f, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, cache_path)
+            tmp_path = None
             log(f'[体检] 结果已缓存: {cache_path}')
     except Exception as exc:
         # 缓存写失败不影响本次结果输出
         log(f'[体检] 缓存写入失败（不影响本次结果）: {exc}')
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
 
     print(json.dumps(result, ensure_ascii=False), flush=True)
     return 0
