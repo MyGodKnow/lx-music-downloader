@@ -2,11 +2,33 @@
 
 > 自动读取落雪音乐（lx-music-desktop）本地歌单，多音源批量无损下载的 Windows 音乐下载工具（Tauri 图形界面 + Python 引擎）。
 
-![platform](https://img.shields.io/badge/platform-Windows-0078d6) ![license](https://img.shields.io/badge/license-GPL--3.0-blue)
+[![release](https://img.shields.io/github/v/release/MyGodKnow/lx-music-downloader?label=最新版本&color=2ea44f)](https://github.com/MyGodKnow/lx-music-downloader/releases/latest)
+[![downloads](https://img.shields.io/github/downloads/MyGodKnow/lx-music-downloader/total?label=下载量&color=0078d6)](https://github.com/MyGodKnow/lx-music-downloader/releases)
+[![stars](https://img.shields.io/github/stars/MyGodKnow/lx-music-downloader?label=Stars&color=e3b341)](https://github.com/MyGodKnow/lx-music-downloader/stargazers)
+[![platform](https://img.shields.io/badge/平台-Windows%2010%2F11-0078d6)](#系统要求)
+[![license](https://img.shields.io/badge/许可证-GPL--3.0-blue)](LICENSE)
+
+**落雪音乐歌单批量下载器** · 桌面 GUI · 多音源自动取链 · 无损音质 · 免安装单文件 EXE
+
+支持从 [落雪音乐（lx-music-desktop）](https://github.com/lyswhut/lx-music-desktop) 读取歌单，
+通过用户自备音源批量下载网易云 / 酷我 / QQ音乐 / 酷狗 / 咪咕的歌曲。
 
 ---
 
 ## 作者的话
+
+这个工具最初只是给自己用的：落雪音乐的歌单攒了几百首，一首首手动导出太麻烦，
+于是写了个脚本自动读数据库、自动找音源、自动下载。
+
+后来发现身边不少人有同样需求，就加了图形界面打包成 EXE 放出来。
+**它不下载、不分发任何音乐**，只是个「把你已经在听的歌保存到本地」的搬运工，
+所有音源由使用者自己提供。
+
+如果它帮你省下了下歌的时间，欢迎点个 ⭐ Star —— 不花钱，
+但能让更多人看到它，也是我继续维护的动力。
+
+有问题或建议，欢迎提 [Issue](https://github.com/MyGodKnow/lx-music-downloader/issues) 或发邮件，
+我都会看。
 
 ## ⚠️ 法律与版权声明（请先阅读）
 
@@ -58,6 +80,18 @@ python lx_music_downloader.py --playlist love --quality flac --dir D:/Music --wo
 
 命令行同样默认从 `%APPDATA%\lx-downloader-sources\` 加载音源；未导入音源时会提示「请先导入音源」。完整参数与说明见 [lx-downloader/README.md](lx-downloader/README.md)。
 
+## 系统要求
+
+| 项目 | 要求 |
+| --- | --- |
+| 操作系统 | Windows 10 1803+ / Windows 11（64 位） |
+| 磁盘空间 | 约 200 MB（程序 54 MB + 临时解压） |
+| 网络 | 需要能访问音乐平台与 GitHub（检查更新） |
+| 其他 | 无需安装 Python / Node.js，引擎已内置 |
+
+> 更新包下载依赖系统自带 `curl.exe`（Windows 10 1803 起内置）。
+> 若系统缺失，仍可手动到 [Releases](https://github.com/MyGodKnow/lx-music-downloader/releases) 下载。
+
 ## 音源管理（用户自备）
 
 - 本仓库**不捆绑任何第三方音源**。请在 GUI「音源」页导入你自己的音源脚本（.js / .json / user_api.json），导入后保存在 `%APPDATA%\lx-downloader-sources\`，可随时增删，不随程序更新丢失
@@ -75,6 +109,15 @@ python lx_music_downloader.py --playlist love --quality flac --dir D:/Music --wo
 | 问题反馈 | [GitHub Issues](https://github.com/MyGodKnow/lx-music-downloader/issues) |
 
 遇到问题欢迎通过**邮箱**或 **GitHub Issues** 反馈。提交时请附上：操作步骤、日志区的报错内容、所用音源名称。
+
+## 关键词
+
+> 方便搜索，也是这个项目在做的事：
+
+`落雪音乐下载器` · `落雪音乐歌单下载` · `lx-music 下载` · `lx-music-desktop 歌单导出` ·
+`音乐歌单批量下载` · `无损音乐下载工具` · `FLAC 批量下载` · `网易云歌单下载` ·
+`酷我音乐下载` · `QQ音乐歌单下载` · `酷狗音乐下载` · `多音源音乐下载` ·
+`Windows 音乐下载软件` · `免安装音乐下载器` · `Tauri 桌面应用` · `Python 音乐下载脚本`
 
 ## 免责声明
 

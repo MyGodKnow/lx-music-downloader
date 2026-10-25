@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 使用问题 / 求助
+    url: https://github.com/MyGodKnow/lx-music-downloader#快速开始
+    about: 先看 README 的快速开始与音源管理章节，大部分问题那里有答案
+  - name: 下载最新版本
+    url: https://github.com/MyGodKnow/lx-music-downloader/releases/latest
+    about: 遇到 bug 先确认是不是最新版本，旧版本的问题可能已修复
