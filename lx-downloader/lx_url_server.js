@@ -1666,9 +1666,70 @@ async function getMusicUrls(source, musicInfo, qualities) {
             throw new Error('无法确定最新版本（GitHub 重定向与 API 均失败）');
           }
 
+          // ---- 兜底：API 被限流时，从 Release 页面解析附件 ----
+          // expanded_assets 是 GitHub 前端用的接口，不消耗 API 配额。
+          let htmlAsset = null;
+          if (!detail || !Array.isArray(detail.assets) || !detail.assets.length) {
+            try {
+              const assetsUrl =
+                `https://github.com/${repo}/releases/expanded_assets/`
+                + encodeURIComponent(String(latest).replace(/^v/i, '') === latest
+                  ? latest : latest);
+              const page = await new Promise((resolve, reject) => {
+                https.get(assetsUrl, {
+                  headers: { 'User-Agent': 'Mozilla/5.0 lx-music-downloader-updater',
+                             Accept: 'text/html' },
+                  timeout: 10000,
+                }, (res) => {
+                  // 跟随一次重定向（tag 写法差异时 GitHub 会跳）
+                  if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+                    https.get(res.headers.location, {
+                      headers: { 'User-Agent': 'Mozilla/5.0 lx-music-downloader-updater',
+                                 Accept: 'text/html' },
+                      timeout: 10000,
+                    }, (r2) => {
+                      let b = '';
+                      r2.on('data', (d) => { b += d; });
+                      r2.on('end', () => resolve(b));
+                    }).on('error', reject);
+                    return;
+                  }
+                  let b = '';
+                  res.on('data', (d) => { b += d; });
+                  res.on('end', () => resolve(b));
+                }).on('error', reject);
+              });
+
+              // 解析 exe 直链
+              const linkRe = /href="(\/[^"]*?\/releases\/download\/[^"]+?\.exe)"/i;
+              const m = page.match(linkRe);
+              if (m) {
+                const href = 'https://github.com' + m[1];
+                const name = decodeURIComponent(href.split('/').pop() || '');
+                // 解析大小（形如 "53.7 MB"）
+                const sz = page.match(/>\s*([\d.]+)\s*(B|KB|MB|GB)\s*</i);
+                let bytes = 0;
+                if (sz) {
+                  const mult = { B: 1, KB: 1024, MB: 1024 ** 2, GB: 1024 ** 3 }[sz[2].toUpperCase()] || 1;
+                  bytes = Math.round(parseFloat(sz[1]) * mult);
+                }
+                htmlAsset = { name, browser_download_url: href, size: bytes };
+                if (process.env.LX_DEBUG_UPDATE === '1') {
+                  process.stderr.write(`[update] HTML 兜底命中: ${name} ${bytes} bytes\n`);
+                }
+              }
+            } catch (e) {
+              if (process.env.LX_DEBUG_UPDATE === '1') {
+                process.stderr.write(`[update] HTML 兜底失败: ${e.message}\n`);
+              }
+            }
+          }
+
+
           const assets = detail && Array.isArray(detail.assets) ? detail.assets : [];
           const exe = assets.find((a) => /\.exe$/i.test(a.name || ''))
-            || assets.find((a) => /windows.*x64/i.test(a.name || ''));
+            || assets.find((a) => /windows.*x64/i.test(a.name || ''))
+            || htmlAsset;   // API 限流时的兜底（来自 Release 页面解析）
 
           process.stdout.write(JSON.stringify({
             id: msg.id,
