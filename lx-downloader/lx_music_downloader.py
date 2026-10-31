@@ -464,19 +464,30 @@ class UrlServer:
     # 实测用户日志里「取链接 109.8s」「取链接 112.7s」就是它们造成的——
     # 桥接内部已有 40s 预算，外层再重试 3 次并退避（3s+8s），
     # 一首歌光取链接就能烧掉近两分钟，还会拖住其它歌。
-    def get_urls(self, source, music_info, quality):
+    def get_urls(self, source, music_info, quality, exclude_urls=None):
         """获取播放链接候选列表（多音质）。
 
         只对**瞬时性**错误（限流、网络抖动、超时）退避重试；
         确定性错误（音源根本不支持/拿不到这首歌、格式加密、缺 ID）
         立即失败，让上层快速换源换档——否则每首歌都要白等两分钟。
+
+        exclude_urls：调用方已经试过并失败的 URL 集合。
+        音源脚本内部有**随机性**（同一首歌多次请求，可能这次只给 128k、
+        下次才给 flac），因此「这一轮候选都不达标」时值得再问一次，
+        但要排除已经试过的链接，避免反复下同一个坏文件。
         """
         last_error = None
+        exclude = set(exclude_urls or ())
         for attempt in range(3):
             try:
-                resp = self.request('url', source=source, musicInfo=music_info, quality=quality)
+                resp = self.request('url', source=source, musicInfo=music_info,
+                                    quality=quality,
+                                    excludeUrls=sorted(exclude) if exclude else None)
                 if resp.get('ok'):
-                    return resp.get('candidates', [])
+                    cands = resp.get('candidates', []) or []
+                    if exclude:
+                        cands = [c for c in cands if c.get('url') not in exclude]
+                    return cands
                 last_error = RuntimeError(resp.get('error', '未知错误'))
             except Exception as exc:
                 last_error = exc
@@ -2889,17 +2900,48 @@ def run_download(args, songs, db_path=None, title=None):
                             # 用的是不同的 hash，沿用上一个档位的 hash 会一直
                             # 拿到低码率文件，然后被判「音质不达标」。
                             music_info = get_music_info(cand, requested_quality)
-                            _tu = time.time()
-                            cands = server.get_urls(source, music_info, requested_quality)
-                            _url_cost += time.time() - _tu
-                            if not cands:
-                                raise RuntimeError('音源未返回任何链接')
-                            _td = time.time()
-                            actual_q, _saved = download_with_candidates(
-                                cands, dest_base, song.get('interval'), song.get('singer'),
-                                requested_quality=requested_quality,
-                                reuse=verified_files)
-                            _dl_cost += time.time() - _td
+                            # 音源脚本内部有随机性：同一首歌多次请求，这次给 128k，
+                            # 下次可能给 flac（实测同一 musicInfo 连问 6 次，
+                            # 3 次只有 128k、3 次拿到真 FLAC）。
+                            # 因此「本轮候选全不达标」时值得再问一轮，只是要排除
+                            # 已经下过并拒掉的 URL，避免反复拉同一个坏文件。
+                            tried_urls = set()
+                            actual_q = None
+                            round_errs = []
+                            for round_no in range(3):
+                                if time.time() > song_deadline:
+                                    budget_hit = True
+                                    round_errs.append('单曲时间预算耗尽')
+                                    break
+                                _tu = time.time()
+                                cands = server.get_urls(source, music_info, requested_quality,
+                                                        exclude_urls=tried_urls or None)
+                                _url_cost += time.time() - _tu
+                                for c in cands:
+                                    if c.get('url'):
+                                        tried_urls.add(c['url'])
+                                if not cands:
+                                    if round_no == 0:
+                                        raise RuntimeError('音源未返回任何链接')
+                                    break
+                                _td = time.time()
+                                try:
+                                    actual_q, _saved = download_with_candidates(
+                                        cands, dest_base, song.get('interval'), song.get('singer'),
+                                        requested_quality=requested_quality,
+                                        reuse=verified_files)
+                                    _dl_cost += time.time() - _td
+                                    break
+                                except Exception as round_error:
+                                    _dl_cost += time.time() - _td
+                                    round_errs.append(str(round_error))
+                                    # 只有「音质不达标」值得再问一轮；
+                                    # 时长/歌手/版本不符说明音源给的根本是别的歌，
+                                    # 再问也是同一批，直接放弃这一档。
+                                    if '音质不达标' not in str(round_error):
+                                        break
+                            if actual_q is None:
+                                raise RuntimeError('; '.join(round_errs[-2:]) or '候选均不可用')
                             remember_downloaded(download_dir, _saved)
                             # 升级模式：新文件已落盘，把被替换的旧文件删掉，
                             # 否则目录里会同时留下 320k 与 flac 两个版本。

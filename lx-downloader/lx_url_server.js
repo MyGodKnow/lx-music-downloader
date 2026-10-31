@@ -1515,8 +1515,13 @@ function qualityRank(q) {
   return Object.prototype.hasOwnProperty.call(QUALITY_RANK, key) ? QUALITY_RANK[key] : 2;
 }
 
-async function getMusicUrls(source, musicInfo, qualities) {
+async function getMusicUrls(source, musicInfo, qualities, excludeUrls) {
   if (!requestHandlers.length) throw new Error('音源未初始化: ' + (initError || 'unknown'));
+  // 调用方已试过并失败的链接。音源脚本内部有随机性（同一首歌多次请求
+  // 可能这次只给 128k、下次才给 flac），所以「本轮候选都不达标」时
+  // 上层会再来问一次；这里要跳过它已经下过并拒掉的链接，
+  // 否则每次都拿回同一批坏候选，白浪费下载带宽。
+  const excluded = new Set(Array.isArray(excludeUrls) ? excludeUrls : []);
 
   const qList = Array.isArray(qualities) ? qualities : [qualities];
   // 候选池大小。
@@ -1648,7 +1653,7 @@ async function getMusicUrls(source, musicInfo, qualities) {
       const batch = ordered.slice(idx, idx + CONCURRENCY);
       idx += CONCURRENCY;
       const hit = await raceBatch(batch, q);
-      if (hit && !seen.has(hit.url)) {
+      if (hit && !seen.has(hit.url) && !excluded.has(hit.url)) {
         seen.add(hit.url);
         candidates.push(hit);
       }
@@ -1752,7 +1757,7 @@ async function directFallbackCandidates(musicInfo, source) {
     }
     try {
       if (msg.cmd === 'url') {
-        const cands = await getMusicUrls(msg.source, msg.musicInfo || {}, msg.quality || '320k');
+        const cands = await getMusicUrls(msg.source, msg.musicInfo || {}, msg.quality || '320k', msg.excludeUrls);
         process.stdout.write(JSON.stringify({ id: msg.id, ok: true, candidates: cands }) + '\n');
       } else if (msg.cmd === 'searchByName') {
         const r = await searchByName(msg.name, msg.singer || '', msg.interval);
