@@ -1,9 +1,92 @@
 # 交接文档（HANDOVER）
 
-> 更新时间：2026-10-18 08:50
-> 仓库：`C:\Users\God Know\WorkBuddy\落雪音乐下载`
+> 更新时间：2026-10-31 14:10
+> 仓库：`C:\Users\God Know\Documents\code\lx-music-download`
 > 远端：https://github.com/MyGodKnow/lx-music-downloader（分支 `main`）
-> 状态：**改动已全部提交，版本 0.2.0**
+> 状态：**已提交，版本 1.2.0，EXE 已重新构建**
+
+> ⚠️ 本文件第一~十章写于 2026-10-18（v0.2.0），其中版本号、目录结构、
+> 待办事项多数已过时。**请优先阅读下面的「第十一章：2026-10-31 下载失败排查」**，
+> 那是当前最新的状态与结论。
+
+---
+
+## 十一、2026-10-31 下载失败排查（本轮）
+
+### 结论：修复 7 个根因，实测成功率 40% → 67%
+
+同一批 15 首真实歌单（请求 `flac`、最低 `320k`）：
+
+| 指标 | 修复前 | 修复后 |
+|------|--------|--------|
+| 成功 | 6 | **10** |
+| 失败 | 9 | 5 |
+| 真无损 | 4 | **9** |
+
+### 7 个 bug（按影响排序）
+
+| # | 问题 | 位置 | 后果 |
+|---|------|------|------|
+| 1 | 平台加密容器未识别 | `is_encrypted_audio_url()` / `is_encrypted_audio_file()` / `urlLooksEncrypted()` | 酷我 `.mgg`/`.mflac`、QQ `.qmc*` 被当普通音频下载，解析不出时长→「时长校验失败」，每次白下几十 MB |
+| 2 | 替代源 SQL 条件互斥 | `get_alternative_sources()` | `name != 当前歌名` 与后续「严格同名」比对矛盾，多平台兜底**永远返回空** |
+| 3 | 按名搜索兜底不走降级 | `_process_song_inner()` 兜底分支 | 请求 flac 时搜到可用 320k 也判不达标，整首失败 |
+| 4 | 酷狗各档 hash 混用 | `get_music_info(row, quality)` | meta 顶层 hash 固定是 128k，未按档位覆盖，请求 flac 仍返回 128k |
+| 5 | `directFallbackCandidates` 被误删 | `lx_url_server.js` | 8522b87 重构时删了函数体但留下调用，异常被 catch 吞掉→兜底**静默失效** |
+| 6 | `targetCount` 成死代码 | `getMusicUrls()` | 命中 1 个候选就 `break`，唯一候选是试听片段时无备选 |
+| 7 | 音质标签虚高 | `detect_actual_quality()` | 照抄音源自报值，16bit FLAC 显示成 `[flac24bit]` |
+
+### 3 项优化
+
+- **跨档位复用**：`download_with_candidates(..., reuse=)` —— flac 档因音质不足被拒的文件，
+  降到 320k 时直接复用，不再整首重下。
+- **失败清单存 id/meta**：重试时直查原平台，不依赖经常不可用的搜索接口（老清单兼容）。
+- **错误信息去重**：修掉 `320k: 320k: ...`。
+
+### 关键实测数据（排查时可直接复用）
+
+- 加密容器 `.mgg` 文件头：`29 01 55 61 70 31 50 34 71 37 35 66 37 32`（`\x29\x01` + `Uap1P4q75f72`）
+- 酷我可用直链形态：`.../trackmedia/M500...mp3`（128k）、`M800...mp3`（320k）、`F000....flac`（无损）
+- 网易云 `music.163.com/song/media/outer/url` 对无版权曲目返回 `application/json` 错误页，不是音频
+- 本机音源现状：`K×H测试.js` / `K×H测试-2.js` 较稳；`星海音乐源.js` 常报「缺少 songId」；
+  `长青SVIP` 报「缺失歌曲标识」；`独家音源.js` 报 `block ip`；`墨澜聚合音源.js` 常给 10-20s 试听片段
+
+### 剩余失败的性质（不是 bug）
+
+1. **音源只提供 128k**：`--min-quality` 默认 `320k`，低于此整首记失败（见待办 1）
+2. **音源返回他人翻唱**：被「歌手标签校验」正确拦截，属于保护行为
+3. **音源返回错误歌曲**：如 `K×H测试-2.js` 对多首歌返回同一首（时长差 35s 被拒）
+
+### 本轮验证命令
+
+```bash
+cd lx-downloader
+py -m unittest discover -s tests        # 118 passed
+node --check lx_url_server.js           # 语法
+cd ../lx-tauri && npx tsc --noEmit       # 0 error
+```
+
+> ⚠️ **测试坑**：不要用 `python -I` 跑引擎——隔离模式会屏蔽用户 site-packages，
+> 导致 `mutagen` 缺失，所有音质校验静默返回 False，看起来像「全部音质不达标」。
+> 本机 `python` 指向 WindowsApps 存根（退出码 49），请用 `py`。
+
+### 打包（本轮已执行）
+
+```bash
+cd lx-downloader
+py -m PyInstaller --noconfirm --clean lx_music_downloader.spec
+# 把 dist/lx_music_downloader/ 打成 zip 覆盖 lx-tauri/src-tauri/engine/engine.zip
+cd ../lx-tauri && npm run tauri build -- --no-bundle
+# 复制 src-tauri/target/release/lx-tauri.exe → 仓库根「落雪音乐下载器.exe」
+```
+
+### 待办（优先级）
+
+1. **[需产品决策] 降级下限**：当前 `min-quality=320k`，音源只有 128k 时整首失败。
+   若要「宁可低质也要有歌」，把默认改成 `128k`（`App.tsx` 的 `useState("320k")`
+   与引擎 `--min-quality` 的 `default`）。
+2. **`/gh` 音源脚本质量**：多数失败源于音源本身（返回错歌/试听片段/缺 ID），
+   程序侧只能校验拒绝，无法修复。
+3. 若某天出现「所有音源都失败」，优先看 `.health.json` 与 `--probe-sources`。
 
 ---
 
@@ -175,7 +258,7 @@ lx-tauri/src/icons.tsx
 ### 第 1 步：重新构建（必须，否则 EXE 无新图标）
 
 ```powershell
-cd "C:\Users\God Know\WorkBuddy\落雪音乐下载\lx-tauri"
+cd "C:\Users\God Know\Documents\code\lx-music-download\lx-tauri"
 npx tsc --noEmit                 # 先确认类型
 npm run tauri build -- --no-bundle
 ```
