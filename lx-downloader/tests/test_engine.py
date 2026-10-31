@@ -13,6 +13,7 @@
 import os
 import sys
 import json
+import re
 import shutil
 import tempfile
 import time
@@ -1138,6 +1139,107 @@ class DirIndexTest(unittest.TestCase):
         self._touch('歌手 - 歌名')
         self.assertIsNotNone(eng.song_exists_in_dir(str(self.dir), '歌手', '歌名'))
         self.assertIsNotNone(eng.song_exists_in_dir(self.dir, '歌手', '歌名'))
+
+
+class ProbeMergeTest(unittest.TestCase):
+    """总大小与测速合并成一次请求；探测读到的头部不再重复下载。
+
+    原来分两次探测（bytes=0-0 取大小、bytes=0-256K 测速），
+    每首歌多一次 DNS/TLS/首包往返（实测 139ms → 67ms）。
+    探测读到的 256KB 若在正式下载时重下，等于白传。
+    """
+
+    def _serve(self, body, range_ok=True):
+        """起一个本地 HTTP 服务，返回 (url, shutdown)。这里不联网。"""
+        import http.server
+        import threading
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                rng = self.headers.get('Range')
+                data = body
+                status = 200
+                if rng and range_ok:
+                    m = re.match(r'bytes=(\d+)-(\d*)', rng)
+                    if m:
+                        start = int(m.group(1))
+                        end = int(m.group(2)) if m.group(2) else len(body) - 1
+                        end = min(end, len(body) - 1)
+                        data = body[start:end + 1]
+                        status = 206
+                self.send_response(status)
+                self.send_header('Content-Type', 'audio/mpeg')
+                self.send_header('Content-Length', str(len(data)))
+                if status == 206:
+                    self.send_header('Content-Range', f'bytes {start}-{end}/{len(body)}')
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, *a):
+                pass
+
+        srv = http.server.HTTPServer(('127.0.0.1', 0), Handler)
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        self.addCleanup(srv.shutdown)
+        return f'http://127.0.0.1:{srv.server_port}/f.mp3'
+
+    def test_probe_returns_size_speed_and_head(self):
+        body = bytes(range(256)) * 4000   # ~1MB
+        url = self._serve(body)
+        size, speed, head = eng._probe_size_and_speed(
+            url, {'User-Agent': 't'}, 10, sample_bytes=65536)
+        self.assertEqual(size, len(body))
+        self.assertIsNotNone(speed)
+        self.assertEqual(len(head), 65536)
+        self.assertEqual(head, body[:65536])
+
+    def test_download_with_preloaded_matches_full_download(self):
+        """带 preloaded 的下载结果必须与一次性完整下载字节相同。"""
+        body = bytes(range(256)) * 4000
+        url = self._serve(body)
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / 'a.part'
+            # 测试用本地回环地址，而 is_safe_http_url 正确地拒绝本机/内网
+            # （SSRF 防护，另有测试覆盖）。这里只放行这一项校验。
+            with mock.patch.object(eng, 'is_safe_http_url', return_value=True):
+                eng.download_file(url, p, retries=0)
+            self.assertEqual(p.read_bytes(), body)
+
+    def test_falls_back_when_server_ignores_range(self):
+        """服务器忽略 Range（回 200）时不能把 preloaded 拼进去，否则文件损坏。"""
+        body = bytes(range(256)) * 4000
+        url = self._serve(body, range_ok=False)
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / 'b.part'
+            with mock.patch.object(eng, 'is_safe_http_url', return_value=True):
+                eng.download_file(url, p, retries=0)
+            self.assertEqual(p.read_bytes(), body,
+                             '忽略 Range 的服务器必须回退为完整下载')
+
+    def test_probe_tolerates_html_error_page(self):
+        """返回 HTML 错误页时不能当音频测速（speed 为 None）。"""
+        import http.server
+        import threading
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                payload = b'<html>error</html>'
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/html')
+                self.send_header('Content-Length', str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *a):
+                pass
+
+        srv = http.server.HTTPServer(('127.0.0.1', 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.shutdown)
+        url = f'http://127.0.0.1:{srv.server_port}/x'
+        size, speed, head = eng._probe_size_and_speed(url, {'User-Agent': 't'}, 10)
+        self.assertIsNone(speed)
 
 
 if __name__ == '__main__':
