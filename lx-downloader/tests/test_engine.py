@@ -1562,5 +1562,49 @@ class MultiArtistMatchTest(unittest.TestCase):
             self.assertTrue(eng.artist_matches_downloaded('x', '周杰伦'))
 
 
+class ConfigPersistenceTest(unittest.TestCase):
+    """GUI 与命令行共用同一份配置文件；min_quality 必须能存能读。
+
+    之前 GUI 的设置全是易失的 useState，重启全部丢失；
+    而引擎配置里连 min_quality 这个键都没有，--min-quality 的默认值
+    是写死的 320k，用户改完下次启动又回到 320k。
+    """
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.addCleanup(self.td.cleanup)
+        self.cfg = Path(self.td.name) / 'cfg.json'
+        self._orig = eng.CONFIG_PATH
+        eng.CONFIG_PATH = self.cfg
+        self.addCleanup(lambda: setattr(eng, 'CONFIG_PATH', self._orig))
+
+    def test_defaults_include_min_quality(self):
+        cfg = eng.load_config()
+        self.assertIn('min_quality', cfg)
+        self.assertIn(cfg['min_quality'], ('128k', '192k', '320k', 'flac', 'flac24bit'))
+
+    def test_save_and_reload_min_quality(self):
+        cfg = eng.load_config()
+        cfg['min_quality'] = '192k'
+        cfg['workers'] = 5
+        eng.save_config(cfg)
+        again = eng.load_config()
+        self.assertEqual(again['min_quality'], '192k')
+        self.assertEqual(again['workers'], 5)
+
+    def test_unknown_keys_are_ignored_on_load(self):
+        """配置文件里混入未知键不应影响读取（也便于向前兼容）。"""
+        eng.save_config({'quality': 'flac', 'bogus': 1})
+        cfg = eng.load_config()
+        self.assertEqual(cfg['quality'], 'flac')
+        self.assertNotIn('bogus', cfg)
+
+    def test_corrupt_config_falls_back_to_defaults(self):
+        self.cfg.write_text('{not json', encoding='utf-8')
+        cfg = eng.load_config()
+        self.assertIn('quality', cfg)
+        self.assertIn('min_quality', cfg)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

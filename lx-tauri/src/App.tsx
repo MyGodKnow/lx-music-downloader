@@ -459,6 +459,56 @@ function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // 启动时读取持久化设置。
+  // 设置存在引擎的 %APPDATA%\lx-downloader-config.json（与命令行界面共用），
+  // 这样「音质 / 最低音质 / 并发 / 下载目录」改完重启就不会丢。
+  // 读失败不阻断界面：只是回到各 state 的默认值。
+  useEffect(() => {
+    let cancelled = false;
+    void invoke<Record<string, unknown>>("read_settings", { python: pythonPath || null })
+      .then((cfg) => {
+        if (cancelled || !cfg) return;
+        if (typeof cfg.quality === "string") setQuality(cfg.quality);
+        if (typeof cfg.fallback_quality === "boolean") setFallback(cfg.fallback_quality);
+        if (typeof cfg.min_quality === "string") setMinQuality(cfg.min_quality);
+        if (typeof cfg.workers === "number") setWorkers(cfg.workers);
+        // 目录与数据库路径为空时保持界面默认（空串表示「自动探测」）
+        if (typeof cfg.dir === "string") setDir(cfg.dir);
+        if (typeof cfg.db === "string") setDbPath(cfg.db);
+      })
+      .catch(() => { /* 读不到就用默认值 */ });
+    return () => { cancelled = true; };
+    // 只在挂载时读一次；pythonPath 变化不该重新覆盖用户当前选择
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // 设置变化时持久化（防抖 600ms）。
+  // 这些控件都是用户在界面里直接改的，改动即保存比「点保存按钮」更顺手；
+  // 防抖是为了避免拖动数值输入框时每敲一下就起一个引擎子进程。
+  // 首次挂载时也会触发一次，但那次写入的就是刚读出来的值，无副作用。
+  const settingsReady = useRef(false);
+  useEffect(() => {
+    // 跳过挂载后的第一次（此时 read_settings 可能还没回来，
+    // 直接写会把用户已保存的设置覆盖成 state 默认值）。
+    if (!settingsReady.current) {
+      settingsReady.current = true;
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      void invoke("save_settings", {
+        patch: {
+          quality,
+          fallback_quality: fallback,
+          min_quality: minQuality,
+          workers,
+          dir,
+        },
+        python: pythonPath || null,
+      }).catch(() => { /* 保存失败不打断使用 */ });
+    }, 600);
+    return () => window.clearTimeout(timer);
+  }, [quality, fallback, minQuality, workers, dir, pythonPath]);
+
   // 自动滚到底部：节流到 200ms 一次，且只在用户没有手动上翻时滚动。
   // 每条日志都 smooth scroll 会在批量下载时明显掉帧。
   useEffect(() => {

@@ -2140,6 +2140,9 @@ def load_config():
         'dir': DOWNLOAD_DIR,
         'quality': '320k',
         'fallback_quality': False,
+        # 降级时允许的最低音质。GUI 里是可选项，必须持久化，
+        # 否则用户每次改完、下次启动又回到默认 320k。
+        'min_quality': '320k',
         # 默认并发 6。
         #
         # 实测（12 首 320k，取链接已改为「并行竞速」后）：
@@ -2327,8 +2330,15 @@ def run():
                         help='音质代码（默认使用设置值；设置菜单使用 1-5）')
     parser.add_argument('--fallback-quality', action='store_true', default=config['fallback_quality'],
                         help='下载失败时自动逐级降低音质')
-    parser.add_argument('--min-quality', default='320k', choices=['128k', '192k', '320k', 'flac', 'flac24bit'],
-                        help='降级时允许的最低音质（默认 320k，不降到其下）')
+    parser.add_argument('--min-quality', default=config.get('min_quality', '320k'),
+                        choices=['128k', '192k', '320k', 'flac', 'flac24bit'],
+                        help='降级时允许的最低音质（默认使用设置值）')
+    # 设置持久化：GUI 用这两个命令读写同一个配置文件，
+    # 这样 GUI 与命令行界面共享一份设置，不会出现「两套默认值」。
+    parser.add_argument('--dump-config', action='store_true',
+                        help='以 JSON 输出当前持久化设置（GUI 启动时读取）')
+    parser.add_argument('--save-config', default=None, metavar='JSON',
+                        help='把 JSON 里的字段合并进配置文件（GUI 保存设置用）')
     # --dir 默认留空（而不是直接取设置值），是为了区分「用户显式指定」与「用默认」：
     # --retry-failed 没带目录时，下载目录必须等于失败清单所在目录，
     # 否则读的是一份清单、写的又是另一份，成功的歌永远移不出去。
@@ -2379,6 +2389,30 @@ def run():
     # GUI 优雅停止：先挂上信号文件监听，再做后续耗时操作。
     if args.stop_file:
         watch_stop_file(args.stop_file)
+
+    # ---- 设置读写：不需要数据库/歌单，尽早处理 ----
+    # 放在最前面：GUI 启动时要立刻拿到设置，不该被任何探测拖慢。
+    if getattr(args, 'dump_config', False):
+        print(json.dumps(load_config(), ensure_ascii=False), flush=True)
+        return 0
+    if getattr(args, 'save_config', None) is not None:
+        try:
+            patch = json.loads(args.save_config)
+            if not isinstance(patch, dict):
+                raise ValueError('保存内容必须是 JSON 对象')
+        except Exception as exc:
+            print(f'[错误] 设置格式无效: {exc}', file=sys.stderr, flush=True)
+            return 1
+        merged = load_config()
+        # 只接受已知字段，避免 GUI 传错键把配置文件污染成无法自愈的形态
+        merged.update({k: v for k, v in patch.items() if k in merged})
+        try:
+            save_config(merged)
+        except OSError as exc:
+            print(f'[错误] 保存设置失败: {exc}', file=sys.stderr, flush=True)
+            return 1
+        print(json.dumps(merged, ensure_ascii=False), flush=True)
+        return 0
 
     # ---- 失败清单模式：不碰数据库/歌单，先于一切探测处理 ----
     # （放在 --search 之前：两者都走「无歌单」路径，且重试最需要尽快拉起下载）

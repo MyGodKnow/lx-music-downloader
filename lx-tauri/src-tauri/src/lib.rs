@@ -1814,6 +1814,44 @@ fn run_engine_json(
     Ok(line.to_string())
 }
 
+/// 读取持久化设置（GUI 启动时调用）。
+///
+/// 设置存在引擎那边的 `%APPDATA%\lx-downloader-config.json`，
+/// 与命令行界面共用同一份文件——否则会出现「GUI 一套默认值、
+/// 命令行另一套」的分裂，用户改了一边另一边不生效。
+#[tauri::command]
+async fn read_settings(python: Option<String>) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let text = run_engine_json(python.as_ref(), vec!["--dump-config".into()], 30, "读取设置")?;
+        serde_json::from_str(&text).map_err(|e| format!("设置解析失败: {e}"))
+    })
+    .await
+    .map_err(|e| format!("任务执行失败: {e}"))?
+}
+
+/// 保存设置（GUI 修改后调用）。
+///
+/// 只把 GUI 真正管理的字段传下去；引擎侧还会再做一次白名单过滤，
+/// 避免误传的键污染配置文件。
+#[tauri::command]
+async fn save_settings(
+    patch: serde_json::Value,
+    python: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let payload = serde_json::to_string(&patch).map_err(|e| format!("设置序列化失败: {e}"))?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let text = run_engine_json(
+            python.as_ref(),
+            vec!["--save-config".into(), payload],
+            30,
+            "保存设置",
+        )?;
+        serde_json::from_str(&text).map_err(|e| format!("设置解析失败: {e}"))
+    })
+    .await
+    .map_err(|e| format!("任务执行失败: {e}"))?
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1845,7 +1883,9 @@ pub fn run() {
             check_update,
             download_update,
             export_songs,
-            save_text_file
+            save_text_file,
+            read_settings,
+            save_settings
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
