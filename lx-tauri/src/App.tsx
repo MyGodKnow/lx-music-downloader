@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
 import { listen } from "@tauri-apps/api/event";
@@ -1119,7 +1119,10 @@ let path: string | null = null;
     };
   }, [stopping, addLog]);
 
-  const okCount = logs.filter((l) => l.kind === "ok").length;
+  // 统计成功行数。原来直接 `logs.filter(...)` 写在渲染体里，
+  // 而下载中 progress 事件频繁触发重渲染，等于每次绘制都全量扫一遍
+  // （最多 800 条）——用 useMemo 只在 logs 变化时才重算。
+  const okCount = useMemo(() => logs.filter((l) => l.kind === "ok").length, [logs]);
   const pickedSongs = results.filter((s) => picked.has(songKey(s)));
 
   const NAV: [Tab, string, React.ReactNode][] = [
@@ -2114,7 +2117,15 @@ function tabTitle(tab: Tab): string {
   return map[tab];
 }
 
-function LogView({
+/**
+ * 日志区。
+ *
+ * 用 memo 包一层：下载过程中 `progress` 事件每几百毫秒就来一次，
+ * 每次都会让 App 重渲染。若不隔离，这里最多 800 个日志节点会被
+ * 重新 diff 一遍（`logs` 引用没变也照算），纯属浪费。
+ * 只有 `logs` 真正变化时才需要重画。
+ */
+const LogView = memo(function LogView({
   logs,
   logEndRef,
 }: {
@@ -2136,6 +2147,6 @@ function LogView({
       <div ref={logEndRef} />
     </div>
   );
-}
+});
 
 export default App;
