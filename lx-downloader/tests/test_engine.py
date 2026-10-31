@@ -1785,5 +1785,57 @@ class InflightDedupTest(unittest.TestCase):
         self.assertEqual(a, b)
 
 
+class SpeedSampleGuardTest(unittest.TestCase):
+    """样本太小时算出的速度不可用于分片决策。
+
+    sample_bytes=1（只为读 Content-Range）时，「1 字节 / 整个往返耗时」
+    会把连接建立时间算进分母，得出 6 字节/秒 这种荒谬值。
+    这种速度一旦被 _choose_parts 采用，会误判成「被限速」而强制分片。
+    """
+
+    BODY = bytes(range(256)) * 4000
+
+    def test_tiny_sample_returns_no_speed(self):
+        import http.server
+        import threading
+        body = self.BODY
+
+        class H(http.server.BaseHTTPRequestHandler):
+            protocol_version = 'HTTP/1.1'
+
+            def do_GET(self):
+                rng = self.headers.get('Range')
+                m = re.match(r'bytes=(\d+)-(\d*)', rng) if rng else None
+                s = int(m.group(1))
+                e = int(m.group(2)) if m.group(2) else len(body) - 1
+                e = min(e, len(body) - 1)
+                data = body[s:e + 1]
+                self.send_response(206)
+                self.send_header('Content-Type', 'audio/mpeg')
+                self.send_header('Content-Range', f'bytes {s}-{e}/{len(body)}')
+                self.send_header('Content-Length', str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, *a):
+                pass
+
+        srv = http.server.HTTPServer(('127.0.0.1', 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.shutdown)
+        url = f'http://127.0.0.1:{srv.server_port}/f.mp3'
+
+        size, speed, head = eng._probe_size_and_speed(url, {'User-Agent': 't'}, 10, sample_bytes=1)
+        self.assertEqual(size, len(body), '总大小仍然要拿到')
+        self.assertIsNone(speed, '1 字节样本不能给出可用速度')
+        self.assertEqual(len(head), 1)
+
+    def test_normal_sample_still_reports_speed(self):
+        self.assertIsNotNone(eng._choose_parts(10 * 1024 * 1024, None))
+        # None 速度时保守取 4 片（原行为不能变）
+        self.assertEqual(eng._choose_parts(10 * 1024 * 1024, None), 4)
+        self.assertEqual(eng._choose_parts(500 * 1024, None), 1)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

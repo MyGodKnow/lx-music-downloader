@@ -1175,7 +1175,14 @@ def _probe_size_and_speed(url, headers, timeout, sample_bytes=256 * 1024):
                 got += len(chunk)
             head = b''.join(chunks)
         dt = time.time() - t0
-        speed = (got / dt) if (dt > 0 and got > 0) else None
+        # 样本太小（例如 sample_bytes=1，只为取 Content-Range）时，
+        # 「读到的字节数 / 整个往返耗时」会把连接建立时间算进分母，
+        # 得出 6 字节/秒 这种荒谬速度。这种速度不可用于分片决策，
+        # 直接返回 None（调用方据此走「不分片」的安全默认）。
+        if got < 16 * 1024:
+            speed = None
+        else:
+            speed = (got / dt) if (dt > 0 and got > 0) else None
         return total_size, speed, head
     except Exception:
         return None, None, b''
