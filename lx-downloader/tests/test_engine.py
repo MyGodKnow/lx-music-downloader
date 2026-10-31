@@ -1424,5 +1424,68 @@ class DbConnectionLeakTest(unittest.TestCase):
             self.assertEqual(cur.fetchone()['v'], 1)
 
 
+class StopRecordsUnfinishedTest(unittest.TestCase):
+    """用户主动停止后，未完成的歌必须留在失败清单里。
+
+    原先「停止」的歌既不算 success 也不进 fail_list。若这首歌本来不在
+    清单里（首次下载），它就彻底消失了——用户下次点「重试上次失败的歌」
+    看不到它，只能自己回忆还差哪些。
+    """
+
+    def _make_args(self, td):
+        args = type('A', (), {})()
+        args.node = None
+        args.api = None
+        args.api_dir = os.path.join(os.environ.get('APPDATA', td), 'lx-downloader-sources')
+        args.dir = td
+        args.quality = '320k'
+        args.fallback_quality = False
+        args.min_quality = '320k'
+        args.workers = 2
+        args.exclude = ''
+        args.max = 0
+        return args
+
+    def test_stopped_songs_land_in_failed_txt(self):
+        eng.reset_dir_index()
+        eng.DOWNLOAD_STOP_EVENT.clear()
+        with tempfile.TemporaryDirectory() as td:
+            args = self._make_args(td)
+            songs = [
+                {'id': '', 'name': '不存在的歌A', 'singer': '歌手A',
+                 'source': 'kw', 'interval': '03:00', 'meta': '{}'},
+                {'id': '', 'name': '不存在的歌B', 'singer': '歌手B',
+                 'source': 'kw', 'interval': '03:00', 'meta': '{}'},
+            ]
+
+            # 不联网：把音源服务替换成一个「永远不返回」的桩，
+            # 然后立刻置停止位，模拟用户点了停止。
+            class _DeadServer:
+                def get_urls(self, *a, **k):
+                    eng.DOWNLOAD_STOP_EVENT.set()
+                    raise InterruptedError('用户请求停止')
+
+                def search_by_name_list(self, *a, **k):
+                    eng.DOWNLOAD_STOP_EVENT.set()
+                    raise InterruptedError('用户请求停止')
+
+                def close(self):
+                    pass
+
+            with mock.patch.object(eng, 'UrlServer') as srv_cls,                     mock.patch.object(eng, 'check_sources', return_value=None),                     mock.patch.object(eng, 'find_node', return_value='node'),                     mock.patch.object(eng, 'detect_database', return_value=None):
+                srv_cls.return_value.start.return_value = _DeadServer()
+                try:
+                    eng.run_download(args, songs, db_path=None, title=None)
+                finally:
+                    eng.DOWNLOAD_STOP_EVENT.clear()
+
+            items = eng.load_failed_songs(td)
+            names = {it['name'] for it in items}
+            self.assertIn('不存在的歌A', names, '停止后未完成的歌必须记入失败清单')
+            self.assertIn('不存在的歌B', names)
+            for it in items:
+                self.assertTrue(it['error'], '必须有明确原因，便于用户判断')
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

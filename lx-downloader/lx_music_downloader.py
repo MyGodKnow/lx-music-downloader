@@ -2932,6 +2932,33 @@ def run_download(args, songs, db_path=None, title=None):
             fail_list = []
         print(f'二次重试完成：仍失败 {len(fail_list)} 首。')
 
+    # 被动停止时，把「本次还没轮到下载」的歌补进失败清单。
+    #
+    # 为什么必须补：用户点「停止」后，未被派发的歌与在途但被中断的歌
+    # 既不算 success 也不进 fail_list。它们若不在旧清单里（首次下载），
+    # 就会**彻底消失**——用户下次点「重试上次失败的歌」根本看不到它们，
+    # 只能自己回忆还差哪些。这与「失败要有记录」的设计目标相悖。
+    #
+    # 只在「用户主动停止」时补，且用明确的错误原因，方便区分于真正的下载失败。
+    if stopped_early or DOWNLOAD_STOP_EVENT.is_set():
+        known = {_failed_key({'name': n, 'singer': s}) for n, s, _e in fail_list}
+        intercepted = 0
+        for song in songs:
+            key = _failed_key(song)
+            if key in known or key in resolved_keys:
+                continue
+            # 已存在于磁盘的歌不算「没下」
+            if song_exists_in_dir(download_dir, song['singer'], song['name']):
+                continue
+            fail_list.append((song['name'], song['singer'], '下载被用户停止，尚未完成'))
+            failed_songs.append((song, (song['name'], song['singer'], '下载被用户停止，尚未完成')))
+            known.add(key)
+            intercepted += 1
+        if intercepted:
+            stats['fail'] += intercepted
+            print(f'[提示] 有 {intercepted} 首因停止未完成，已记入失败清单，可稍后重试。',
+                  flush=True)
+
     # 总结
     print('\n' + '=' * 50)
     if DOWNLOAD_STOP_EVENT.is_set():
