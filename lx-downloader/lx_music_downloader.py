@@ -2510,17 +2510,47 @@ def run_download(args, songs, db_path=None, title=None):
     server_local = threading.local()
     servers = []
     servers_lock = threading.Lock()
+    # 预热好的服务队列：主线程并行启动若干个，worker 直接取用。
+    ready_pool = queue.Queue()
+
+    def make_server():
+        server = UrlServer(node_exe, args.api, args.api_dir).start()
+        with servers_lock:
+            servers.append(server)
+        return server
 
     def get_worker_server():
         server = getattr(server_local, 'server', None)
         if server is None:
-            server = UrlServer(node_exe, args.api, args.api_dir).start()
+            # 优先取预热好的实例；池子空了才现起一个
+            try:
+                server = ready_pool.get_nowait()
+            except queue.Empty:
+                server = make_server()
             server_local.server = server
-            with servers_lock:
-                servers.append(server)
         return server
 
-    print('音源服务并行池已就绪，开始下载。\n')
+    # 预热：Node 进程要加载并解析全部音源脚本，单个约 3.5s。
+    # 原实现是「谁先用谁去起」，且完全串行发生在每首歌的第一步里——
+    # 8 个 worker 等于把 ~28s 的启动时间摊进了前几首歌的耗时中，
+    # 用户看到的是「点了下载要等半分钟才出第一条结果」。
+    # 这里在主线程里并行预热，总耗时约等于单个进程的启动时间。
+    worker_cap = max(1, min(32, args.workers))
+    warm_target = min(worker_cap, 8, max(1, len(songs)))
+    if warm_target > 0:
+        t_warm = time.time()
+        with ThreadPoolExecutor(max_workers=warm_target) as warm_pool:
+            futures = [warm_pool.submit(make_server) for _ in range(warm_target)]
+            for fut in as_completed(futures):
+                try:
+                    ready_pool.put(fut.result())
+                except Exception as exc:
+                    print(f'[警告] 音源服务预热失败（稍后会按需重试）: {exc}', file=sys.stderr, flush=True)
+                if DOWNLOAD_STOP_EVENT.is_set():
+                    break
+        print(f'音源服务并行池已就绪（{ready_pool.qsize()} 个，预热 {time.time() - t_warm:.1f}s），开始下载。\n')
+    else:
+        print('音源服务将按需启动，开始下载。\n')
 
     download_dir = Path(args.dir)
     download_dir.mkdir(parents=True, exist_ok=True)
