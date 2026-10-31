@@ -22,6 +22,24 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import lx_music_downloader as eng  # noqa: E402
 
+# MPEG1 Layer3 帧头第三个字节的码率索引（高 4 位）
+_BITRATE_IDX = {320: 0xE0, 192: 0xA0, 160: 0x80, 128: 0x90, 64: 0x50}
+
+
+def make_mp3(path, seconds=4, bitrate_kbps=320):
+    """写一个带有效帧头序列的 MP3，让 mutagen 能解析出时长与码率。
+
+    帧头 0xFF 0xFB <br_idx> 0x00 = MPEG1 Layer3 / <br>kbps / 44100Hz，
+    帧长 144*bitrate/采样率，逐帧重复即可被 mutagen 正确识别。
+    """
+    sample_rate = 44100
+    frame_len = int(144 * bitrate_kbps * 1000 / sample_rate)
+    n_frames = max(1, int(seconds * sample_rate / 1152))
+    header = bytes([0xFF, 0xFB, _BITRATE_IDX[bitrate_kbps], 0x00])
+    with open(path, 'wb') as f:
+        for _ in range(n_frames):
+            f.write(header + b'\x00' * max(0, frame_len - len(header)))
+
 
 class QualityTierTest(unittest.TestCase):
     """音质档位：请求什么档位就按什么门槛验收，且绝不因“更好”而拒收。"""
@@ -710,6 +728,345 @@ class FailedListTest(unittest.TestCase):
             self.assertIn(key, song)
         self.assertEqual(song['name'], '晴天')
         self.assertEqual(json.loads(song['meta']), {})
+
+    def test_failed_to_song_carries_id_and_meta(self):
+        """新版清单会存 id/meta，重试时可直接命中原平台记录。"""
+        song = eng.failed_to_song({
+            'name': '晴天', 'singer': '周杰伦', 'source': 'kw', 'interval': '04:29',
+            'error': '加密格式', 'id': 'kw_186016', 'meta': '{"songId":"186016"}',
+        })
+        self.assertEqual(song['id'], 'kw_186016')
+        self.assertEqual(json.loads(song['meta']), {'songId': '186016'})
+
+    def test_write_reload_keeps_id_and_meta(self):
+        with tempfile.TemporaryDirectory() as td:
+            eng.write_failed_file(td, [{
+                'name': '晴天', 'singer': '周杰伦', 'source': 'kw', 'interval': '04:29',
+                'error': '加密格式', 'id': 'kw_186016', 'meta': '{"songId":"186016"}',
+            }])
+            items = eng.load_failed_songs(td)
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]['id'], 'kw_186016')
+        self.assertEqual(json.loads(items[0]['meta']), {'songId': '186016'})
+
+    def test_old_list_without_id_still_works(self):
+        """老清单没有 id/meta，必须保持兼容（退化为按名搜索）。"""
+        with tempfile.TemporaryDirectory() as td:
+            Path(td, eng.FAILED_FILE_NAME).write_text(
+                eng.FAILED_HEADER_V2 + '\n'
+                + '{"name":"晴天","singer":"周杰伦","source":"kw","interval":"04:29","error":"x"}\n',
+                encoding='utf-8')
+            items = eng.load_failed_songs(td)
+        self.assertEqual(len(items), 1)
+        self.assertNotIn('id', items[0])
+        song = eng.failed_to_song(items[0])
+        self.assertEqual(song['id'], '')
+        self.assertEqual(json.loads(song['meta']), {})
+
+
+class EncryptedContainerTest(unittest.TestCase):
+    """平台加密容器（酷我 .mgg/.mflac、QQ .qmc*）必须被识别出来。
+
+    这类文件头是自定义加密容器，mutagen 解析不出时长与码率，
+    四重校验必然失败。此前不识别会让每首歌白下载几十 MB 后
+    才以「时长校验失败 / 音质不达标」这种误导性原因失败。
+    """
+
+    def test_url_suffix_detected(self):
+        cases = [
+            'http://car-er.kuwo.cn/x/resource/30106/trackmedia/Q0M3004Loxf.mgg',
+            'http://a.b/c/abc.mflac',
+            'http://a.b/c/abc.mflac0',
+            'http://a.b/c/abc.mgg1',
+            'http://a.b/c/abc.mgg?token=abc',
+        ]
+        for url in cases:
+            with self.subTest(url=url):
+                self.assertTrue(eng.is_encrypted_audio_url(url))
+
+    def test_query_string_suffix_not_flagged(self):
+        """只按 URL **路径**判断：查询参数里出现 .mgg 不代表资源本身加密。"""
+        self.assertFalse(eng.is_encrypted_audio_url('https://a.b/x.flac?fname=y.mgg'))
+
+    def test_plain_audio_url_not_flagged(self):
+        cases = [
+            'http://a.b/c/abc.mp3',
+            'http://a.b/c/F000001ziKgJ3o5Ipp.flac',
+            'https://music.163.com/song/media/outer/url?id=1.mp3',
+            'http://a.b/c/abc.m4a',
+        ]
+        for url in cases:
+            with self.subTest(url=url):
+                self.assertFalse(eng.is_encrypted_audio_url(url))
+
+    def test_empty_url_not_flagged(self):
+        self.assertFalse(eng.is_encrypted_audio_url(''))
+        self.assertFalse(eng.is_encrypted_audio_url(None))
+
+    def test_file_magic_detected(self):
+        fd, path = tempfile.mkstemp(suffix='.part')
+        os.close(fd)
+        self.addCleanup(lambda: os.path.exists(path) and os.unlink(path))
+        # 实测酷我 .mgg 容器头：0x29 0x01 + "Uap1P4q75f72"
+        with open(path, 'wb') as f:
+            f.write(b')\x01Uap1P4q75f72' + b'\x00' * 20)
+        self.assertTrue(eng.is_encrypted_audio_file(path))
+
+    def test_normal_audio_file_not_flagged(self):
+        for head in (b'ID3\x04\x00\x00', b'fLaC\x00\x00\x00\x22',
+                     b'OggS', b'\xff\xfb\x90\x00', b'RIFF\x00\x00\x00\x00WAVE'):
+            fd, path = tempfile.mkstemp(suffix='.part')
+            os.close(fd)
+            self.addCleanup(lambda p=path: os.path.exists(p) and os.unlink(p))
+            with open(path, 'wb') as f:
+                f.write(head + b'\x00' * 40)
+            with self.subTest(head=head):
+                self.assertFalse(eng.is_encrypted_audio_file(path))
+
+    def test_encrypted_candidate_is_skipped_before_download(self):
+        """下载前的后缀判断要生效：加密候选不该触发任何网络请求。"""
+        with mock.patch.object(eng, 'download_file') as dl:
+            with self.assertRaises(RuntimeError) as ctx:
+                eng.download_with_candidates(
+                    [{'url': 'http://a.b/c/abc.mgg', 'quality': '320k'}],
+                    Path(tempfile.gettempdir()) / '_never_written',
+                    requested_quality='320k')
+        dl.assert_not_called()
+        self.assertIn('加密格式', str(ctx.exception))
+
+
+class AlternativeSourceTest(unittest.TestCase):
+    """替代源查询：换平台 + 同名，两个条件必须能同时成立。
+
+    曾经写成 `WHERE source != ? AND name != ?`，而 Python 侧又要求
+    name 完全等于当前歌名——两个条件互斥，替代源永远返回空。
+    """
+
+    def _make_db(self):
+        import sqlite3
+        fd, path = tempfile.mkstemp(suffix='.db')
+        os.close(fd)
+        self.addCleanup(lambda: os.path.exists(path) and os.unlink(path))
+        conn = sqlite3.connect(path)
+        conn.execute("""CREATE TABLE my_list_music_info (
+            id TEXT, name TEXT, singer TEXT, source TEXT, interval TEXT, meta TEXT)""")
+        conn.executemany(
+            "INSERT INTO my_list_music_info VALUES (?,?,?,?,?,?)",
+            [
+                ('kw_6739985', '私の言葉', '久保ユリカ', 'kw', '03:38', '{"songId":"6739985"}'),
+                ('wy_30070747', '私の言葉', '久保ユリカ', 'wy', '03:38', '{"songId":30070747}'),
+                ('kw_1', '晴天', '周杰伦', 'kw', '04:29', '{}'),
+                ('wy_2', '晴天 (Live)', '周杰伦', 'wy', '04:30', '{}'),
+            ])
+        conn.commit()
+        conn.close()
+        return path
+
+    def test_returns_same_name_from_other_platform(self):
+        db = self._make_db()
+        rows = eng.get_alternative_sources(db, {
+            'name': '私の言葉', 'singer': '久保ユリカ', 'source': 'kw', 'id': 'kw_6739985'})
+        self.assertEqual([r['source'] for r in rows], ['wy'])
+
+    def test_does_not_return_current_source(self):
+        db = self._make_db()
+        rows = eng.get_alternative_sources(db, {
+            'name': '私の言葉', 'singer': '久保ユリカ', 'source': 'kw', 'id': 'kw_6739985'})
+        self.assertNotIn('kw', [r['source'] for r in rows])
+
+    def test_version_suffix_is_not_alternative(self):
+        """「晴天 (Live)」不是「晴天」的替代源——名字必须严格一致。"""
+        db = self._make_db()
+        rows = eng.get_alternative_sources(db, {
+            'name': '晴天', 'singer': '周杰伦', 'source': 'kw', 'id': 'kw_1'})
+        self.assertEqual(rows, [])
+
+    def test_no_database_returns_empty(self):
+        """单曲下载没有数据库上下文，不能崩。"""
+        self.assertEqual(eng.get_alternative_sources(
+            str(Path(tempfile.gettempdir()) / 'nope.db'),
+            {'name': 'x', 'singer': 'y', 'source': 'kw'}), [])
+
+
+class ReuseAcrossQualitiesTest(unittest.TestCase):
+    """降级序列里同一个候选不该被重复下载。
+
+    flac 档位把 320k 文件判「音质不达标」后，降到 320k 档位时如果整首重下，
+    等于同一份内容下两遍。reuse 缓存让内容校验通过的文件跨档位复用。
+    """
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.addCleanup(self.td.cleanup)
+        self.dir = Path(self.td.name)
+        # 造两个真实可解析的 MP3：320k 与 128k，避免依赖网络。
+        self.audio = self.dir / 'src320.mp3'
+        self._make_mp3(self.audio, bitrate_kbps=320)
+        self.low = self.dir / 'src128.mp3'
+        self._make_mp3(self.low, bitrate_kbps=128)
+
+    # MPEG1 Layer3 帧头第三个字节的码率索引（高 4 位）
+    _BITRATE_IDX = {320: 0xE0, 192: 0xA0, 160: 0x80, 128: 0x90, 64: 0x50}
+
+    def _make_mp3(self, path, seconds=4, bitrate_kbps=320):
+        make_mp3(path, seconds=seconds, bitrate_kbps=bitrate_kbps)
+
+    def test_quality_rejection_keeps_file_for_lower_tier(self):
+        """高档位因音质被拒时，文件要留在 reuse 里供低档位复用。"""
+        reuse = {}
+        with mock.patch.object(eng, 'download_file') as dl:
+            def fake_download(url, dest, **kw):
+                import shutil
+                shutil.copyfile(self.low, dest)   # 128k
+            dl.side_effect = fake_download
+            dest_base = self.dir / 'song'
+            with self.assertRaises(RuntimeError) as ctx:
+                eng.download_with_candidates(
+                    [{'url': 'https://a.b/c.mp3', 'quality': '320k'}],
+                    dest_base, expected_interval='00:04', expected_singer='',
+                    requested_quality='320k', reuse=reuse)
+            self.assertIn('音质不达标', str(ctx.exception))
+        self.assertEqual(dl.call_count, 1)
+        self.assertEqual(len(reuse), 1, '音质不达标时应保留文件供降级复用')
+        kept = Path(next(iter(reuse.values())))
+        self.assertTrue(kept.exists(), f'复用文件应真实存在: {kept}')
+        # 不该把最终文件写出来（.reuse 缓存文件是预期存在的临时产物）
+        self.assertFalse([p for p in self.dir.glob('song.*') if not p.name.endswith('.reuse')])
+
+    def test_lower_tier_reuses_without_second_download(self):
+        reuse = {}
+        calls = []
+
+        def fake_download(url, dest, **kw):
+            import shutil
+            calls.append(url)
+            shutil.copyfile(self.low, dest)   # 128k：320k 档位会被拒
+
+        with mock.patch.object(eng, 'download_file', side_effect=fake_download):
+            with self.assertRaises(RuntimeError):
+                eng.download_with_candidates(
+                    [{'url': 'https://a.b/c.mp3', 'quality': '320k'}],
+                    self.dir / 's1', expected_interval='00:04', expected_singer='',
+                    requested_quality='320k', reuse=reuse)
+            # 降到 128k 档位：应复用，不再下载
+            quality, saved = eng.download_with_candidates(
+                [{'url': 'https://a.b/c.mp3', 'quality': '320k'}],
+                self.dir / 's1', expected_interval='00:04', expected_singer='',
+                requested_quality='128k', reuse=reuse)
+        self.assertEqual(calls, ['https://a.b/c.mp3'], '第二次不应再下载')
+        # 返回的是**实测**音质（文件确实是 128k），不是候选自报的 320k
+        self.assertEqual(quality, '128k')
+        self.assertTrue(Path(saved).exists())
+        self.assertEqual(reuse, {}, '成功后应清空复用缓存')
+
+    def test_bad_content_drops_reuse_entry(self):
+        """内容不合格（时长不符）时，不能把它留在缓存里反复失败。"""
+        bad = self.dir / 'bad.mp3'
+        self._make_mp3(bad, seconds=1)
+        reuse = {'https://a.b/bad.mp3': str(bad)}
+        with self.assertRaises(RuntimeError):
+            eng.download_with_candidates(
+                [{'url': 'https://a.b/bad.mp3', 'quality': '320k'}],
+                self.dir / 's2', expected_interval='05:00', expected_singer='',
+                requested_quality='320k', reuse=reuse)
+        self.assertEqual(reuse, {}, '坏候选必须从缓存剔除')
+
+
+class ActualQualityTest(unittest.TestCase):
+    """日志里的音质标签必须是实测的，不能照抄音源自报值。
+
+    实测样本：音源把 16bit/44.1kHz 的普通 FLAC 报成 flac24bit，
+    直接把自报值打到日志里会误导用户以为下到了 Hi-Res。
+    """
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.addCleanup(self.td.cleanup)
+        self.dir = Path(self.td.name)
+
+    def test_320k_mp3(self):
+        p = self.dir / 'a.mp3'
+        make_mp3(p, bitrate_kbps=320)
+        self.assertEqual(eng.detect_actual_quality(p), '320k')
+
+    def test_128k_mp3(self):
+        p = self.dir / 'b.mp3'
+        make_mp3(p, bitrate_kbps=128)
+        self.assertEqual(eng.detect_actual_quality(p), '128k')
+
+    def test_unparsable_file_returns_empty(self):
+        p = self.dir / 'c.bin'
+        p.write_bytes(b'\x00' * 128)
+        self.assertEqual(eng.detect_actual_quality(p), '')
+
+    def test_missing_file_returns_empty(self):
+        self.assertEqual(eng.detect_actual_quality(self.dir / 'nope.mp3'), '')
+
+
+class QualityHashTest(unittest.TestCase):
+    """酷狗等平台每个音质档有各自的 hash，必须按请求档位挑选。
+
+    曾经的 bug：固定按 320k→128k→flac 取第一个 hash，请求 320k/flac
+    时仍把 128k 的 hash 传给音源，音源返回 128k 后被判「音质不达标」，
+    表现成「这个源什么音质都下不了」。
+    """
+
+    def _row(self, **over):
+        row = {
+            'name': '水手', 'singer': '郑智化', 'source': 'kg', 'interval': '04:52',
+            'meta': json.dumps({
+                'songId': 338293,
+                # 真实数据里顶层 hash 固定是 128k 那个，必须被档位专属值覆盖
+                'hash': 'TOPHASH128',
+                '_qualitys': {
+                    '128k': {'hash': 'HASH128'},
+                    '320k': {'hash': 'HASH320'},
+                    'flac': {'hash': 'HASHFLAC'},
+                },
+            }),
+        }
+        row.update(over)
+        return row
+
+    def test_picks_hash_for_requested_quality(self):
+        self.assertEqual(eng.get_music_info(self._row(), '320k')['hash'], 'HASH320')
+        self.assertEqual(eng.get_music_info(self._row(), 'flac')['hash'], 'HASHFLAC')
+        self.assertEqual(eng.get_music_info(self._row(), '128k')['hash'], 'HASH128')
+
+    def test_top_level_hash_is_overridden(self):
+        """顶层 hash 是 128k 的，必须被请求档位的 hash 覆盖。
+
+        这是「kg 源什么音质都下不了」的根因：之前只在 hash 缺失时才补，
+        顶层那个 128k hash 一直生效，请求 flac 也返回 128k。
+        """
+        info = eng.get_music_info(self._row(), 'flac')
+        self.assertEqual(info['hash'], 'HASHFLAC')
+        self.assertNotEqual(info['hash'], 'TOPHASH128')
+
+    def test_falls_back_to_higher_then_lower(self):
+        """请求 flac 但只声明了 320k 时，用 320k 的 hash（而不是 128k）。"""
+        row = self._row(meta=json.dumps({
+            'songId': 1,
+            '_qualitys': {'128k': {'hash': 'H128'}, '320k': {'hash': 'H320'}},
+        }))
+        self.assertEqual(eng.get_music_info(row, 'flac')['hash'], 'H320')
+        self.assertEqual(eng.get_music_info(row, 'flac24bit')['hash'], 'H320')
+
+    def test_without_quality_keeps_existing_hash(self):
+        """不传 quality 时保持旧行为（用 meta 里的 hash），供 scan_sources 等外部脚本使用。"""
+        self.assertEqual(eng.get_music_info(self._row())['hash'], 'TOPHASH128')
+
+    def test_array_qualitys_supported(self):
+        row = self._row(meta=json.dumps({
+            'songId': 2,
+            'qualitys': [
+                {'type': '128k', 'hash': 'A128'},
+                {'type': '320k', 'hash': 'A320'},
+                {'type': 'flac', 'hash': 'AFLAC'},
+            ],
+        }))
+        self.assertEqual(eng.get_music_info(row, 'flac')['hash'], 'AFLAC')
+        self.assertEqual(eng.get_music_info(row, '320k')['hash'], 'A320')
 
 
 if __name__ == '__main__':

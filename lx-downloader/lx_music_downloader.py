@@ -738,6 +738,14 @@ def parse_failed_txt(text):
                         'interval': str(obj.get('interval') or '').strip(),
                         'error': str(obj.get('error') or '').strip(),
                     }
+                    # 可选字段：老清单没有，新清单会带，用于重试时直查原平台
+                    if obj.get('id'):
+                        item['id'] = str(obj['id'])
+                    meta = obj.get('meta')
+                    if isinstance(meta, dict):
+                        item['meta'] = json.dumps(meta, ensure_ascii=False)
+                    elif meta:
+                        item['meta'] = str(meta)
         if item is None:
             item = _parse_v1_line(line)
         if not item:
@@ -766,17 +774,18 @@ def load_failed_songs(directory):
 def failed_to_song(item):
     """把失败清单条目转换成 run_download 认识的歌曲结构。
 
-    关键：**不写 meta**。失败清单里没有原始平台 ID（也不该存，ID 会失效），
-    所以重试时走「原源 + 按名搜索兜底」：source 只用于决定先问哪个平台，
-    真正的 ID 由 searchByName 现场搜出来，这比拿旧 ID 直查更可靠。
+    id/meta 是「有则用、无则退」的可选字段（v2 早期记录没有）：
+      - 有 id/meta → 重试时直接命中原平台记录，不必重新搜索，命中率最高；
+      - 没有 → source 只用于决定先问哪个平台，真正的 ID 由 searchByName 现场搜。
+    因此这里原样透传，缺失时保持旧行为。
     """
     return {
-        'id': '',
+        'id': str(item.get('id') or ''),
         'name': item['name'],
         'singer': item.get('singer', ''),
         'source': item.get('source', ''),
         'interval': item.get('interval', ''),
-        'meta': '{}',
+        'meta': item.get('meta') or '{}',
     }
 
 
@@ -800,6 +809,11 @@ def write_failed_file(directory, items):
             'interval': item.get('interval', ''),
             'error': item.get('error', ''),
         }
+        # id/meta 可选：有就存，重试时能直接命中原平台记录
+        if item.get('id'):
+            record['id'] = item['id']
+        if item.get('meta'):
+            record['meta'] = item['meta']
         lines.append(json.dumps(record, ensure_ascii=False))
     tmp = path.with_name(path.name + '.tmp')
     try:
@@ -839,6 +853,10 @@ def get_alternative_sources(db_path, song):
     """
     if is_lxmc_file(str(db_path)):
         return []
+    # 数据库不存在/不可读时静默返回空：替代源只是「锦上添花」，
+    # 不该因为它把整首歌的下载流程抛异常（单曲下载、清单重试都可能没有库）。
+    if not Path(str(db_path)).is_file():
+        return []
 
     target_name = strict_song_key(song['name'])
     target_singer = strict_song_key(song['singer'])
@@ -854,14 +872,20 @@ def get_alternative_sources(db_path, song):
     conn = _connect_db_ro(db_path)
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
-    # 先用 SQL 缩小候选集：name 的精确/前缀匹配交给索引与 SQL 过滤，
-    # 避免每次都把整表拉进 Python。带括号的版本后缀用 LIKE 前缀兜住。
+    # 取「同名的其它平台记录」当替代源。
+    #
+    # 这里曾经写成 `WHERE source != ? AND name != ? AND name LIKE ?`，
+    # 而后面的 Python 过滤又要求 `strict_song_key(name) == target_name`：
+    # 「name != 当前歌名」与「name 完全等于当前歌名」互相排斥，
+    # 导致**替代源永远返回空列表**——查一次白查，多平台兜底形同不存在。
+    # 正确条件是「换平台 + 同名」，由 LIKE 前缀先把候选集压小（走索引），
+    # 再由 strict_song_key 做精确复核（把「晴天」与「晴天 (Live)」区分开）。
     cur.execute("""
         SELECT id, name, singer, source, interval, meta
         FROM my_list_music_info
-        WHERE source != ? AND name != ? AND name LIKE ?
+        WHERE source != ? AND name LIKE ?
         ORDER BY CASE source WHEN 'tx' THEN 0 WHEN 'wy' THEN 1 WHEN 'kw' THEN 2 WHEN 'kg' THEN 3 ELSE 4 END
-    """, (song['source'], song['name'], target_name.replace('%', '').replace('_', '') + '%'))
+    """, (song['source'], target_name.replace('%', '').replace('_', '') + '%'))
     cand = [dict(r) for r in cur.fetchall()]
     conn.close()
 
@@ -889,8 +913,47 @@ def get_alternative_sources(db_path, song):
     return rows
 
 
-def get_music_info(row):
-    """从数据库行构建音源所需的 musicInfo"""
+def _pick_quality_field(qualitys, quality, field):
+    """从落雪的 `_qualitys` 表里取指定音质对应的字段（hash / size 等）。
+
+    落雪数据结构形如：
+        {"128k": {"hash": "AAA", "size": "4.47 MiB"},
+         "320k": {"hash": "BBB"}, "flac": {"hash": "CCC"}}
+    各平台/各版本可能用 `qualitys`（数组）而非 `_qualitys`（字典），
+    数组形态里每项形如 {"type": "320k", "hash": "BBB"}，两种都支持。
+
+    按「请求档位 → 更高档位 → 更低档位」的顺序查找：
+    请求 flac 但只有 320k 时用 320k 的 hash，好过直接用 128k 的。
+    """
+    want = str(quality or '').lower()
+    order = ['128k', '192k', '320k', 'flac', 'flac24bit']
+    idx = order.index(want) if want in order else order.index('320k')
+    # 先同级，再从高到低，最后从低到高
+    pref = ([order[idx]]
+            + list(reversed(order[idx + 1:]))
+            + list(reversed(order[:idx])))
+    table = {}
+    if isinstance(qualitys, dict):
+        table = qualitys
+    elif isinstance(qualitys, list):
+        for item in qualitys:
+            if isinstance(item, dict):
+                key = str(item.get('type') or item.get('quality') or '').lower()
+                if key:
+                    table[key] = item
+    for q in pref:
+        entry = table.get(q)
+        if isinstance(entry, dict) and entry.get(field):
+            return entry[field]
+    return None
+
+
+def get_music_info(row, quality=None):
+    """从数据库行构建音源所需的 musicInfo。
+
+    quality：请求的音质档位。传入时会从 `_qualitys` 中挑出该档位专属的
+    hash/字段——酷狗等平台每个档位是不同的 hash，不区分就永远拿 128k。
+    """
     meta = {}
     try:
         meta = json.loads(row['meta'] or '{}')
@@ -913,6 +976,13 @@ def get_music_info(row):
             info['songmid'] = str(sid)
     elif 'songmid' in info and ('songId' not in info or info['songId'] is None):
         info['songId'] = info['songmid']
+    elif info.get('id') is not None and 'songId' not in info:
+        # 失败清单重试路径：meta 里只有 `id`（没有 songId/songmid）时，
+        # 把它补齐成音源脚本普遍读取的字段名。缺这一步时，
+        # 「重试失败的歌」永远拿不到 songId，只能靠按名搜索兜底。
+        info['songId'] = info['id']
+        if 'songmid' not in info:
+            info['songmid'] = str(info['id'])
 
     # 统一剥掉平台前缀：数据库 id 形如 `wy_30070747`、`kw_55219`，
     # 而所有音源要的都是纯 ID（30070747 / 55219）。
@@ -923,11 +993,37 @@ def get_music_info(row):
             stripped = re.sub(r'^[A-Za-z]{2}_', '', val)
             if stripped != val:
                 info[key] = stripped
-    if 'hash' not in info and info.get('_qualitys'):
-        qs = info.get('_qualitys', {})
-        for q in ('320k', '128k', 'flac'):
-            if q in qs and qs[q].get('hash'):
-                info['hash'] = qs[q]['hash']
+    # 酷狗等平台**每个音质档有各自的 hash**，并不是一首歌一个 hash。
+    # 落雪在 meta 顶层也放了 `hash`，但那**固定是 128k 那个**；
+    # 这里以前只在 `'hash' not in info` 时才从 `_qualitys` 里补，于是顶层
+    # 那个 128k hash 一直生效——请求 flac/320k 也拿到 128k 文件，
+    # 随后被「音质不达标」拒掉，表现为「这个源什么音质都下不了」。
+    # 因此必须**主动覆盖**顶层 hash，按请求档位取对应值。
+    # `_qualitys`（字典）与 `qualitys`（数组）两种形态并存，都要认。
+    if quality:
+        for key in ('_qualitys', 'qualitys'):
+            qs = info.get(key)
+            if not qs:
+                continue
+            picked = _pick_quality_field(qs, quality, 'hash')
+            if picked:
+                info['hash'] = picked
+                break
+    if not info.get('hash'):
+        for key in ('_qualitys', 'qualitys'):
+            qs = info.get(key)
+            if isinstance(qs, dict):
+                for q in ('320k', '128k', 'flac'):
+                    entry = qs.get(q)
+                    if isinstance(entry, dict) and entry.get('hash'):
+                        info['hash'] = entry['hash']
+                        break
+            elif isinstance(qs, list):
+                for item in qs:
+                    if isinstance(item, dict) and item.get('hash'):
+                        info['hash'] = item['hash']
+                        break
+            if info.get('hash'):
                 break
     return info
 
@@ -1304,48 +1400,140 @@ def song_exists_in_dir(download_dir, singer, name):
     return None
 
 
+class _QualityShortfall(RuntimeError):
+    """内部信号：下载内容本身合格，只是达不到当前请求的音质档位。
+
+    与「内容不合格」区分开，是为了让跨档位复用（download_with_candidates 的
+    reuse 参数）能保留已下好的文件。它是 RuntimeError 的子类，
+    调用方无需特殊处理，错误文案与语义和普通失败一致。
+    """
+
+
 def download_with_candidates(candidates, dest_base, expected_interval=None, expected_singer=None,
-                             requested_quality='320k'):
+                             requested_quality='320k', reuse=None):
     """尝试多个候选 URL；每个候选都独立临时文件，避免坏链接污染下一个候选。
     可传 expected_singer 做歌手标签校验，防止翻唱版冒充原唱。
     requested_quality 决定音质校验门槛（请求 128k 就按 128k 验收，请求无损就必须真无损）。
     dest_base 为不含扩展名的目标路径；四重校验通过后按文件内容确定真实扩展名
     再落盘（URL 扩展名不可靠，避免把 FLAC 存成假 .mp3）。
+    reuse：可选的 dict，用于跨音质档位复用「已下载且内容校验通过」的文件。
+      降级序列会是 flac → 320k → 192k…，同一个候选在高档位可能因为
+      「音质不达标」被拒，到低档位时又得整首重下一遍；只要时长/版本/歌手
+      已经通过，内容本身是好的，重下纯属浪费带宽。命中时直接从 reuse 取内容指标。
     返回 (音质标签, 实际保存路径)。"""
     errors = []
-    part_path = Path(str(dest_base) + '.part')
+    base_part_path = Path(str(dest_base) + '.part')
     for cand in candidates:
-        safe_unlink(part_path)
+        safe_unlink(base_part_path)
+        url = cand.get('url')
         # 只允许 http(s)：候选 URL 来自第三方音源脚本，若不校验 scheme，
         # `file:///C:/Users/x/.ssh/id_rsa` 会被 urlopen 直接读出来并落成"歌曲文件"。
-        if not is_safe_http_url(cand.get('url')):
+        if not is_safe_http_url(url):
             continue
+        # 平台加密容器（.mgg/.mflac/.qmc*）无法解析时长与码率，四重校验必然失败。
+        # 按后缀先判一次，省掉整首白下载（实测单个 .mgg 有 27MB）。
+        if is_encrypted_audio_url(url):
+            errors.append('加密格式(不可播放)')
+            continue
+        # 本次候选实际使用的临时文件：可能是新下载的，也可能复用上一档位的成果。
+        # 复用文件**不属于**本轮清理范围，因此单独记一个标记。
+        caching = False
+        part_path = base_part_path
         try:
-            download_file(cand['url'], part_path, retries=2)
+            # 同一首歌降到低档位时，若这个候选已经完整通过过一次内容校验，
+            # 直接用它当时测得的文件（内容指标与档位无关，音质门槛另行判定）。
+            cached = (reuse or {}).get(url)
+            if cached and Path(cached).exists():
+                part_path = Path(cached)
+                caching = True
+            else:
+                download_file(url, part_path, retries=2)
+                # 后缀看不出来时按文件头兜底：同一个音源可能用无扩展名的代理地址
+                # 返回加密内容（形如 .../get?id=xxx），只有下载后才知道。
+                if is_encrypted_audio_file(part_path):
+                    raise RuntimeError('加密格式(不可播放)')
             if not verify_duration(part_path, expected_interval):
-                safe_unlink(part_path)
                 raise RuntimeError(f'时长校验失败(预期{expected_interval})')
             if is_rejected_version(part_path):
-                safe_unlink(part_path)
                 raise RuntimeError('版本不符(伴奏/翻唱/卡拉ok等)')
             if not artist_matches_downloaded(part_path, expected_singer):
-                safe_unlink(part_path)
                 raise RuntimeError('歌手不符(疑似翻唱版)')
             if not verify_quality(part_path, requested_quality):
-                safe_unlink(part_path)
-                raise RuntimeError(f'音质不达标(低于 {requested_quality})')
+                # 内容本身没问题，只是这个档位不够高：把文件留给更低档位复用，
+                # 否则 320k 的文件在 flac 档被判掉后，降到 320k 还要再下一遍。
+                # 注意：这里抛出专用异常，绕开下面的通用清理——通用清理会
+                # 把刚存进 reuse 的文件删掉，使复用机制彻底失效。
+                if reuse is not None and not caching:
+                    keep = Path(str(base_part_path) + '.reuse')
+                    try:
+                        if keep.exists():
+                            safe_unlink(keep)
+                        base_part_path.replace(keep)
+                        reuse[url] = str(keep)
+                    except OSError:
+                        pass  # 挪不动就放弃复用，功能不受影响
+                raise _QualityShortfall(f'音质不达标(低于 {requested_quality})')
             final_path = _path_with_ext(dest_base, detect_audio_ext(part_path))
             part_path.rename(final_path)
-            return cand.get('quality', ''), str(final_path)
+            # 已经落盘成正式文件，复用缓存里的路径随之失效，必须摘掉，
+            # 否则同一次运行里降到更低档位会拿到一个不存在的文件。
+            if reuse is not None:
+                reuse.pop(url, None)
+            # 日志里展示**实测**音质：音源脚本自报的 quality 经常虚高
+            # （16bit/44.1kHz 的普通 FLAC 被标成 flac24bit），直接用会误导用户。
+            return (detect_actual_quality(final_path) or cand.get('quality', ''),
+                    str(final_path))
+        except _QualityShortfall as e:
+            errors.append(f"{cand.get('quality', '?')}: {e}")
         except InterruptedError:
             # 用户停止：立刻放弃剩余候选并清掉半成品，不要继续试下一条链接。
-            safe_unlink(part_path)
+            if not caching:
+                safe_unlink(part_path)
             raise
         except Exception as e:
+            # 内容不合格（时长/版本/歌手/加密）时，连同复用缓存一起丢掉，
+            # 免得下一档位继续拿同一份坏文件反复校验。
+            if not caching:
+                safe_unlink(part_path)
+            if reuse is not None and url in reuse:
+                safe_unlink(reuse.pop(url, None))
             errors.append(f"{cand.get('quality', '?')}: {e}")
     # 清理残留 .part
-    safe_unlink(part_path)
+    safe_unlink(base_part_path)
     raise RuntimeError('; '.join(errors))
+
+
+def detect_actual_quality(path):
+    """按文件内容推断**真实**音质档位（用于日志展示，不参与校验）。
+
+    为什么需要它：落盘时记录的「音质标签」一直取音源脚本自报的 `quality`，
+    而脚本经常把自己 16bit/44.1kHz 的普通 FLAC 报成 flac24bit。
+    用户看到的 `[flac24bit]` 因此不可信——实测 32MB/138s 的文件被标成
+    Hi-Res，实际是 16bit。这里按解析结果给出可信档位。
+    无法解析时返回空串，由调用方回退到原标签。
+    """
+    try:
+        from mutagen import File as MFile
+        mf = MFile(path)
+        if mf is None or mf.info is None:
+            return ''
+        if is_lossless_audio(mf):
+            bits = int(getattr(mf.info, 'bits_per_sample', 0) or 0)
+            sr = int(getattr(mf.info, 'sample_rate', 0) or 0)
+            # Hi-Res 判定沿用常见口径：位深 > 16 或采样率 > 48kHz
+            if bits > 16 or sr > 48000:
+                return 'flac24bit'
+            return 'flac'
+        br = int(getattr(mf.info, 'bitrate', 0) or 0)
+        if br >= 320000 * _BITRATE_TOLERANCE:
+            return '320k'
+        if br >= 192000 * _BITRATE_TOLERANCE:
+            return '192k'
+        if br > 0:
+            return '128k'
+    except Exception:
+        pass
+    return ''
 
 
 def lower_quality_options(quality, min_quality='320k'):
@@ -1429,6 +1617,47 @@ def verify_quality(path, quality='320k'):
         return br >= int(min_br * _BITRATE_TOLERANCE)
     except Exception:
         return False
+
+
+# 平台加密容器的魔数。酷我 `.mgg`/`.mflac` 用自定义容器加密，头两字节固定
+# 为 0x29 0x01，后接 11 字节魔数 `Uap1P4q75f72`（实测样本）。
+# QQ 的 `.qmc*`/`.tkm` 系列同属不可直接播放的加密容器。
+#
+# 这类文件**不是**音频，mutagen 解析不出时长与码率，因此四重校验必然拒绝。
+# 早期没有单独识别，表现为「时长校验失败 / 音质不达标」这种误导性错误，
+# 而且要先白下载几十 MB 才失败。这里按文件头判定，尽早给出准确原因。
+_ENCRYPTED_MAGIC = {
+    b')\x01Uap1P4q75f72': 'kuwo-mgg',
+    b'\x9a\x9b\xa2\x11': 'qmc',   # QQ qmc 系列部分版本的头部
+}
+# URL 后缀同样能识别加密格式（音源直接给出 .mgg/.mflac 时无需下载即可判断）
+ENCRYPTED_URL_EXT_RE = re.compile(
+    r'\.(?:mgg|mgg1|mggl|mflac|mflac0|mflach|qmc0|qmc2|qmc3|qmcflac|qmcogg|tkm)(?:$|\?)',
+    re.IGNORECASE,
+)
+
+
+def is_encrypted_audio_url(url):
+    """按 URL 后缀判断是否为平台加密容器。"""
+    if not url:
+        return False
+    try:
+        return bool(ENCRYPTED_URL_EXT_RE.search(urlsplit(str(url)).path or ''))
+    except Exception:
+        return bool(ENCRYPTED_URL_EXT_RE.search(str(url)))
+
+
+def is_encrypted_audio_file(path):
+    """按文件头判断是否为平台加密容器（不是可直接播放的音频）。"""
+    try:
+        with open(path, 'rb') as f:
+            head = f.read(32)
+    except Exception:
+        return False
+    for magic in _ENCRYPTED_MAGIC:
+        if head.startswith(magic):
+            return True
+    return False
 
 
 def detect_audio_ext(path):
@@ -2160,6 +2389,19 @@ def run_download(args, songs, db_path=None, title=None):
         _t0 = time.time()
         _url_cost = 0.0
         _dl_cost = 0.0
+        # 跨音质档位复用的临时文件（见 download_with_candidates 的 reuse 参数）。
+        # 无论成功、失败还是被停止，都要在退出前清掉，否则下载目录会残留 .reuse。
+        verified_files = {}
+        try:
+            return _process_song_inner(idx, song, retry, verified_files)
+        finally:
+            for leftover in list(verified_files.values()):
+                safe_unlink(leftover)
+
+    def _process_song_inner(idx, song, retry, verified_files):
+        _t0 = time.time()
+        _url_cost = 0.0
+        _dl_cost = 0.0
         try:
             if DOWNLOAD_STOP_EVENT.is_set():
                 return 'stopped'
@@ -2209,7 +2451,6 @@ def run_download(args, songs, db_path=None, title=None):
                     continue
                 tried_sources.add(cand['source'])
                 try:
-                    music_info = get_music_info(cand)
                     source = cand['source']
                     # 开启降级时，获取链接、下载和严格时长校验都失败后才切换低音质。
                     quality_levels = lower_quality_options(args.quality, args.min_quality if hasattr(args, 'min_quality') else '320k') if args.fallback_quality else [args.quality]
@@ -2220,6 +2461,10 @@ def run_download(args, songs, db_path=None, title=None):
                             quality_errors.append('单曲时间预算耗尽')
                             break
                         try:
+                            # musicInfo 必须按档位重建：酷狗等平台每个音质档
+                            # 用的是不同的 hash，沿用上一个档位的 hash 会一直
+                            # 拿到低码率文件，然后被判「音质不达标」。
+                            music_info = get_music_info(cand, requested_quality)
                             _tu = time.time()
                             cands = server.get_urls(source, music_info, requested_quality)
                             _url_cost += time.time() - _tu
@@ -2228,7 +2473,8 @@ def run_download(args, songs, db_path=None, title=None):
                             _td = time.time()
                             actual_q, _saved = download_with_candidates(
                                 cands, dest_base, song.get('interval'), song.get('singer'),
-                                requested_quality=requested_quality)
+                                requested_quality=requested_quality,
+                                reuse=verified_files)
                             _dl_cost += time.time() - _td
                             with print_lock:
                                 downgrade_note = f'，自动降级至 {requested_quality}' if requested_quality != args.quality else ''
@@ -2236,7 +2482,14 @@ def run_download(args, songs, db_path=None, title=None):
                                 _print_timing(song, _url_cost, _dl_cost, time.time() - _t0)
                             return 'success'
                         except Exception as quality_error:
-                            quality_errors.append(f'{requested_quality}: {quality_error}')
+                            # download_with_candidates 已经把每个候选的错误
+                            # 前缀成 `quality: ...`，这里只标当前档位，
+                            # 不再嵌一层，否则日志会出现 `320k: 320k: ...`。
+                            msg = str(quality_error)
+                            if msg.startswith(f'{requested_quality}:'):
+                                quality_errors.append(msg)
+                            else:
+                                quality_errors.append(f'{requested_quality}: {msg}')
                     raise RuntimeError('; '.join(quality_errors) or '所有音质均失败')
                 except Exception as e:
                     errors.append(f'{cand["source"]}: {e}')
@@ -2255,12 +2508,35 @@ def run_download(args, songs, db_path=None, title=None):
                 if not cands:
                     raise RuntimeError('按名搜索无候选')
                 _td = time.time()
-                actual_q, _saved = download_with_candidates(
-                    cands, dest_base, song.get('interval'), song.get('singer'),
-                    requested_quality=args.quality)
+                # 降级序列必须和主路径一致：搜到的候选本就以 320k 居多，
+                # 若这里只按 args.quality（例如 flac）验收，即便兜底成功拿到
+                # 一首可用的 320k 也会被直接判「音质不达标」而整首失败——
+                # 这正是「开了自动降级仍大量失败」的来源之一。
+                actual_q = None
+                fallback_errors = []
+                levels = (lower_quality_options(args.quality, args.min_quality)
+                          if args.fallback_quality else [args.quality])
+                for requested_quality in levels:
+                    try:
+                        actual_q, _saved = download_with_candidates(
+                            cands, dest_base, song.get('interval'), song.get('singer'),
+                            requested_quality=requested_quality,
+                            reuse=verified_files)
+                        break
+                    except InterruptedError:
+                        raise
+                    except Exception as quality_error:
+                        msg = str(quality_error)
+                        fallback_errors.append(
+                            msg if msg.startswith(f'{requested_quality}:')
+                            else f'{requested_quality}: {msg}')
+                if actual_q is None:
+                    raise RuntimeError('; '.join(fallback_errors) or '按名搜索候选均不可用')
                 _dl_cost += time.time() - _td
                 with print_lock:
-                    print(f'[成功] {song["name"]} - {song["singer"]} [{actual_q}] (按名搜索)')
+                    note = f'，自动降级至 {actual_q}' if actual_q != args.quality else ''
+                    print(f'[成功] {song["name"]} - {song["singer"]} [{actual_q}]'
+                          f'(按名搜索){note}')
                     _print_timing(song, _url_cost, _dl_cost, time.time() - _t0)
                 return 'success'
             except Exception as e:
@@ -2485,6 +2761,14 @@ def run_download(args, songs, db_path=None, title=None):
             if origin:
                 item['source'] = str(origin.get('source') or '')
                 item['interval'] = str(origin.get('interval') or '')
+                # 保留平台 ID 与 meta：重试时可直接命中原平台记录，
+                # 不必依赖「按名搜索」重新找一遍（搜索接口经常不可用）。
+                # 早先刻意不存 ID，理由是「ID 会失效」；但实测失效远比
+                # 搜不到常见，且 ID 失效时自然会退回搜索，因此保留更有价值。
+                if origin.get('id'):
+                    item['id'] = str(origin['id'])
+                if origin.get('meta'):
+                    item['meta'] = origin['meta']
             merged[_failed_key(item)] = item
         write_failed_file(download_dir, list(merged.values()))
         if fail_list:

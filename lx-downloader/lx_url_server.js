@@ -545,6 +545,25 @@ function urlLooksLossless(url) {
   return /(^|[/._-])(F000|Q000)[0-9A-Za-z]/.test(String(url));
 }
 
+// 平台加密格式：酷我 `.mgg` / `.mflac` 系列，QQ 的部分加密档。
+//
+// 为什么要在这里剔除：这些文件**不是**可直接播放的音频，头几个字节是自定义
+// 加密容器（实测 `.mgg` 形如 `29 01 55 61 ...`），mutagen 解析不出时长与码率，
+// 于是下游「时长校验 / 音质校验」必然失败——表面上像是「音源给了错歌」，
+// 实际是格式根本没法用。此前不做区分，导致这类歌每首都白下载几十 MB 后
+// 才在四项校验里被拒，既浪费带宽又把该音源的成功率算成失败。
+// 正确做法是把它当作「这个源这次没给出可用链接」，继续试其它音源。
+const ENCRYPTED_AUDIO_EXT_RE = /\.(mgg|mgg1|mggl|mflac|mflac0|mflach|qmc0|qmc2|qmc3|qmcflac|qmcogg|tkm)(?:$|\?)/i;
+function urlLooksEncrypted(url) {
+  if (!url) return false;
+  try {
+    const path = new URL(String(url)).pathname;
+    return ENCRYPTED_AUDIO_EXT_RE.test(path);
+  } catch (e) {
+    return ENCRYPTED_AUDIO_EXT_RE.test(String(url));
+  }
+}
+
 // 注意：该计数是**进程内**的。Python 每个下载线程各起一个 Node 进程，
 // 所以对平台的真实总并发 = workers × PLATFORM_MAX_CONCURRENT。
 //
@@ -589,6 +608,8 @@ async function getUrlFromSourceEntry(entry, source, songInfo, quality) {
       url = result.url || (result.data && result.data.url) || (result.url && result.url.url);
     }
     if (url && /^https?:\/\//.test(url)) {
+      // 加密容器下游必然解析失败，直接当作本候选不可用
+      if (urlLooksEncrypted(url)) return null;
       // 明确只要 320k+：返回的 URL 是已知 128k 时直接放弃，避免把低质当高质
       if (urlLooks128k(url) && !urlLooks320(url) && !urlLooksLossless(url)) return null;
       const valid = await checkUrl(url);
@@ -623,6 +644,10 @@ async function searchByName(name, singer, interval) {
   const seenUrls = new Set();
   const addCandidate = (url, quality, via, score) => {
     if (!url || seenUrls.has(url)) return;
+    // 统一在入口过滤加密容器：5 条搜索路径各自判一遍容易漏，
+    // 漏掉的后果是兜底结果里混进不可解析的 .mgg/.mflac，
+    // 下层校验必然失败，等于把兜底机会白白浪费掉。
+    if (urlLooksEncrypted(url)) return;
     seenUrls.add(url);
     candidates.push({ url, quality, via, score });
   };
@@ -1442,6 +1467,13 @@ async function getMusicUrls(source, musicInfo, qualities) {
         bumpSource(entry.name, -1);
         return null;
       }
+      // 加密容器（.mgg/.mflac/...）无法解析时长与码率，下游必然判失败。
+      // 这里就当作「本源无可用链接」，且不记该源失败——这是格式限制，
+      // 不是音源本身不靠谱，记失败会把它错误地推进冷却队列。
+      if (urlLooksEncrypted(url)) {
+        failures.push(`${entry.name}: 加密格式不可用`);
+        return null;
+      }
       // 只丢弃比请求档位更低的 128k 回退
       const wantRank = qualityRank(q);
       const resultQuality = result && typeof result === 'object'
@@ -1514,7 +1546,13 @@ async function getMusicUrls(source, musicInfo, qualities) {
 
   for (const q of qList) {
     if (overDeadline()) break;
-    // 分批复用：每次并发 CONCURRENCY 个，拿到就停
+    // 持续分批探测，直到凑够 targetCount 个候选或音源用尽。
+    //
+    // 这里曾经命中第一个就 break（注释写「够 1 个就能下载」），使 targetCount=2
+    // 成了死代码。后果在真实库里很明显：唯一那个候选若是 19.8s 的试听片段、
+    // 或时长对不上的换版本，Python 端的四重校验一定会拒掉它，而此时既没有
+    // 第二个候选、也没有机会再问下一个音源，整首歌直接判失败。
+    // 多拿一个候选只在「确实有多个源可用」时多花一次请求，却能救回这类歌。
     let idx = 0;
     while (idx < ordered.length && candidates.length < targetCount && !overDeadline()) {
       const batch = ordered.slice(idx, idx + CONCURRENCY);
@@ -1524,9 +1562,8 @@ async function getMusicUrls(source, musicInfo, qualities) {
         seen.add(hit.url);
         candidates.push(hit);
       }
-      if (hit) break;   // 本轮已命中，不再继续下一批（够 1 个就能下载）
     }
-    if (candidates.length > 0) break;   // 已有候选，不再试更高音质档
+    if (candidates.length > 0) break;   // 已有候选，不再试其它音质档
   }
 
   if (!candidates.length) {
@@ -1547,6 +1584,41 @@ async function getMusicUrls(source, musicInfo, qualities) {
     throw err;
   }
   return candidates;
+}
+
+// ⚠️ 已实测排除的方案：酷我 antiserver（antiserver.kuwo.cn/anti.s）
+//   它对多数 rid 返回同一个默认文件、且忽略 br 参数（固定 32kbps），
+//   用它兜底会**下错歌**——比下载失败更糟。宁可不兜底也不给错文件。
+//
+// 当前策略：只保留能通过「时长 + 音质」双重校验的直连路径；
+// 若拿不到可信链接，就如实报错，由上层记录到 failed.txt。
+
+/** 从 musicInfo 里尽力取出「平台 + 该平台的 ID」 */
+function extractPlatformId(musicInfo, source) {
+  const info = musicInfo || {};
+  const raw = info.rid || info.id || info.songId || info.songmid || info.hash || '';
+  let id = String(raw || '').trim();
+  id = id.replace(/^MUSIC_/i, '').replace(/^[a-z]{2}_/i, '');
+  if (!/^\d{3,}$/.test(id)) return null;
+  return { source: String(source || info.source || '').toLowerCase(), id };
+}
+
+/**
+ * 直连兜底总入口：返回候选数组（可能为空）。
+ *
+ * 目前**没有**可信的免签名直链接口可用，因此返回空数组，
+ * 让上层走「按名搜索」或如实报错。保留此函数是为了：
+ *   1. 后续若发现稳定接口，可在此直接补上；
+ *   2. 明确记录「为什么不做兜底」，避免以后又接回会下错歌的接口。
+ *
+ * 注意：这个函数曾在 8522b87 的并行竞速重构里被误删，但调用点还留着。
+ * 由于调用点包在 try/catch 里，删除只表现为「兜底静默失效」而不报错，
+ * 极难从日志发现。改动本文件时请保留它，或连同调用点一起删。
+ */
+async function directFallbackCandidates(musicInfo, source) {
+  const got = extractPlatformId(musicInfo, source);
+  if (!got) return [];
+  return [];
 }
 
 // ========== 主流程 ==========
