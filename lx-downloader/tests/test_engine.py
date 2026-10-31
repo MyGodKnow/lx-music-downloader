@@ -1556,6 +1556,20 @@ class MultiArtistMatchTest(unittest.TestCase):
         """
         self.assertTrue(self._match('林俊杰', '林俊杰、G.E.M. 邓紫棋'))
 
+    def test_han_variants_are_tolerated(self):
+        """日文汉字与简体异体字是同一人，不能判成翻唱。
+
+        实测 `平野綾` vs `平野绫`：文件时长 279.1s 与预期 04:38 完全吻合，
+        内容正确，却因字形不同被拒。
+        """
+        self.assertTrue(self._match('平野綾', '平野绫'))
+        self.assertTrue(self._match('平野绫', '平野綾'))
+
+    def test_trailing_punctuation_is_tolerated(self):
+        """实测 `吐息.` vs `吐息`：同一歌手，尾随句点不该影响判断。"""
+        self.assertTrue(self._match('吐息.', '吐息'))
+        self.assertTrue(self._match('吐息', '吐息.'))
+
     def test_unrelated_artist_is_rejected(self):
         """与预期毫无交集仍要拒绝（真翻唱）。"""
         self.assertFalse(self._match('RyaVocal', '周杰伦'))

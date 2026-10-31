@@ -2155,6 +2155,19 @@ def read_artist_tag(path):
         return []
 
 
+# 中日文异体字 → 统一写法。只收录实测会遇到的高频字，
+#
+# 用途仅限**歌手名比对**：不同平台/标签把同一位歌手的名字写成日文汉字或
+# 简体字（实测 `平野綾` vs `平野绫`，时长 279.1s 与预期 04:38 完全吻合，
+# 内容正确却因名字字形被判成翻唱版）。
+# 绝不用于歌名比对——歌名必须严格区分「晴天」与「晴天 (Live)」。
+_HAN_VARIANT_TABLE = {
+    '綾': '绫', '澤': '泽', '黒': '黑', '浜': '滨', '辺': '边', '広': '广',
+    '徳': '德', '恵': '惠', '絵': '绘', '拡': '扩', '楽': '乐', '桜': '樱',
+    '壁': '壁', '斎': '斋', '竜': '龙', '渕': '渊', '髙': '高', '﨑': '崎',
+}
+
+
 def artist_matches_downloaded(path, expected_singer):
     """若文件带 artist 标签，校验其中是否有与预期歌手匹配的项。
 
@@ -2190,10 +2203,23 @@ def artist_matches_downloaded(path, expected_singer):
     # 安全性：仍然拒绝真正的翻唱（标签歌手与预期毫无交集），
     # 而且时长校验、版本词校验、音质校验都还在，不会因此放进错歌。
     split_re = r'[、,，;&/]'
-    exp_parts = [strict_song_key(x) for x in re.split(split_re, expected_singer) if x.strip()]
+    # 歌手名用**专用**归一化，比歌名的 strict_song_key 再宽两点。
+    # 这两点都是实测到的真实误杀（时长、码率都对，只是名字写法不同）：
+    #   1. 中日文异体字：`平野綾`（日文）vs `平野绫`（简体），同一人
+    #   2. 尾随标点：`吐息.` vs `吐息`
+    # 注意**不能**把这套规则加到 strict_song_key 上——那里必须严格区分
+    # 「晴天」与「晴天 (Live)」，放宽会下错歌。歌手校验是另一回事：
+    # 它只用来排除翻唱，容忍异体字不会让人把翻唱当成原唱。
+    def _norm_artist(x):
+        key = strict_song_key(x)
+        # 逐字映射异体字（_HAN_VARIANT_TABLE 是「字 → 统一字」表）
+        key = ''.join(_HAN_VARIANT_TABLE.get(ch, ch) for ch in key)
+        return key.rstrip('.．·・`\'" ')
+
+    exp_parts = [_norm_artist(x) for x in re.split(split_re, expected_singer) if x.strip()]
     tag_norms = []
     for a in tags:
-        tag_norms.extend(strict_song_key(x) for x in re.split(split_re, str(a)) if x.strip())
+        tag_norms.extend(_norm_artist(x) for x in re.split(split_re, str(a)) if x.strip())
     exp_parts = [e for e in exp_parts if e]
     tag_norms = [t for t in tag_norms if t]
     if not exp_parts or not tag_norms:
