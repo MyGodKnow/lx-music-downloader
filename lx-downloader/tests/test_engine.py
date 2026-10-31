@@ -15,6 +15,7 @@ import sys
 import json
 import re
 import shutil
+import sqlite3
 import tempfile
 import time
 import unittest
@@ -1333,6 +1334,94 @@ class TruncatedDownloadTest(unittest.TestCase):
             with mock.patch.object(eng, 'is_safe_http_url', return_value=True):
                 eng.download_file(url, p, retries=0)
             self.assertEqual(p.read_bytes(), self.BODY)
+
+
+class DbConnectionLeakTest(unittest.TestCase):
+    """只读数据库连接必须在异常路径也关闭。
+
+    原写法 `conn = _connect_db_ro(...)` ... `conn.close()` 一旦中间抛异常
+    就泄漏连接，每个连接持有文件句柄，批量下载几百首可能耗尽句柄。
+    这里用包装对象记录 close 是否被调用（sqlite3.Connection 的实例属性
+    不可写，故不能直接打补丁）。
+    """
+
+    def _make_db(self):
+        import sqlite3
+        fd, path = tempfile.mkstemp(suffix='.db')
+        os.close(fd)
+        self.addCleanup(lambda: os.path.exists(path) and os.unlink(path))
+        conn = sqlite3.connect(path)
+        conn.execute("""CREATE TABLE my_list_music_info (
+            id TEXT, name TEXT, singer TEXT, source TEXT, interval TEXT, meta TEXT)""")
+        conn.execute("""CREATE TABLE my_list_music_info_order (
+            listId TEXT, musicInfoId TEXT, "order" INTEGER)""")
+        conn.execute("CREATE TABLE my_list (id TEXT, name TEXT, position INTEGER)")
+        conn.commit()
+        conn.close()
+        return path
+
+    def test_closes_on_exception(self):
+        db = self._make_db()
+        state = {'closed': 0}
+        real = sqlite3.connect
+
+        def fake_connect(*a, **k):
+            conn = real(*a, **k)
+            state['closed'] += 0
+
+            class Wrapper:
+                row_factory = None
+
+                def cursor(self):
+                    return conn.cursor()
+
+                def execute(self, *aa):
+                    return conn.execute(*aa)
+
+                def close(self):
+                    state['closed'] += 1
+                    return conn.close()
+
+            return Wrapper()
+
+        with mock.patch.object(eng.sqlite3, 'connect', side_effect=fake_connect):
+            with self.assertRaises(RuntimeError):
+                with eng._db_ro(db) as conn:
+                    conn.execute('SELECT 1')
+                    raise RuntimeError('boom inside')
+        self.assertEqual(state['closed'], 1, '异常路径也必须 close')
+
+    def test_closes_on_success(self):
+        db = self._make_db()
+        state = {'closed': 0}
+        real = sqlite3.connect
+
+        def fake_connect(*a, **k):
+            conn = real(*a, **k)
+
+            class Wrapper:
+                row_factory = None
+
+                def cursor(self):
+                    return conn.cursor()
+
+                def close(self):
+                    state['closed'] += 1
+                    return conn.close()
+
+            return Wrapper()
+
+        with mock.patch.object(eng.sqlite3, 'connect', side_effect=fake_connect):
+            with eng._db_ro(db) as conn:
+                conn.cursor().execute('SELECT 1').fetchone()
+        self.assertEqual(state['closed'], 1)
+
+    def test_row_factory_is_set(self):
+        db = self._make_db()
+        with eng._db_ro(db) as conn:
+            cur = conn.cursor()
+            cur.execute('SELECT 1 AS v')
+            self.assertEqual(cur.fetchone()['v'], 1)
 
 
 if __name__ == '__main__':

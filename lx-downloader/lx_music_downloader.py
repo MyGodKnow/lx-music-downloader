@@ -31,6 +31,7 @@ lx_music_downloader.py - 落雪音乐歌单一键下载器
   python lx_music_downloader.py --retry-failed D:/Music   # 只补下该目录 failed.txt 里的歌
 """
 import argparse
+import contextlib
 import ipaddress
 import json
 import os
@@ -833,6 +834,25 @@ def _connect_db_ro(db_path):
     return sqlite3.connect(f'file:{db_path}?mode=ro', uri=True)
 
 
+@contextlib.contextmanager
+def _db_ro(db_path):
+    """只读数据库连接的上下文管理器：保证异常路径也会关闭连接。
+
+    直接用 `conn = _connect_db_ro(...)` 再 `conn.close()` 的写法，
+    一旦中间的 execute/转换抛异常就会泄漏连接——每个连接持有文件句柄，
+    批量下载（几百首）时可能把句柄耗尽，表现成后续查询全部失败。
+    """
+    conn = _connect_db_ro(db_path)
+    try:
+        conn.row_factory = sqlite3.Row
+        yield conn
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
 # 替代源查询缓存：同一进程内同一首歌只查一次库。
 # 16 并发下每首歌都开一次「全表拉取 + Python 过滤」会造成明显的数据库争用，
 # 缓存后既少开连接也少做重复过滤。key = (db_path, song_id)。
@@ -869,9 +889,6 @@ def get_alternative_sources(db_path, song):
     if cached is not None:
         return [dict(r) for r in cached]
 
-    conn = _connect_db_ro(db_path)
-    conn.row_factory = sqlite3.Row
-    cur = conn.cursor()
     # 取「同名的其它平台记录」当替代源。
     #
     # 这里曾经写成 `WHERE source != ? AND name != ? AND name LIKE ?`，
@@ -880,14 +897,15 @@ def get_alternative_sources(db_path, song):
     # 导致**替代源永远返回空列表**——查一次白查，多平台兜底形同不存在。
     # 正确条件是「换平台 + 同名」，由 LIKE 前缀先把候选集压小（走索引），
     # 再由 strict_song_key 做精确复核（把「晴天」与「晴天 (Live)」区分开）。
-    cur.execute("""
-        SELECT id, name, singer, source, interval, meta
-        FROM my_list_music_info
-        WHERE source != ? AND name LIKE ?
-        ORDER BY CASE source WHEN 'tx' THEN 0 WHEN 'wy' THEN 1 WHEN 'kw' THEN 2 WHEN 'kg' THEN 3 ELSE 4 END
-    """, (song['source'], target_name.replace('%', '').replace('_', '') + '%'))
-    cand = [dict(r) for r in cur.fetchall()]
-    conn.close()
+    with _db_ro(db_path) as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id, name, singer, source, interval, meta
+            FROM my_list_music_info
+            WHERE source != ? AND name LIKE ?
+            ORDER BY CASE source WHEN 'tx' THEN 0 WHEN 'wy' THEN 1 WHEN 'kw' THEN 2 WHEN 'kg' THEN 3 ELSE 4 END
+        """, (song['source'], target_name.replace('%', '').replace('_', '') + '%'))
+        cand = [dict(r) for r in cur.fetchall()]
 
     rows = []
     seen = set()
@@ -1030,43 +1048,39 @@ def get_music_info(row, quality=None):
 
 def list_playlists(db_path):
     """列出所有歌单"""
-    conn = _connect_db_ro(db_path)
-    conn.row_factory = sqlite3.Row
-    cur = conn.cursor()
-    # 默认列表、收藏列表（内置）
     result = []
-    for lid, lname in (('default', '默认列表'), ('love', '我的收藏')):
-        cur.execute("SELECT COUNT(*) FROM my_list_music_info_order WHERE listId=?", (lid,))
-        cnt = cur.fetchone()[0]
-        if cnt > 0:
-            result.append({'id': lid, 'name': lname, 'cnt': cnt})
-    # 自定义歌单
-    cur.execute("""
-        SELECT ml.id, ml.name,
-               (SELECT COUNT(*) FROM my_list_music_info_order mio WHERE mio.listId = ml.id) as cnt
-        FROM my_list ml
-        ORDER BY ml.position
-    """)
-    for r in cur.fetchall():
-        result.append({'id': r[0], 'name': r[1], 'cnt': r[2]})
-    conn.close()
+    with _db_ro(db_path) as conn:
+        cur = conn.cursor()
+        # 默认列表、收藏列表（内置）
+        for lid, lname in (('default', '默认列表'), ('love', '我的收藏')):
+            cur.execute("SELECT COUNT(*) FROM my_list_music_info_order WHERE listId=?", (lid,))
+            cnt = cur.fetchone()[0]
+            if cnt > 0:
+                result.append({'id': lid, 'name': lname, 'cnt': cnt})
+        # 自定义歌单
+        cur.execute("""
+            SELECT ml.id, ml.name,
+                   (SELECT COUNT(*) FROM my_list_music_info_order mio WHERE mio.listId = ml.id) as cnt
+            FROM my_list ml
+            ORDER BY ml.position
+        """)
+        for r in cur.fetchall():
+            result.append({'id': r[0], 'name': r[1], 'cnt': r[2]})
     return result
 
 
 def get_songs(db_path, playlist_id):
     """获取歌单内所有歌曲"""
-    conn = _connect_db_ro(db_path)
-    conn.row_factory = sqlite3.Row
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT mi.id, mi.name, mi.singer, mi.source, mi.interval, mi.meta
-        FROM my_list_music_info mi
-        JOIN my_list_music_info_order mio ON mio.musicInfoId = mi.id
-        WHERE mio.listId = ?
-        ORDER BY mio."order"
-    """, (playlist_id,))
-    rows = [dict(r) for r in cur.fetchall()]
-    conn.close()
+    with _db_ro(db_path) as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT mi.id, mi.name, mi.singer, mi.source, mi.interval, mi.meta
+            FROM my_list_music_info mi
+            JOIN my_list_music_info_order mio ON mio.musicInfoId = mi.id
+            WHERE mio.listId = ?
+            ORDER BY mio."order"
+        """, (playlist_id,))
+        rows = [dict(r) for r in cur.fetchall()]
     # 去重（同一首歌可能出现多次）
     seen = set()
     songs = []
