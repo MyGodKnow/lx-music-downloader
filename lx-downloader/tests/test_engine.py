@@ -1606,5 +1606,47 @@ class ConfigPersistenceTest(unittest.TestCase):
         self.assertIn('min_quality', cfg)
 
 
+class UpgradeExistingTest(unittest.TestCase):
+    """已有低音质文件时，可选用 --upgrade-existing 触发重新下载。
+
+    默认「存在即跳过」是为了避免重复下载；但用户把音质从 320k 调到 flac 后，
+    旧的低码率文件会让这首歌永远不再被下载——想升级也升不了。
+    """
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.addCleanup(self.td.cleanup)
+        self.dir = Path(self.td.name)
+        eng.reset_dir_index()
+        self.addCleanup(eng.reset_dir_index)
+
+    def test_existing_low_quality_detected_as_insufficient(self):
+        p = self.dir / '歌手 - 歌名.mp3'
+        make_mp3(p, bitrate_kbps=128)
+        eng.reset_dir_index()
+        self.assertTrue(eng.verify_quality(p, '128k'))
+        self.assertFalse(eng.verify_quality(p, '320k'),
+                         '128k 文件不该满足 320k 请求')
+        self.assertFalse(eng.verify_quality(p, 'flac'))
+
+    def test_existing_high_quality_satisfies_lower_request(self):
+        p = self.dir / '歌手 - 歌名.mp3'
+        make_mp3(p, bitrate_kbps=320)
+        eng.reset_dir_index()
+        # 320k 文件满足 320k 与 128k 的请求（更高音质永远通过）
+        self.assertTrue(eng.verify_quality(p, '320k'))
+        self.assertTrue(eng.verify_quality(p, '128k'))
+
+    def test_detect_actual_quality_used_for_logging(self):
+        p = self.dir / '歌手 - 歌名.mp3'
+        make_mp3(p, bitrate_kbps=128)
+        self.assertEqual(eng.detect_actual_quality(p), '128k')
+
+    def test_upgrade_flag_exists_in_parser(self):
+        """参数必须存在于 CLI（GUI/脚本可直接使用）。"""
+        src = Path(eng.__file__).read_text(encoding='utf-8')
+        self.assertIn('--upgrade-existing', src)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

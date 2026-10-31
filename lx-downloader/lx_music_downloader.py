@@ -2335,6 +2335,8 @@ def run():
                         help='降级时允许的最低音质（默认使用设置值）')
     # 设置持久化：GUI 用这两个命令读写同一个配置文件，
     # 这样 GUI 与命令行界面共享一份设置，不会出现「两套默认值」。
+    parser.add_argument('--upgrade-existing', action='store_true',
+                        help='已有文件音质不达标时重新下载（默认「存在即跳过」）')
     parser.add_argument('--dump-config', action='store_true',
                         help='以 JSON 输出当前持久化设置（GUI 启动时读取）')
     parser.add_argument('--save-config', default=None, metavar='JSON',
@@ -2676,9 +2678,19 @@ def run_download(args, songs, db_path=None, title=None):
             # （放在取音源服务之前：已下载的歌不该再拉起 Node 子进程）
             existing = song_exists_in_dir(download_dir, song['singer'], song['name'])
             if existing and existing.stat().st_size > 1024:
+                # 默认「存在即跳过」，避免重复下载。
+                # 但用户把音质从 320k 调到 flac 后，旧的低码率文件会让这首歌
+                # 永远不再被下载——想要无损也拿不到。开启 --upgrade-existing
+                # 时，先看已有文件是否达到当前请求档位：达标才跳过，不达标就重下。
+                if not getattr(args, 'upgrade_existing', False) or \
+                        verify_quality(existing, args.quality):
+                    with print_lock:
+                        print(f'[跳过] {song["name"]} - {song["singer"]} (已存在)')
+                    return 'skip'
                 with print_lock:
-                    print(f'[跳过] {song["name"]} - {song["singer"]} (已存在)')
-                return 'skip'
+                    print(f'[升级] {song["name"]} - {song["singer"]} '
+                          f'(已有 {detect_actual_quality(existing) or "未知"}，'
+                          f'重新下载 {args.quality})')
 
             errors = []
             server = get_worker_server()
@@ -2744,6 +2756,15 @@ def run_download(args, songs, db_path=None, title=None):
                                 reuse=verified_files)
                             _dl_cost += time.time() - _td
                             remember_downloaded(download_dir, _saved)
+                            # 升级模式：新文件已落盘，把被替换的旧文件删掉，
+                            # 否则目录里会同时留下 320k 与 flac 两个版本。
+                            # 只删「不是刚写出的那个」的文件，避免误删。
+                            try:
+                                if existing and Path(_saved) != Path(existing) \
+                                        and Path(existing).exists():
+                                    safe_unlink(existing)
+                            except Exception:
+                                pass
                             with print_lock:
                                 downgrade_note = f'，自动降级至 {requested_quality}' if requested_quality != args.quality else ''
                                 print(f'[成功] {song["name"]} - {song["singer"]} [{actual_q}]{downgrade_note}')
