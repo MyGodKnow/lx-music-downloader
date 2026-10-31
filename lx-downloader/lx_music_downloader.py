@@ -1154,7 +1154,11 @@ def _probe_size_and_speed(url, headers, timeout, sample_bytes=256 * 1024):
             chunks = []
             got = 0
             while got < sample_bytes:
-                chunk = resp.read(64 * 1024)
+                # 按「还差多少」精确读，而不是固定 64KB：
+                # sample_bytes 很小时（例如只取 Content-Range 的 sample_bytes=1），
+                # 固定 64KB 会把整段多读下来白白浪费带宽。
+                want = min(64 * 1024, sample_bytes - got)
+                chunk = resp.read(want)
                 if not chunk:
                     break
                 chunks.append(chunk)

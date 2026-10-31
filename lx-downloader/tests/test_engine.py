@@ -1648,5 +1648,57 @@ class UpgradeExistingTest(unittest.TestCase):
         self.assertIn('--upgrade-existing', src)
 
 
+class ProbeSampleSizeTest(unittest.TestCase):
+    """探测读取量必须精确等于 sample_bytes。
+
+    原先固定 read(64KB)，sample_bytes=1（只取 Content-Range 的场合）
+    也会把 64KB 整段拉下来，白白浪费带宽——而这是每首歌都要走一次的分支。
+    """
+
+    BODY = bytes(range(256)) * 2000
+
+    def setUp(self):
+        import http.server
+        import threading
+        body = self.BODY
+
+        class H(http.server.BaseHTTPRequestHandler):
+            protocol_version = 'HTTP/1.1'
+
+            def do_GET(self):
+                rng = self.headers.get('Range')
+                m = re.match(r'bytes=(\d+)-(\d*)', rng) if rng else None
+                s = int(m.group(1))
+                e = int(m.group(2)) if m.group(2) else len(body) - 1
+                e = min(e, len(body) - 1)
+                data = body[s:e + 1]
+                self.send_response(206)
+                self.send_header('Content-Type', 'audio/mpeg')
+                self.send_header('Content-Range', f'bytes {s}-{e}/{len(body)}')
+                self.send_header('Content-Length', str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, *a):
+                pass
+
+        srv = http.server.HTTPServer(('127.0.0.1', 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.shutdown)
+        self.url = f'http://127.0.0.1:{srv.server_port}/f.mp3'
+
+    def test_reads_exactly_requested_bytes(self):
+        for sb in (1, 100, 65536):
+            with self.subTest(sample_bytes=sb):
+                _, _, head = eng._probe_size_and_speed(
+                    self.url, {'User-Agent': 't'}, 10, sample_bytes=sb)
+                self.assertEqual(len(head), sb)
+                self.assertEqual(head, self.BODY[:sb])
+
+    def test_reports_total_size(self):
+        size, _, _ = eng._probe_size_and_speed(self.url, {'User-Agent': 't'}, 10)
+        self.assertEqual(size, len(self.BODY))
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
