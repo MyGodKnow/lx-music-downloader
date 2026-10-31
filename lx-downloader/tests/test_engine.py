@@ -1523,5 +1523,44 @@ class IntervalSecondsTest(unittest.TestCase):
                              '数字 interval 也必须参与校验')
 
 
+class MultiArtistMatchTest(unittest.TestCase):
+    """多歌手标签必须按分隔符拆开比对。
+
+    很多文件把多位歌手放进同一个 artist 字段（"水瀬いのり、久保ユリカ"）。
+    若只拆预期、不拆标签，两个单人都匹配不上，同一首歌会因
+    「标签里歌手顺序不同」被判成翻唱版而拒收。
+    """
+
+    def _match(self, tag, expected):
+        with mock.patch.object(eng, 'read_artist_tag', return_value=[tag]):
+            return eng.artist_matches_downloaded('x', expected)
+
+    def test_single_artist(self):
+        self.assertTrue(self._match('久保ユリカ', '久保ユリカ'))
+
+    def test_composite_tag_either_order(self):
+        for tag in ('久保ユリカ、水瀬いのり', '水瀬いのり、久保ユリカ'):
+            with self.subTest(tag=tag):
+                self.assertTrue(self._match(tag, '久保ユリカ、水瀬いのり'))
+
+    def test_different_separators(self):
+        self.assertTrue(self._match('水瀬いのり/久保ユリカ', '久保ユリカ、水瀬いのり'))
+        self.assertTrue(self._match('水瀬いのり, 久保ユリカ', '久保ユリカ、水瀬いのり'))
+
+    def test_missing_expected_artist_is_rejected(self):
+        self.assertFalse(self._match('久保ユリカ', '久保ユリカ、水瀬いのり'))
+
+    def test_completely_different_is_rejected(self):
+        self.assertFalse(self._match('邓紫棋', '周杰伦'))
+
+    def test_extra_guest_is_accepted(self):
+        """标签多了嘉宾但包含预期歌手 -> 应通过（否则会误杀大量正常歌曲）。"""
+        self.assertTrue(self._match('周杰伦、费玉清', '周杰伦'))
+
+    def test_no_tags_is_permissive(self):
+        with mock.patch.object(eng, 'read_artist_tag', return_value=[]):
+            self.assertTrue(eng.artist_matches_downloaded('x', '周杰伦'))
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

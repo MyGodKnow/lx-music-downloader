@@ -2056,9 +2056,18 @@ def artist_matches_downloaded(path, expected_singer):
     for a in tags:
         if strict_song_key(a) == exp_n:
             return True
-    # 多歌手：预期按分隔符拆段后，每段都要能在标签里找到完全相等的一项
-    exp_parts = [strict_song_key(x) for x in re.split(r'[、,，;&/]', expected_singer) if x.strip()]
-    tag_norms = [strict_song_key(a) for a in tags]
+    # 多歌手：预期按分隔符拆段后，每段都要能在标签里找到完全相等的一项。
+    #
+    # 关键：标签侧**也必须拆**。很多文件把多位歌手放进同一个 artist 字段，
+    # 形如 `"水瀬いのり、久保ユリカ"`；若只拆预期、不拆标签，
+    # `tag_norms` 里就只有一个长串，两个单人都匹配不上，
+    # 于是同一首歌因「标签里歌手顺序不同」被判成翻唱版而拒收——
+    # 这是真实库里反复出现的误杀。
+    split_re = r'[、,，;&/]'
+    exp_parts = [strict_song_key(x) for x in re.split(split_re, expected_singer) if x.strip()]
+    tag_norms = []
+    for a in tags:
+        tag_norms.extend(strict_song_key(x) for x in re.split(split_re, str(a)) if x.strip())
     exp_parts = [e for e in exp_parts if e]
     if exp_parts:
         return all(any(e == t for t in tag_norms) for e in exp_parts)
