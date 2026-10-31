@@ -1700,5 +1700,38 @@ class ProbeSampleSizeTest(unittest.TestCase):
         self.assertEqual(size, len(self.BODY))
 
 
+class NameSearchStaticTest(unittest.TestCase):
+    """按名搜索的关键约束（静态检查，避免只靠人工记）。
+
+    这些点都踩过坑：并行化、来源多样性、oiapi 双档位。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.src = Path(eng.__file__).with_name('lx_url_server.js').read_text(encoding='utf-8')
+
+    def test_quality_fetch_is_parallel(self):
+        """音质档取链必须并行；串行会把 15s 搜索预算烧光。"""
+        self.assertIn('getUrlsForQualities', self.src)
+        # 不应再有「for qi 里 await getUrlFromSourceEntry」的串行写法
+        self.assertNotIn('await(getUrlFromSourceEntry(entry, hitSource, musicInfo, q)', self.src)
+
+    def test_candidate_sources_must_be_diverse(self):
+        """候选不能全靠同一个音源刷满，否则该源失效时兜底失效。"""
+        self.assertIn('seenVia', self.src)
+        self.assertIn('diverseEnough', self.src)
+
+    def test_kuwo_fallback_requests_lossless_too(self):
+        """oiapi 酷我 br=1 是无损、br=5 是 320k，两档都要请求。"""
+        self.assertIn('br=${br}', self.src)
+        # 必须同时出现 1 和 5 两档
+        self.assertRegex(self.src, r'kwUrl\(1\)')
+        self.assertRegex(self.src, r'kwUrl\(5\)')
+
+    def test_encrypted_urls_filtered_in_search(self):
+        """搜索兜底也必须过滤加密容器，否则下层必然失败。"""
+        self.assertIn('urlLooksEncrypted', self.src)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

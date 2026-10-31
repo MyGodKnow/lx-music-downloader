@@ -621,6 +621,28 @@ async function getUrlFromSourceEntry(entry, source, songInfo, quality) {
   }
 }
 
+/**
+ * 一次取多个音质档的链接，**并行**发出。
+ *
+ * 原实现是 for(qi) 串行：每档都要等上一档的取链（最多 5s）**加上**
+ * checkUrl 校验（最多 4s）跑完才轮到下一档，3 档最坏 27s。
+ * 实测按名搜索整体要 9.5~21s，主要就耗在这条串行链上，
+ * 15s 预算经常在还有音源没被问到时就用光了。
+ *
+ * 并行后总耗时约等于「最慢的那一档」，返回值保持「高档位优先」的顺序，
+ * 调用方按数组顺序 addCandidate 即可维持原有打分逻辑。
+ */
+async function getUrlsForQualities(entry, source, songInfo, qOrder) {
+  const settled = await Promise.all(
+    qOrder.map((q) => getUrlFromSourceEntry(entry, source, songInfo, q).then(
+      (url) => ({ q, url }),
+      () => ({ q, url: null }),
+    )),
+  );
+  // 保持 qOrder 的顺序（flac 在前），过滤掉失败的档位
+  return settled.filter((x) => x.url);
+}
+
 // QQ 音乐搜索（带重试）：瞬时限流会返回空结果，重试几次通常能恢复
 async function qqSearch(kw) {
   const url = `https://c.y.qq.com/soso/fcgi-bin/client_search_cp?p=1&n=10&w=${encodeURIComponent(kw)}&format=json&cr=1&t=0`;
@@ -668,59 +690,117 @@ async function searchByName(name, singer, interval) {
   const ENOUGH_CANDIDATES = 3;
   const deadline = Date.now() + SEARCH_BUDGET_MS;
   const overBudget = () => Date.now() > deadline;
-  const enough = () => candidates.length >= ENOUGH_CANDIDATES;
+  // 注意：刻意不再提供「只看候选个数」的 enough()。
+  // 只数个数的话，一个能返回多个音质档的源就能刷满 3 个候选，
+  // 一旦它整体失效，兜底等于不存在。判断统一走 diverseEnough()。
 
   // 方式一：多平台逐音源 musicSearch（换接口搜索）—— 精确命中后取直链
-  for (const platform of ['kw', 'kg', 'wy', 'tx']) {
-    if (overBudget() || enough()) break;
-    for (const entry of requestHandlers) {
-      if (overBudget() || enough()) break;
-      if (sourceBlocked(entry.name)) continue;
-      try {
-        const result = await callHandler(entry, platform, 'musicSearch', { musicInfo: { name, singer }, page: 1, type: 'song' }, 5000);
-        const list = extractSongList(result);
-        for (const song of list) {
-          if (!songMatch(song, name, singer, interval)) continue;
-          // 命中的歌曲可能来自其它平台，取该歌自身的 source 字段（缺省沿用搜索平台）
-          const hitSource = song.source || song.platform || song.from || platform;
-          // 组装该源 musicUrl 所需的 musicInfo（尽量保留 song 原始字段 + id 兼容字段）
-          const musicInfo = Object.assign({}, song, { name: songTitle(song), singer: songSinger(song) });
-          if (musicInfo.id == null && musicInfo.songId != null) musicInfo.id = musicInfo.songId;
-          for (let qi = 0; qi < qOrder.length; qi++) {
-            const q = qOrder[qi];
-            const url = await getUrlFromSourceEntry(entry, hitSource, musicInfo, q);
-            if (!url) continue;
-            addCandidate(url, q, `${entry.name}(${platform}搜索)`, scoreOf(qi, url));
-          }
+  //
+  // 这里原来是「平台 × 音源 × 音质档」三重串行 await：每层都等上一个跑完，
+  // 而每源搜索 5s、每源取链 5s，15s 预算很快耗尽，排在后面的音源
+  // 根本没有机会被问到。实际效果是「只有最前面一两个源参与了兜底」。
+  //
+  // 改为：同一轮里**并行**问多个音源（受平台并发限制收敛），
+  // 谁先给出可用候选就先用谁，但不再因为「凑够 3 个」就完全停止——
+  // 而是要求候选来自**不同音源**，避免 3 个候选全出自同一个已失活的源。
+  const seenVia = new Set();
+  const diverseEnough = () => {
+    // 「足够」= 候选够多 **且** 来源够分散。
+    //
+    // 只数个数的话，一个能返回多音质档的源就能自己刷满 3 个候选，
+    // 一旦这个源整体失效（很常见：卡密过期、被 block），兜底就等于不存在。
+    // 所以要求：至少 2 个候选来自**不同音源**。
+    //
+    // 注意这里不能写成 `Math.min(2, candidates.length)`：
+    // 候选只有 1 个时那等于要求 1 种来源就够了，等于没做多样性约束。
+    if (candidates.length >= ENOUGH_CANDIDATES && seenVia.size >= 2) return true;
+    // 候选已经不少但确实只有一个源可用（其它源都挂了）时也别死磕，
+    // 交给 Python 端按真实内容校验——多个档位同源仍可能有一个可用。
+    return candidates.length >= ENOUGH_CANDIDATES + 2;
+  };
+
+  async function searchOneSource(entry, platform) {
+    if (overBudget() || diverseEnough() || sourceBlocked(entry.name)) return;
+    try {
+      const result = await callHandler(entry, platform, 'musicSearch',
+        { musicInfo: { name, singer }, page: 1, type: 'song' }, 5000);
+      const list = extractSongList(result);
+      if (list.length) noteSourceOk(entry.name);
+      for (const song of list) {
+        if (overBudget() || diverseEnough()) return;
+        if (!songMatch(song, name, singer, interval)) continue;
+        // 命中的歌曲可能来自其它平台，取该歌自身的 source 字段（缺省沿用搜索平台）
+        const hitSource = song.source || song.platform || song.from || platform;
+        // 组装该源 musicUrl 所需的 musicInfo（尽量保留 song 原始字段 + id 兼容字段）
+        const musicInfo = Object.assign({}, song, { name: songTitle(song), singer: songSinger(song) });
+        if (musicInfo.id == null && musicInfo.songId != null) musicInfo.id = musicInfo.songId;
+        // 三个音质档并行取链，避免串行等待把 15s 预算烧光
+        const got = await getUrlsForQualities(entry, hitSource, musicInfo, qOrder);
+        for (const { q, url } of got) {
+          if (overBudget() || diverseEnough()) return;
+          const qi = qOrder.indexOf(q);
+          const before = candidates.length;
+          addCandidate(url, q, `${entry.name}(${platform}搜索)`, scoreOf(qi < 0 ? 2 : qi, url));
+          if (candidates.length > before) seenVia.add(entry.name);
         }
-        if (list.length) noteSourceOk(entry.name);
-      } catch (e) { /* 该源不支持/搜索失败，继续下一个 */ }
+      }
+    } catch (e) { /* 该源不支持/搜索失败，忽略 */ }
+  }
+
+  for (const platform of ['kw', 'kg', 'wy', 'tx']) {
+    if (overBudget() || diverseEnough()) break;
+    // 同轮并行问最多 3 个音源；并行数过高会触发平台限流（见 getMusicUrls 的注释）
+    const entries = requestHandlers.filter((e) => !sourceBlocked(e.name));
+    for (let i = 0; i < entries.length; i += 3) {
+      if (overBudget() || diverseEnough()) break;
+      await Promise.all(entries.slice(i, i + 3).map((e) => searchOneSource(e, platform)));
     }
   }
 
   // 方式二：溯音酷我（oiapi）严格校验
-  if (!enough()) try {
+  //
+  // 原来固定 `br=5`，实测该参数决定返回的**音质档**：
+  //   br=1 → flac 2000kbps（无损）      br=5 → mp3 320k
+  // 也就是说兜底一直在主动放弃无损。这里并行请求两档：
+  // 无损先拿到就先用，320k 作为后备。两档并行，总耗时约等于较慢的那个。
+  if (!diverseEnough()) try {
     const kwQuery = encodeURIComponent(`${singer} ${name}`);
-    const r = await doRequest(`https://oiapi.net/api/Kuwo?msg=${kwQuery}&n=1&br=5`, { method: 'GET' }, 15000);
-    if (r.statusCode === 200 && r.body && typeof r.body === 'object' && r.body.code === 1) {
-      const m = r.body.message || '';
-      const parsed = {};
-      for (const line of String(m).split('\n')) {
-        if (line.startsWith('歌名：')) parsed.song = line.replace('歌名：', '').trim();
-        if (line.startsWith('歌手：')) parsed.singer = line.replace('歌手：', '').trim();
+    const kwUrl = (br) => `https://oiapi.net/api/Kuwo?msg=${kwQuery}&n=1&br=${br}`;
+    const parseKw = (r) => {
+      if (!r || r.statusCode !== 200 || !r.body || typeof r.body !== 'object' || r.body.code !== 1) {
+        return null;
       }
+      const m = String(r.body.message || '');
+      const info = r.body.data || {};
+      // 歌名/歌手优先取结构化 data（message 里的文本格式会随接口变动）
+      const songName = info.song || (m.match(/歌名[：:](.+)/) || [])[1];
+      const songSinger = info.singer || (m.match(/歌手[：:](.+)/) || [])[1];
       const urlMatch = m.match(/音乐链接[：:](\S+)/);
-      if (urlMatch && /^https?:\/\//.test(urlMatch[1])) {
-        if (nameMatch(parsed.song, name) && singerMatch(parsed.singer, singer) && !urlLooks128k(urlMatch[1])) {
-          const url = urlMatch[1];
-          const valid = await checkUrl(url);
-          if (valid) addCandidate(url, '320k', '溯音酷我(按名搜索)', 11);
-        }
-      }
+      if (!urlMatch || !/^https?:\/\//.test(urlMatch[1])) return null;
+      return {
+        name: String(songName || '').trim(),
+        singer: String(songSinger || '').trim(),
+        url: urlMatch[1],
+      };
+    };
+    const results = await Promise.all([
+      doRequest(kwUrl(1), { method: 'GET' }, 15000).then(parseKw, () => null),   // 无损
+      doRequest(kwUrl(5), { method: 'GET' }, 15000).then(parseKw, () => null),   // 320k
+    ]);
+    for (let i = 0; i < results.length; i++) {
+      const got = results[i];
+      if (!got) continue;
+      if (!nameMatch(got.name, name) || !singerMatch(got.singer, singer)) continue;
+      if (urlLooks128k(got.url) && !urlLooks320(got.url) && !urlLooksLossless(got.url)) continue;
+      const valid = await checkUrl(got.url);
+      if (!valid) continue;
+      // br=1 那档按无损计分（score 更低 = 更优先）
+      if (i === 0) addCandidate(got.url, 'flac', '溯音酷我(按名搜索)', 1);
+      else addCandidate(got.url, '320k', '溯音酷我(按名搜索)', 11);
     }
   } catch (e) { /* continue */ }
   // 方式三：溯音网易云（oiapi）严格校验
-  if (!enough()) try {
+  if (!diverseEnough()) try {
     const nameQuery = encodeURIComponent(`${singer} ${name}`);
     const r = await doRequest(`https://oiapi.net/api/Music_163?name=${nameQuery}&n=1&br=5`, { method: 'GET' }, 15000);
     if (r.statusCode === 200 && r.body && typeof r.body === 'object' && r.body.code === 0 && r.body.data) {
@@ -738,7 +818,7 @@ async function searchByName(name, singer, interval) {
   } catch (e) { /* continue */ }
   // 方式四：QQ 音乐按名搜索 → 把命中歌曲的 songmid 喂回各音源 tx 取链接。
   // 兜底场景：某些源自身的 tx 搜索返回 128k，但直接喂正确 songmid 时可拿到 M800/F000。
-  if (!enough()) try {
+  if (!diverseEnough()) try {
     const list = await qqSearch(`${singer} ${name}`);
     for (const hit of list) {
       const mid = hit.songmid || '';
@@ -754,14 +834,16 @@ async function searchByName(name, singer, interval) {
       const singerOk = singerMatch(qSinger, singer);
       const singerPenalty = singerOk ? 0 : 20;
       const musicInfo = { name: qTitle, singer: qSinger, songmid: mid, id: mid };
-      for (const qi of [0, 1, 2]) {
-        const q = qOrder[qi];
-        for (const entry of requestHandlers) {
-          if (overBudget()) break;
-          if (sourceBlocked(entry.name)) continue;
-          const url = await getUrlFromSourceEntry(entry, 'tx', musicInfo, q);
-          if (!url) continue;
-          addCandidate(url, q, `${entry.name}(QQ直查mid)`, scoreOf(qi, url) + singerPenalty);
+      // 音源与音质档并行取链：串行版本在 15s 预算下常常只问到前一两个源
+      const entries = requestHandlers.filter((e) => !sourceBlocked(e.name));
+      const settled = await Promise.all(entries.map((entry) =>
+        getUrlsForQualities(entry, 'tx', musicInfo, qOrder).then(
+          (list) => ({ entry, list }), () => ({ entry, list: [] }))));
+      for (const { entry, list } of settled) {
+        if (overBudget()) break;
+        for (const { q, url } of list) {
+          addCandidate(url, q, `${entry.name}(QQ直查mid)`,
+            scoreOf(Math.max(0, qOrder.indexOf(q)), url) + singerPenalty);
         }
         if (overBudget()) break;
       }
@@ -773,11 +855,11 @@ async function searchByName(name, singer, interval) {
   // 个别歌曲的歌手名在不同平台差异较大（日文 vs 中文译名 vs 罗马音），
   // 带歌手搜索可能无结果；此时哪怕已有 128k 候选，也应继续找无损/320k。
   const hasHighQuality = candidates.some((c) => urlLooks320(c.url) || urlLooksLossless(c.url));
-  if (singer && !hasHighQuality && !enough() && !overBudget()) {
+  if (singer && !hasHighQuality && !diverseEnough() && !overBudget()) {
     try {
       const list = await qqSearch(name);
       for (const hit of list) {
-        if (overBudget() || enough()) break;
+        if (overBudget() || diverseEnough()) break;
         const mid = hit.songmid || '';
         if (!mid) continue;
         const qTitle = hit.songname || '';
@@ -785,15 +867,16 @@ async function searchByName(name, singer, interval) {
         if (!nameMatch(qTitle, name)) continue;
         if (!intervalMatch(Number(hit.interval), interval)) continue;
         const musicInfo = { name: qTitle, singer: qSinger, songmid: mid, id: mid };
-        for (const qi of [0, 1, 2]) {
-          const q = qOrder[qi];
-          for (const entry of requestHandlers) {
-            if (overBudget()) break;
-            if (sourceBlocked(entry.name)) continue;
-            const url = await getUrlFromSourceEntry(entry, 'tx', musicInfo, q);
-            if (!url) continue;
+        const entries2 = requestHandlers.filter((e) => !sourceBlocked(e.name));
+        const settled2 = await Promise.all(entries2.map((entry) =>
+          getUrlsForQualities(entry, 'tx', musicInfo, qOrder).then(
+            (list) => ({ entry, list }), () => ({ entry, list: [] }))));
+        for (const { entry, list } of settled2) {
+          if (overBudget()) break;
+          for (const { q, url } of list) {
             // 无歌手搜索最易命中翻唱，统一加高罚分排最后，靠原唱结果优先
-            addCandidate(url, q, `${entry.name}(QQ无歌手搜索)`, scoreOf(qi, url) + 20);
+            addCandidate(url, q, `${entry.name}(QQ无歌手搜索)`,
+              scoreOf(Math.max(0, qOrder.indexOf(q)), url) + 20);
           }
           if (overBudget()) break;
         }
