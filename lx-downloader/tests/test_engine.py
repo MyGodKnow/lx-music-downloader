@@ -1837,5 +1837,86 @@ class SpeedSampleGuardTest(unittest.TestCase):
         self.assertEqual(eng._choose_parts(500 * 1024, None), 1)
 
 
+class Range416RecoveryTest(unittest.TestCase):
+    """残留 .part 比实际内容长时，断点续传会触发 416。
+
+    典型成因：上次下的是另一个更大的文件、链接换成了更短的版本、
+    或上次断流写入了超出总长的数据。不处理的话整首歌直接判失败
+    （用户日志里反复出现 `HTTP Error 416: Request Range Not Satisfiable`）。
+    正确做法：丢掉残留、从 0 重下。
+    """
+
+    BODY = bytes(range(256)) * 4000    # ~1MB
+
+    def _server(self):
+        import http.server
+        import threading
+        body = self.BODY
+
+        class H(http.server.BaseHTTPRequestHandler):
+            protocol_version = 'HTTP/1.1'
+
+            def do_GET(self):
+                rng = self.headers.get('Range')
+                m = re.match(r'bytes=(\d+)-(\d*)', rng) if rng else None
+                if m:
+                    s = int(m.group(1))
+                    if s >= len(body):
+                        # 起点越界：按 HTTP 规范回 416
+                        self.send_response(416)
+                        self.send_header('Content-Length', '0')
+                        self.end_headers()
+                        return
+                    e = int(m.group(2)) if m.group(2) else len(body) - 1
+                    e = min(e, len(body) - 1)
+                    data = body[s:e + 1]
+                    self.send_response(206)
+                    self.send_header('Content-Type', 'audio/mpeg')
+                    self.send_header('Content-Range', f'bytes {s}-{e}/{len(body)}')
+                    self.send_header('Content-Length', str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                else:
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'audio/mpeg')
+                    self.send_header('Content-Length', str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+
+            def log_message(self, *a):
+                pass
+
+        srv = http.server.HTTPServer(('127.0.0.1', 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.shutdown)
+        return f'http://127.0.0.1:{srv.server_port}/f.mp3'
+
+    def test_oversized_leftover_recovers(self):
+        url = self._server()
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / 'a.part'
+            p.write_bytes(b'Z' * (len(self.BODY) + 5000))   # 残留比实际长
+            with mock.patch.object(eng, 'is_safe_http_url', return_value=True):
+                eng.download_file(url, p, retries=0)
+            self.assertEqual(p.read_bytes(), self.BODY)
+
+    def test_normal_resume_still_works(self):
+        url = self._server()
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / 'b.part'
+            p.write_bytes(self.BODY[:300000])               # 正常半成品
+            with mock.patch.object(eng, 'is_safe_http_url', return_value=True):
+                eng.download_file(url, p, retries=0)
+            self.assertEqual(p.read_bytes(), self.BODY)
+
+    def test_fresh_download(self):
+        url = self._server()
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / 'c.part'
+            with mock.patch.object(eng, 'is_safe_http_url', return_value=True):
+                eng.download_file(url, p, retries=0)
+            self.assertEqual(p.read_bytes(), self.BODY)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

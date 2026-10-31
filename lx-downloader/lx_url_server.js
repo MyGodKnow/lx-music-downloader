@@ -1519,13 +1519,21 @@ async function getMusicUrls(source, musicInfo, qualities) {
   if (!requestHandlers.length) throw new Error('音源未初始化: ' + (initError || 'unknown'));
 
   const qList = Array.isArray(qualities) ? qualities : [qualities];
-  const targetCount = 2;          // 2 个候选就够 Python 端实测
+  // 候选池大小。
+  //
+  // 原来是 2，理由是「2 个候选就够 Python 端实测」。但实测发现这个数字
+  // 太小：音源经常把 128k 的 MP4 标成 flac/320k，Python 端按真实内容
+  // 校验时会全部拒绝；两个候选都不可用时，就没有第三个可以换，
+  // 整首歌直接失败——用户看到的就是「音质不达标」。
+  // 提到 4 个：多几次请求，换取「有足够备选可换」。
+  const targetCount = 4;
   const CONCURRENCY = 3;          // 并行探测的音源数（与平台限流上限一致）
   const failures = [];
   let lastErr = null;
 
-  // 整体预算：并行后单轮最多 ~20s，两轮 + 校验足够，给 35s（原 45s 可收紧）
-  const deadline = Date.now() + 35000;
+  // 整体预算：候选从 2 提到 4 后需要多一点时间，但仍要有硬上限，
+  // 否则失败歌曲会长时间占住 worker。35s → 40s。
+  const deadline = Date.now() + 40000;
   const overDeadline = () => Date.now() > deadline;
 
   // 按「成功榜 + 用户优先级」排好序的候选音源
@@ -1635,7 +1643,6 @@ async function getMusicUrls(source, musicInfo, qualities) {
     // 成了死代码。后果在真实库里很明显：唯一那个候选若是 19.8s 的试听片段、
     // 或时长对不上的换版本，Python 端的四重校验一定会拒掉它，而此时既没有
     // 第二个候选、也没有机会再问下一个音源，整首歌直接判失败。
-    // 多拿一个候选只在「确实有多个源可用」时多花一次请求，却能救回这类歌。
     let idx = 0;
     while (idx < ordered.length && candidates.length < targetCount && !overDeadline()) {
       const batch = ordered.slice(idx, idx + CONCURRENCY);
@@ -1646,7 +1653,12 @@ async function getMusicUrls(source, musicInfo, qualities) {
         candidates.push(hit);
       }
     }
-    if (candidates.length > 0) break;   // 已有候选，不再试其它音质档
+    // 注意：这里**不再**「有候选就跳出音质循环」。
+    // 用户明确要求「音质不达标就换链接」：只试一个音质档时，一旦这一档
+    // 的音源都给了不达标的文件（很常见：标 flac 实为 128k MP4），
+    // 整首歌就只能失败。继续试下一档能拿到别源的同曲更高/可用版本。
+    // 只要还没凑够候选且没超预算，就继续。
+    if (candidates.length >= targetCount) break;
   }
 
   if (!candidates.length) {

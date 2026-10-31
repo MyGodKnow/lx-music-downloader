@@ -1317,8 +1317,24 @@ def _download_sequential(url, dest_path, timeout, headers, preloaded=b''):
     elif preloaded:
         # 跳过已缓存的头部，从它的尾部开始续
         h['Range'] = f'bytes={len(preloaded)}-'
-    req = Request(url, headers=h)
-    with urlopen(req, timeout=timeout) as resp:
+    try:
+        resp = urlopen(Request(url, headers=h), timeout=timeout)
+    except HTTPError as exc:
+        # 416 Range Not Satisfiable：残留的 .part 比服务器上的实际内容还长
+        # （典型成因：上次下载的是另一个更大的文件、或链接换成了更短的版本、
+        #  或上次因断流写入了超出总长的数据）。
+        # 断点续传的前提「已有长度 < 总长」不成立，只能丢掉重下。
+        # 不处理的话这里会直接抛出，整首歌被判失败——日志里反复出现的
+        # `HTTP Error 416` 就是它。
+        if getattr(exc, 'code', None) == 416 and existing > 0:
+            safe_unlink(dest_path)
+            h.pop('Range', None)
+            resp = urlopen(Request(url, headers=h), timeout=timeout)
+            preloaded = b''
+            existing = 0
+        else:
+            raise
+    with resp:
         status = getattr(resp, 'status', 200)
         content_type = (resp.headers.get('Content-Type') or '').lower()
         # preloaded 非空时我们主动发了 Range，服务器回 206 才说明续传成立；
@@ -1326,9 +1342,12 @@ def _download_sequential(url, dest_path, timeout, headers, preloaded=b''):
         append = existing > 0 and status == 206
         use_preloaded = bool(preloaded) and status == 206
         if status not in (200, 206):
+            # 重下后仍非 200/206：把残留清掉，避免下次又撞 416
+            safe_unlink(dest_path)
             raise RuntimeError(f'HTTP {status}')
         # 不强制 audio/*：拦截明显的错误页/JSON，避免误杀可播放的音频流。
         if any(x in content_type for x in ('text/html', 'application/json', 'text/xml')):
+            safe_unlink(dest_path)
             raise RuntimeError(f'返回错误页: {content_type}')
         mode = 'ab' if (append or use_preloaded) else 'wb'
         total = (existing if append else 0) + (len(preloaded) if use_preloaded else 0)
