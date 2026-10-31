@@ -1487,5 +1487,41 @@ class StopRecordsUnfinishedTest(unittest.TestCase):
                 self.assertTrue(it['error'], '必须有明确原因，便于用户判断')
 
 
+class IntervalSecondsTest(unittest.TestCase):
+    """时长解析必须同时认「MM:SS」与「秒数」。
+
+    GUI 搜索页的 interval 是秒数（Rust 侧 Option<f64>），单曲下载时原样
+    传给引擎。旧实现只认冒号格式，遇到数字返回 None，
+    而 verify_duration 在 expected 为 None 时**直接放行**——
+    等于时长校验静默失效，翻唱版与错歌能混过第一关。
+    """
+
+    def test_colon_formats(self):
+        self.assertEqual(eng.interval_to_seconds('04:29'), 269.0)
+        self.assertEqual(eng.interval_to_seconds('3:45.5'), 225.5)
+        self.assertEqual(eng.interval_to_seconds('00:03:45'), 225.0)
+
+    def test_plain_numbers_are_seconds(self):
+        for v in (269, 269.0, '269', '269.0'):
+            with self.subTest(v=v):
+                self.assertEqual(eng.interval_to_seconds(v), 269.0)
+
+    def test_invalid_inputs_return_none(self):
+        for v in ('', None, 'abc', 0, -5, '0', True, False):
+            with self.subTest(v=v):
+                self.assertIsNone(eng.interval_to_seconds(v))
+
+    def test_verify_duration_actually_runs_for_numeric_interval(self):
+        """传数字时校验必须真的执行，而不是走「无法校验就放行」。"""
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / 'song.mp3'
+            make_mp3(p, seconds=4, bitrate_kbps=320)
+            # 期望 4 秒（数字形态）：应通过
+            self.assertTrue(eng.verify_duration(p, 4))
+            # 期望 60 秒：必须拒绝。旧实现这里会返回 True（放行）
+            self.assertFalse(eng.verify_duration(p, 60),
+                             '数字 interval 也必须参与校验')
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

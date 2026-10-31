@@ -1908,11 +1908,37 @@ def probe_duration(path):
 
 
 def interval_to_seconds(interval):
-    """将 '02:56' 或 '03:45.5' 格式转为秒数"""
-    if not interval:
+    """把时长约定转换成秒数。支持三种输入：
+
+      - `'02:56'` / `'03:45.5'` / `'00:03:45'`（数据库与 failed.txt 的形态）
+      - 纯数字 `269` / `269.0` / `'269'`：**以秒为单位**
+      - 数字字符串里带冒号的交给上面的分支
+
+    为什么必须支持纯数字：GUI 搜索页拿到的 `interval` 是**秒数**（Rust 侧
+    定义为 `Option<f64>`），单曲下载时原样写进 `--song-file` 传给引擎。
+    旧实现只认冒号格式，遇到数字直接返回 None，于是 `verify_duration`
+    走「无法校验 → 放行」的分支——**时长校验静默失效**，
+    翻唱版、错歌因此能混过四重校验里的第一关。
+    """
+    if interval is None or interval == '':
         return None
+    # 纯数字（含 float）优先按秒处理，避免 str(269) 被当成冒号格式解析失败
+    if isinstance(interval, bool):
+        return None
+    if isinstance(interval, (int, float)):
+        return float(interval) if interval > 0 else None
+    text = str(interval).strip()
+    if not text:
+        return None
+    if ':' not in text:
+        # 纯数字字符串（容忍 "269.0" 这种从 JSON 数字转来的形态）
+        try:
+            val = float(text)
+        except ValueError:
+            return None
+        return val if val > 0 else None
     try:
-        parts = str(interval).strip().split(':')
+        parts = text.split(':')
         if len(parts) == 2:
             return int(parts[0]) * 60 + float(parts[1])
         if len(parts) == 3:
