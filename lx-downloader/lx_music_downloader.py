@@ -2668,120 +2668,127 @@ def run_download(args, songs, db_path=None, title=None):
     # 这里用「分批调度」：每批完成后根据实测成功率与耗时调整下一批的并发度。
     # 池子按最大并发建好复用，实际同时在跑的任务数由调度器控制。
     max_workers = min(32, max(worker_count, 12))
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        total = len(songs)
-        stopped_early = False
-        done = 0
-        pending_index = 0
-        in_flight = {}          # future -> song
-        cur_window = worker_count   # 当前允许的在途任务数
-        import collections
-        recent = collections.deque(maxlen=30)  # 最近结果：True=成功
-        batch_start = time.time()
-        batch_done = 0
+    stopped_early = False
+    try:
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            total = len(songs)
+            done = 0
+            pending_index = 0
+            in_flight = {}          # future -> song
+            cur_window = worker_count   # 当前允许的在途任务数
+            import collections
+            recent = collections.deque(maxlen=30)  # 最近结果：True=成功
+            batch_done = 0
 
-        def submit_until_full():
-            nonlocal pending_index
-            while pending_index < total and len(in_flight) < cur_window:
-                if DOWNLOAD_STOP_EVENT.is_set():
-                    return
-                s = songs[pending_index]
-                fut = pool.submit(process_song, pending_index, s)
-                in_flight[fut] = s
-                pending_index += 1
-
-        submit_until_full()
-
-        while in_flight:
-            # 等任意一个完成
-            done_set, _ = wait(list(in_flight.keys()), return_when=FIRST_COMPLETED)
-            for fut in done_set:
-                song_obj = in_flight.pop(fut, None)
-                done += 1
-                batch_done += 1
-                try:
-                    result = fut.result()
-                except Exception as exc:
-                    result = ('fail', (song_obj or {}).get('name', 'unknown'),
-                              (song_obj or {}).get('singer', ''), str(exc))
-                    with print_lock:
-                        print(f'\n[线程异常] {(song_obj or {}).get("name", "unknown")}: {exc}')
-                if result == 'stopped' and DOWNLOAD_STOP_EVENT.is_set():
-                    for p in in_flight:
-                        p.cancel()
-                    in_flight.clear()
-                    stopped_early = True
-                    break
-                if result == 'success':
-                    stats['success'] += 1
-                    recent.append(True)
-                    if song_obj:
-                        mark_resolved(song_obj)
-                elif result == 'skip':
-                    stats['skip'] += 1
-                    recent.append(True)
-                    # 已存在也算解决：这首不需要再出现在失败清单里
-                    if song_obj:
-                        mark_resolved(song_obj)
-                elif result == 'stopped':
-                    continue
-                else:
-                    stats['fail'] += 1
-                    recent.append(False)
-                    if len(result) >= 4:
-                        failure = (result[1], result[2], result[3])
-                        fail_list.append(failure)
-                        failed_songs.append((song_obj, failure))
-                    else:
-                        failure = (str(result), '', 'unknown')
-                        fail_list.append(failure)
-                        failed_songs.append((song_obj, failure))
-
-                elapsed = time.time() - start_time
-                speed = done / elapsed if elapsed > 0 else 0
-                active = len(in_flight)
-                try:
-                    _progress = {
-                        'done': done,
-                        'total': total,
-                        'success': stats['success'],
-                        'fail': stats['fail'],
-                        'skip': stats['skip'],
-                        'active': active,
-                        'speed': round(speed, 1),
-                    }
-                    print('##PROGRESS## ' + json.dumps(_progress, ensure_ascii=False), flush=True)
-                except Exception:
-                    pass
-
-            if stopped_early:
-                break
-
-            # 每完成 6 首评估一次：失败率高就降并发，全成功且仍有积压就小幅升
-            if batch_done >= 6:
-                fail_rate = 1.0 - (sum(recent) / len(recent) if recent else 1.0)
-                old_window = cur_window
-                if fail_rate > 0.35:
-                    cur_window = max(4, cur_window - 3)
-                elif fail_rate < 0.12 and cur_window < max_workers:
-                    cur_window = min(max_workers, cur_window + 2)
-                if cur_window != old_window:
-                    with print_lock:
-                        print(f'[调度] 并发窗口 {old_window} → {cur_window}'
-                              f'（近 {len(recent)} 首失败率 {fail_rate*100:.0f}%）', flush=True)
-                batch_done = 0
+            def submit_until_full():
+                nonlocal pending_index
+                while pending_index < total and len(in_flight) < cur_window:
+                    if DOWNLOAD_STOP_EVENT.is_set():
+                        return
+                    s = songs[pending_index]
+                    fut = pool.submit(process_song, pending_index, s)
+                    in_flight[fut] = s
+                    pending_index += 1
 
             submit_until_full()
+
+            while in_flight:
+                # 等任意一个完成
+                done_set, _ = wait(list(in_flight.keys()), return_when=FIRST_COMPLETED)
+                for fut in done_set:
+                    song_obj = in_flight.pop(fut, None)
+                    done += 1
+                    batch_done += 1
+                    try:
+                        result = fut.result()
+                    except Exception as exc:
+                        result = ('fail', (song_obj or {}).get('name', 'unknown'),
+                                  (song_obj or {}).get('singer', ''), str(exc))
+                        with print_lock:
+                            print(f'\n[线程异常] {(song_obj or {}).get("name", "unknown")}: {exc}')
+                    if result == 'stopped' and DOWNLOAD_STOP_EVENT.is_set():
+                        for p in in_flight:
+                            p.cancel()
+                        in_flight.clear()
+                        stopped_early = True
+                        break
+                    if result == 'success':
+                        stats['success'] += 1
+                        recent.append(True)
+                        if song_obj:
+                            mark_resolved(song_obj)
+                    elif result == 'skip':
+                        stats['skip'] += 1
+                        recent.append(True)
+                        # 已存在也算解决：这首不需要再出现在失败清单里
+                        if song_obj:
+                            mark_resolved(song_obj)
+                    elif result == 'stopped':
+                        continue
+                    else:
+                        stats['fail'] += 1
+                        recent.append(False)
+                        if len(result) >= 4:
+                            failure = (result[1], result[2], result[3])
+                            fail_list.append(failure)
+                            failed_songs.append((song_obj, failure))
+                        else:
+                            failure = (str(result), '', 'unknown')
+                            fail_list.append(failure)
+                            failed_songs.append((song_obj, failure))
+
+                    elapsed = time.time() - start_time
+                    speed = done / elapsed if elapsed > 0 else 0
+                    active = len(in_flight)
+                    try:
+                        _progress = {
+                            'done': done,
+                            'total': total,
+                            'success': stats['success'],
+                            'fail': stats['fail'],
+                            'skip': stats['skip'],
+                            'active': active,
+                            'speed': round(speed, 1),
+                        }
+                        print('##PROGRESS## ' + json.dumps(_progress, ensure_ascii=False), flush=True)
+                    except Exception:
+                        pass
+
+                if stopped_early:
+                    break
+
+                # 每完成 6 首评估一次：失败率高就降并发，全成功且仍有积压就小幅升
+                if batch_done >= 6:
+                    fail_rate = 1.0 - (sum(recent) / len(recent) if recent else 1.0)
+                    old_window = cur_window
+                    if fail_rate > 0.35:
+                        cur_window = max(4, cur_window - 3)
+                    elif fail_rate < 0.12 and cur_window < max_workers:
+                        cur_window = min(max_workers, cur_window + 2)
+                    if cur_window != old_window:
+                        with print_lock:
+                            print(f'[调度] 并发窗口 {old_window} → {cur_window}'
+                                  f'（近 {len(recent)} 首失败率 {fail_rate*100:.0f}%）', flush=True)
+                    batch_done = 0
+
+                submit_until_full()
+    finally:
+        # 无论主循环是否异常退出，都必须回收 Node 子进程。
+        # 这里原先没有 try/finally：一旦调度或统计代码抛异常，
+        # 每个 worker 线程各起的 Node 实例（最多 32 个）会全部残留成僵尸进程，
+        # 用户看到的是「下载器关了但后台还有一堆 node.exe」。
+        for worker_server in servers:
+            try:
+                worker_server.close()
+            except Exception:
+                pass
+        servers.clear()
     print()
 
     # 停止时等待在途任务收尾：ThreadPoolExecutor 退出时会 join 所有运行中的任务，
     # 这期间它们看到 STOP_EVENT 会立刻放弃剩余候选，把已下完的文件正常落盘。
     if stopped_early and DOWNLOAD_STOP_EVENT.is_set():
         print('[停止] 正在等待在途任务收尾（已下载的文件会保留）……', flush=True)
-
-    for worker_server in servers:
-        worker_server.close()
-    servers.clear()
 
     if failed_songs and not DOWNLOAD_STOP_EVENT.is_set():
         retry_songs = [song for song, _failure in failed_songs]
@@ -2802,28 +2809,34 @@ def run_download(args, songs, db_path=None, title=None):
         get_worker_server = get_retry_server
         retry_failures = []
         retry_workers = max(1, min(4, worker_count))
-        with ThreadPoolExecutor(max_workers=retry_workers) as retry_pool:
-            retry_futures = {retry_pool.submit(process_song, i, song, True): song for i, song in enumerate(retry_songs)}
-            for retry_future in as_completed(retry_futures):
-                song = retry_futures[retry_future]
+        try:
+            with ThreadPoolExecutor(max_workers=retry_workers) as retry_pool:
+                retry_futures = {retry_pool.submit(process_song, i, song, True): song for i, song in enumerate(retry_songs)}
+                for retry_future in as_completed(retry_futures):
+                    song = retry_futures[retry_future]
+                    try:
+                        retry_result = retry_future.result()
+                    except Exception as exc:
+                        retry_result = ('fail', song['name'], song['singer'], str(exc))
+                    if retry_result == 'success':
+                        stats['fail'] -= 1
+                        stats['success'] += 1
+                        fail_list = [item for item in fail_list if not (item[0] == song['name'] and item[1] == song['singer'])]
+                        mark_resolved(song)
+                    elif retry_result == 'skip':
+                        stats['fail'] -= 1
+                        stats['skip'] += 1
+                        fail_list = [item for item in fail_list if not (item[0] == song['name'] and item[1] == song['singer'])]
+                        mark_resolved(song)
+                    elif retry_result != 'stopped':
+                        retry_failures.append(retry_result)
+        finally:
+            # 同主循环：重试阶段也要保证 Node 子进程被回收
+            for retry_server in retry_servers:
                 try:
-                    retry_result = retry_future.result()
-                except Exception as exc:
-                    retry_result = ('fail', song['name'], song['singer'], str(exc))
-                if retry_result == 'success':
-                    stats['fail'] -= 1
-                    stats['success'] += 1
-                    fail_list = [item for item in fail_list if not (item[0] == song['name'] and item[1] == song['singer'])]
-                    mark_resolved(song)
-                elif retry_result == 'skip':
-                    stats['fail'] -= 1
-                    stats['skip'] += 1
-                    fail_list = [item for item in fail_list if not (item[0] == song['name'] and item[1] == song['singer'])]
-                    mark_resolved(song)
-                elif retry_result != 'stopped':
-                    retry_failures.append(retry_result)
-        for retry_server in retry_servers:
-            retry_server.close()
+                    retry_server.close()
+                except Exception:
+                    pass
         if retry_failures:
             fail_list = [(item[1], item[2], item[3]) for item in retry_failures if len(item) >= 4]
         else:
