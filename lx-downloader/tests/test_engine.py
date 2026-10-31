@@ -2004,5 +2004,36 @@ class NonRetryableUrlErrorTest(unittest.TestCase):
         self.assertEqual(len(calls), 3, '瞬时错误应重试满 3 次')
 
 
+class RetryProgressTest(unittest.TestCase):
+    """二次重试阶段也必须推进度事件。
+
+    界面顶部的「成功/失败」数字完全来自 ##PROGRESS## 事件。原先重试阶段
+    一次都不发，于是数字停在主循环结束时的值（用户看到「成功 185 失败 46」），
+    而引擎最终汇总打印「成功 216 失败 15」——两边对不上，像是统计出错。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.src = Path(eng.__file__).read_text(encoding='utf-8')
+
+    def test_retry_loop_emits_progress(self):
+        # 取出「二次重试」到「总结」之间的代码段
+        start = self.src.index('开始二次重试')
+        end = self.src.index('收尾时再推一次最终计数')
+        block = self.src[start:end]
+        self.assertIn('##PROGRESS##', block,
+                      '重试循环里必须发进度，否则界面数字不会更新')
+
+    def test_final_progress_after_retry(self):
+        self.assertIn('finished', self.src)
+        self.assertIn('收尾时再推一次最终计数', self.src)
+
+    def test_progress_payload_has_expected_fields(self):
+        # 界面读取 success/fail/skip/total/done
+        for field in ("'success'", "'fail'", "'skip'", "'total'", "'done'"):
+            with self.subTest(field=field):
+                self.assertIn(field, self.src)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

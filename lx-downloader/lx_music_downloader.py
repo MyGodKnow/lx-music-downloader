@@ -3158,6 +3158,28 @@ def run_download(args, songs, db_path=None, title=None):
                         mark_resolved(song)
                     elif retry_result != 'stopped':
                         retry_failures.append(retry_result)
+                    # 重试阶段也要推进度。
+                    #
+                    # 原先这里一次都不发 ##PROGRESS##，而界面顶部的
+                    # 「成功 / 失败」数字完全来自该事件，于是停在主循环结束时的
+                    # 数字不再更新。用户看到的是「成功 185 失败 46」，
+                    # 而引擎最终汇总打印「成功 216 失败 15」——两边对不上，
+                    # 让人以为统计出错。这里把重试后的真实计数推给界面。
+                    try:
+                        _progress = {
+                            'done': stats['success'] + stats['fail'] + stats['skip'],
+                            'total': len(songs),
+                            'success': stats['success'],
+                            'fail': stats['fail'],
+                            'skip': stats['skip'],
+                            'active': 0,
+                            'speed': None,
+                            'retrying': True,
+                        }
+                        print('##PROGRESS## ' + json.dumps(_progress, ensure_ascii=False),
+                              flush=True)
+                    except Exception:
+                        pass
         finally:
             # 同主循环：重试阶段也要保证 Node 子进程被回收
             for retry_server in retry_servers:
@@ -3170,6 +3192,23 @@ def run_download(args, songs, db_path=None, title=None):
         else:
             fail_list = []
         print(f'二次重试完成：仍失败 {len(fail_list)} 首。')
+
+    # 收尾时再推一次最终计数，保证界面数字与引擎汇总完全一致
+    # （含停止时补记的「未完成」条目）。
+    try:
+        _final = {
+            'done': stats['success'] + stats['fail'] + stats['skip'],
+            'total': len(songs),
+            'success': stats['success'],
+            'fail': stats['fail'],
+            'skip': stats['skip'],
+            'active': 0,
+            'speed': None,
+            'finished': True,
+        }
+        print('##PROGRESS## ' + json.dumps(_final, ensure_ascii=False), flush=True)
+    except Exception:
+        pass
 
     # 被动停止时，把「本次还没轮到下载」的歌补进失败清单。
     #
