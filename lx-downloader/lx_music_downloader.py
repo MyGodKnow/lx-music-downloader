@@ -1220,23 +1220,24 @@ def download_file(url, dest_path, timeout=120, retries=3, parts=None):
         try:
             headers = {'User-Agent': 'Mozilla/5.0', 'Accept': 'audio/*,*/*;q=0.8', 'Referer': url}
             if parts is not None:
-                # 已显式指定分片数：仍需知道总大小才能切片。
+                # 已显式指定分片数：需要总大小才能切片。
                 # 这时不必测速（调用方自己决定了），只取 Content-Range。
                 total_size, _speed, _head = _probe_size_and_speed(
                     url, headers, timeout, sample_bytes=1)
                 n_parts = parts
-                _download_sequential(url, dest_path, timeout, headers)
             else:
                 # 一次请求同时拿到总大小与单连接速度，再据此决定是否分片。
                 total_size, speed, head = _probe_size_and_speed(url, headers, timeout)
                 n_parts = _choose_parts(total_size, speed)
-                if total_size and n_parts > 1:
-                    _multipart_download(url, dest_path, total_size, n_parts, headers, timeout)
-                else:
-                    # 探测阶段已读到开头 head，直接写进文件并让下载从其后继续，
-                    # 省掉把同一段 256KB 再下一遍。
-                    _download_sequential(url, dest_path, timeout, headers,
-                                         preloaded=head if total_size else b'')
+            if total_size and n_parts > 1:
+                _multipart_download(url, dest_path, total_size, n_parts, headers, timeout)
+            else:
+                # 探测阶段已读到开头 head，直接写进文件并让下载从其后继续，
+                # 省掉把同一段 256KB 再下一遍。
+                # head 只在「按速度自动决策」的分支里读到；显式 parts 分支读的是
+                # sample_bytes=1 的一个字节，不属于可复用的完整前缀，不能传。
+                pre = head if (parts is None and total_size) else b''
+                _download_sequential(url, dest_path, timeout, headers, preloaded=pre)
             return True
         except Exception as e:
             last_error = e
@@ -1319,14 +1320,22 @@ def _download_sequential(url, dest_path, timeout, headers, preloaded=b''):
 
 
 def _download_part(url, start, end, part_path, headers, timeout):
-    """下载 [start, end] 字节范围到独立临时分片文件。"""
+    """下载 [start, end] 字节范围到独立临时分片文件。
+
+    **必须**校验实际写入字节数：CDN 中途断流时 resp.read() 只是返回空，
+    循环会正常结束，分片文件变短但不报错。若不校验，合并出来的文件
+    中间会缺一段，而头部（含时长信息）往往完好——四重校验因此照常通过，
+    用户拿到的是一个播放到中途就断掉的残损文件。
+    """
     h = dict(headers)
     h['Range'] = f'bytes={start}-{end}'
     req = Request(url, headers=h)
+    expected = end - start + 1
     with urlopen(req, timeout=timeout) as resp:
         status = getattr(resp, 'status', 200)
         if status != 206:
             raise RuntimeError(f'分片响应非 206: {status}')
+        written = 0
         with open(part_path, 'wb') as out:
             while True:
                 if DOWNLOAD_STOP_EVENT.is_set():
@@ -1335,6 +1344,10 @@ def _download_part(url, start, end, part_path, headers, timeout):
                 if not chunk:
                     break
                 out.write(chunk)
+                written += len(chunk)
+    if written != expected:
+        safe_unlink(part_path)
+        raise RuntimeError(f'分片不完整: 收到 {written} 字节，应为 {expected}')
 
 
 def _multipart_download(url, dest_path, total_size, parts, headers, timeout):
@@ -1375,6 +1388,7 @@ def _multipart_download(url, dest_path, total_size, parts, headers, timeout):
         raise RuntimeError(f'分片下载失败: {errors[0]}')
 
     # 按顺序合并各分片
+    merged = 0
     with open(dest, 'wb') as out:
         for _, _, pp in jobs:
             with open(pp, 'rb') as pin:
@@ -1383,9 +1397,15 @@ def _multipart_download(url, dest_path, total_size, parts, headers, timeout):
                     if not chunk:
                         break
                     out.write(chunk)
+                    merged += len(chunk)
     for _, _, pp in jobs:
         safe_unlink(pp)
-    return total_size
+    # 合并后按 Content-Range 声明的总大小复核一次。分片内部已有校验，
+    # 这里是最后一道防线：避免「每片都对、拼接却少一截」这类错误落盘。
+    if total_size and merged != total_size:
+        safe_unlink(dest)
+        raise RuntimeError(f'合并后大小不符: {merged} != {total_size}')
+    return merged
 
 
 def _print_timing(song, url_cost, dl_cost, total):

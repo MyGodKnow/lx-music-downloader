@@ -1242,5 +1242,98 @@ class ProbeMergeTest(unittest.TestCase):
         self.assertIsNone(speed)
 
 
+class TruncatedDownloadTest(unittest.TestCase):
+    """CDN 中途断流必须被发现，不能落一个「播放到一半就断」的残损文件。
+
+    resp.read() 在连接提前关闭时只是返回空，循环正常结束、不报错。
+    若不校验字节数，分片会变短，而合并后的文件头部（含时长信息）往往完好，
+    四重校验因此照常通过——这是最隐蔽的一类数据损坏。
+    """
+
+    BODY = bytes(range(256)) * 4000   # ~1MB
+
+    def _server(self, truncate=False):
+        import http.server
+        import threading
+
+        body = self.BODY
+        proto = http.server.BaseHTTPRequestHandler
+
+        class H(proto):
+            protocol_version = 'HTTP/1.1'
+
+            def do_GET(self):
+                rng = self.headers.get('Range')
+                m = re.match(r'bytes=(\d+)-(\d*)', rng) if rng else None
+                if m:
+                    s = int(m.group(1))
+                    e = int(m.group(2)) if m.group(2) else len(body) - 1
+                    e = min(e, len(body) - 1)
+                    data, code = body[s:e + 1], 206
+                else:
+                    s, e, data, code = 0, len(body) - 1, body, 200
+                self.send_response(code)
+                self.send_header('Content-Type', 'audio/mpeg')
+                self.send_header('Content-Range', f'bytes {s}-{e}/{len(body)}')
+                self.send_header('Content-Length', str(len(data)))
+                self.end_headers()
+                try:
+                    self.wfile.write(data[:len(data) // 2] if truncate else data)
+                    self.wfile.flush()
+                except Exception:
+                    pass
+                if truncate:
+                    self.close_connection = True
+
+            def log_message(self, *a):
+                pass
+
+        srv = http.server.HTTPServer(('127.0.0.1', 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.shutdown)
+        return f'http://127.0.0.1:{srv.server_port}/f.mp3'
+
+    def test_truncated_parts_are_rejected(self):
+        url = self._server(truncate=True)
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / 'a.part'
+            with mock.patch.object(eng, 'is_safe_http_url', return_value=True):
+                with self.assertRaises(RuntimeError) as ctx:
+                    eng.download_file(url, p, retries=0, parts=4)
+            self.assertIn('分片不完整', str(ctx.exception))
+            self.assertFalse(p.exists(), '失败后不能留下残损文件')
+            self.assertFalse(list(Path(td).glob('*.part[0-9]')), '分片临时文件要清干净')
+
+    def test_explicit_parts_actually_uses_multipart(self):
+        """显式传 parts 时必须真的分片，不能静默退化成顺序下载。
+
+        这里曾有一个重构引入的 bug：parts 分支里直接调用了
+        _download_sequential，把 n_parts 完全忽略，
+        导致「分片」名存实亡，截断检测也随之失效。
+        """
+        url = self._server()
+        calls = []
+        real = eng._multipart_download
+
+        def spy(*a, **k):
+            calls.append(a)
+            return real(*a, **k)
+
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / 'b.part'
+            with mock.patch.object(eng, 'is_safe_http_url', return_value=True),                     mock.patch.object(eng, '_multipart_download', side_effect=spy):
+                eng.download_file(url, p, retries=0, parts=4)
+            self.assertEqual(len(calls), 1, 'parts=4 必须走分片路径')
+            self.assertEqual(p.read_bytes(), self.BODY)
+
+    def test_auto_decision_matches_full_bytes(self):
+        url = self._server()
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / 'c.part'
+            with mock.patch.object(eng, 'is_safe_http_url', return_value=True):
+                eng.download_file(url, p, retries=0)
+            self.assertEqual(p.read_bytes(), self.BODY)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
