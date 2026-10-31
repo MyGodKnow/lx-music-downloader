@@ -1917,6 +1917,44 @@ class Range416RecoveryTest(unittest.TestCase):
                 eng.download_file(url, p, retries=0)
             self.assertEqual(p.read_bytes(), self.BODY)
 
+    def test_server_rejecting_all_ranges_recovers(self):
+        """有些 CDN/防盗链节点对**任何** Range 都回 416（哪怕从 0 开始）。
+
+        之前的恢复逻辑限定 `existing > 0`，这种「全新下载也被 416 拒绝」
+        的情况仍然直接判整首失败。现在统一去掉 Range 重试。
+        """
+        import http.server
+        import threading
+        body = self.BODY
+
+        class H(http.server.BaseHTTPRequestHandler):
+            protocol_version = 'HTTP/1.1'
+
+            def do_GET(self):
+                if self.headers.get('Range'):
+                    self.send_response(416)
+                    self.send_header('Content-Length', '0')
+                    self.end_headers()
+                    return
+                self.send_response(200)
+                self.send_header('Content-Type', 'audio/mpeg')
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a):
+                pass
+
+        srv = http.server.HTTPServer(('127.0.0.1', 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.shutdown)
+        url = f'http://127.0.0.1:{srv.server_port}/f.mp3'
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / 'd.part'
+            with mock.patch.object(eng, 'is_safe_http_url', return_value=True):
+                eng.download_file(url, p, retries=0)
+            self.assertEqual(p.read_bytes(), self.BODY)
+
 
 class NonRetryableUrlErrorTest(unittest.TestCase):
     """确定性取链失败不该退避重试。

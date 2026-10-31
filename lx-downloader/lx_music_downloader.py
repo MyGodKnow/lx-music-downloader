@@ -1360,13 +1360,14 @@ def _download_sequential(url, dest_path, timeout, headers, preloaded=b''):
     try:
         resp = urlopen(Request(url, headers=h), timeout=timeout)
     except HTTPError as exc:
-        # 416 Range Not Satisfiable：残留的 .part 比服务器上的实际内容还长
-        # （典型成因：上次下载的是另一个更大的文件、或链接换成了更短的版本、
-        #  或上次因断流写入了超出总长的数据）。
-        # 断点续传的前提「已有长度 < 总长」不成立，只能丢掉重下。
-        # 不处理的话这里会直接抛出，整首歌被判失败——日志里反复出现的
-        # `HTTP Error 416` 就是它。
-        if getattr(exc, 'code', None) == 416 and existing > 0:
+        # 416 Range Not Satisfiable。有两种成因：
+        #   a) 残留 .part 比服务器上的实际内容还长（旧版本遗留、链接换成短版本）
+        #   b) 服务器对**任何** Range 请求都拒绝（部分 CDN/防盗链节点会这样，
+        #      即使我们从 0 开始发 Range 也回 416）
+        # 两种都可以靠「去掉 Range、从头完整下载」解决，因此不区分，统一重试一次。
+        # 之前只在 existing > 0 时才恢复，(b) 情况仍然直接判整首失败——
+        # 日志里 `kw: flac: 下载失败: HTTP Error 416` 就是它。
+        if getattr(exc, 'code', None) == 416:
             safe_unlink(dest_path)
             h.pop('Range', None)
             resp = urlopen(Request(url, headers=h), timeout=timeout)
@@ -2870,7 +2871,15 @@ def run_download(args, songs, db_path=None, title=None):
                     # 开启降级时，获取链接、下载和严格时长校验都失败后才切换低音质。
                     quality_levels = lower_quality_options(args.quality, args.min_quality if hasattr(args, 'min_quality') else '320k') if args.fallback_quality else [args.quality]
                     quality_errors = []
+                    # 该源是否「连链接都拿不到」。一旦成立，就没必要再试更低档位：
+                    # 降档只是把「要 flac」改成「要 320k」，而这里失败的原因是
+                    # 音源本身不支持这首/被 block/格式加密——同一批音源不会因为
+                    # 降档就突然有链接。实测失败歌每首因此白等 30~70 秒。
+                    source_has_no_url = False
                     for requested_quality in quality_levels:
+                        if source_has_no_url:
+                            quality_errors.append(f'{requested_quality}: 已确认该源无可用链接，跳过')
+                            continue
                         if time.time() > song_deadline:
                             budget_hit = True
                             quality_errors.append('单曲时间预算耗尽')
@@ -2911,6 +2920,10 @@ def run_download(args, songs, db_path=None, title=None):
                             # 前缀成 `quality: ...`，这里只标当前档位，
                             # 不再嵌一层，否则日志会出现 `320k: 320k: ...`。
                             msg = str(quality_error)
+                            # 「所有音源均未返回可用链接」= 这一档连链接都没有。
+                            # 标记后跳过该源剩余档位，避免每档都白跑一遍完整预算。
+                            if '所有音源均未返回可用链接' in msg:
+                                source_has_no_url = True
                             if msg.startswith(f'{requested_quality}:'):
                                 quality_errors.append(msg)
                             else:
