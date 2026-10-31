@@ -1918,5 +1918,53 @@ class Range416RecoveryTest(unittest.TestCase):
             self.assertEqual(p.read_bytes(), self.BODY)
 
 
+class NonRetryableUrlErrorTest(unittest.TestCase):
+    """确定性取链失败不该退避重试。
+
+    get_urls 原先对所有错误都重试 3 次并退避（3s+8s），而桥接内部已有
+    ~40s 预算，叠加后一首歌光取链接就要近两分钟（用户日志实测 109.8s /
+    112.7s）。这些错误重试多少次结果都一样。
+    """
+
+    def test_constant_covers_known_deterministic_errors(self):
+        for tag in ('加密格式不可用', '缺少 songId', '缺失歌曲标识',
+                    '无法获取歌曲ID', 'block ip', '不支持的平台'):
+            with self.subTest(tag=tag):
+                self.assertIn(tag, eng.NON_RETRYABLE_URL_ERRORS)
+
+    def test_retry_guard_stops_immediately(self):
+        """命中确定性错误时，应该只发一次请求就返回。"""
+        calls = []
+
+        class FakeServer:
+            def request(self, *a, **k):
+                calls.append(1)
+                return {'ok': False, 'error': '所有音源均未返回可用链接（K×H测试.js: 加密格式不可用）'}
+
+        srv = eng.UrlServer.__new__(eng.UrlServer)
+        # 直接借用真实方法，只替换 self.request
+        srv.request = FakeServer().request
+        with self.assertRaises(RuntimeError) as ctx:
+            eng.UrlServer.get_urls(srv, 'kw', {}, 'flac')
+        self.assertEqual(len(calls), 1, '确定性错误必须立即失败，不能重试')
+        self.assertIn('加密格式', str(ctx.exception))
+
+    def test_transient_error_still_retries(self):
+        """瞬时错误（超时/限流）仍要重试，不能一刀切。"""
+        calls = []
+
+        class FakeServer:
+            def request(self, *a, **k):
+                calls.append(1)
+                return {'ok': False, 'error': '取链接超时'}
+
+        srv = eng.UrlServer.__new__(eng.UrlServer)
+        srv.request = FakeServer().request
+        with mock.patch.object(eng.time, 'sleep', return_value=None):
+            with self.assertRaises(RuntimeError):
+                eng.UrlServer.get_urls(srv, 'kw', {}, 'flac')
+        self.assertEqual(len(calls), 3, '瞬时错误应重试满 3 次')
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

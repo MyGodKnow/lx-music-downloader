@@ -287,6 +287,26 @@ def find_node():
 # 与 lx_url_server.js 的 JSON-RPC 管道封装：每个下载线程一个独立实例，
 # 避免全局锁把取链接请求串行化（见 run() 里的 thread-local 池）。
 
+# 取链接时「重试也没用」的错误特征（确定性失败）。
+#
+# 背景：get_urls 原先对所有错误都重试 3 次并退避（3s + 8s），而桥接内部
+# 本身已有 ~40s 预算。两者叠加后，一首歌光「取链接」就能耗掉近两分钟——
+# 用户日志里 `取链接 109.8s` / `112.7s` 正是这么来的，还会拖住同批其它歌。
+# 这些错误（音源不支持该曲、格式加密、缺 ID、被 block）重试多少次结果
+# 都一样，必须立即失败，让上层尽快换源/换档。
+NON_RETRYABLE_URL_ERRORS = (
+    '加密格式不可用',
+    '未返回有效链接',
+    '链接校验失败',
+    '低码率',
+    '缺少 songId',
+    '缺失歌曲标识',
+    '无法获取歌曲ID',
+    'block ip',
+    '不支持的平台',
+    '所有音源均未返回可用链接',
+)
+
 
 class UrlServer:
     """与 Node 音源桥接服务通信（常驻子进程）"""
@@ -440,8 +460,17 @@ class UrlServer:
                     continue
                 return obj
 
+    # 这类错误是**确定性**的：重试多少次结果都一样，只会白等。
+    # 实测用户日志里「取链接 109.8s」「取链接 112.7s」就是它们造成的——
+    # 桥接内部已有 40s 预算，外层再重试 3 次并退避（3s+8s），
+    # 一首歌光取链接就能烧掉近两分钟，还会拖住其它歌。
     def get_urls(self, source, music_info, quality):
-        """获取播放链接候选列表（多音质），对临时网络错误/平台限流自动退避重试。"""
+        """获取播放链接候选列表（多音质）。
+
+        只对**瞬时性**错误（限流、网络抖动、超时）退避重试；
+        确定性错误（音源根本不支持/拿不到这首歌、格式加密、缺 ID）
+        立即失败，让上层快速换源换档——否则每首歌都要白等两分钟。
+        """
         last_error = None
         for attempt in range(3):
             try:
@@ -451,8 +480,12 @@ class UrlServer:
                 last_error = RuntimeError(resp.get('error', '未知错误'))
             except Exception as exc:
                 last_error = exc
-            # 平台限流/网络抖动通常几十秒内恢复；退避重试比立即判死更能命中。
-            time.sleep(3 if attempt == 0 else 8)
+            msg = str(last_error or '')
+            if any(tag in msg for tag in NON_RETRYABLE_URL_ERRORS):
+                raise RuntimeError(msg)
+            if attempt < 2:
+                # 平台限流/网络抖动通常几十秒内恢复；退避重试比立即判死更能命中。
+                time.sleep(3 if attempt == 0 else 8)
         raise RuntimeError(str(last_error or '未知错误'))
 
     def search_by_name_list(self, name, singer, interval=None):
@@ -1265,7 +1298,14 @@ def download_file(url, dest_path, timeout=120, retries=3, parts=None):
                 total_size, speed, head = _probe_size_and_speed(url, headers, timeout)
                 n_parts = _choose_parts(total_size, speed)
             if total_size and n_parts > 1:
-                _multipart_download(url, dest_path, total_size, n_parts, headers, timeout)
+                try:
+                    _multipart_download(url, dest_path, total_size, n_parts, headers, timeout)
+                except _RangeUnsatisfiable:
+                    # 探测到的总大小 > 实际内容（链接换成了短版本等）。
+                    # 顺序下载不依赖预知总大小，能照常拿到完整内容，
+                    # 因此降级而不是判失败。
+                    safe_unlink(dest_path)
+                    _download_sequential(url, dest_path, timeout, headers)
             else:
                 # 探测阶段已读到开头 head，直接写进文件并让下载从其后继续，
                 # 省掉把同一段 256KB 再下一遍。
@@ -1378,14 +1418,24 @@ def _download_part(url, start, end, part_path, headers, timeout):
 
     **必须**校验实际写入字节数：CDN 中途断流时 resp.read() 只是返回空，
     循环会正常结束，分片文件变短但不报错。若不校验，合并出来的文件
-    中间会缺一段，而头部（含时长信息）往往完好——四重校验因此照常通过，
+    中间会缺一段，而头部（含时长信息）往往完好，四重校验因此照常通过，
     用户拿到的是一个播放到中途就断掉的残损文件。
     """
     h = dict(headers)
     h['Range'] = f'bytes={start}-{end}'
     req = Request(url, headers=h)
     expected = end - start + 1
-    with urlopen(req, timeout=timeout) as resp:
+    try:
+        resp = urlopen(req, timeout=timeout)
+    except HTTPError as exc:
+        # 416 出现在分片路径上，说明「探测到的总大小」比服务器实际内容大
+        # （链接换成了更短的版本、CDN 缓存了旧长度、或探测时拿到了别的对象）。
+        # 这时把错误原样抛给上层只会让整首歌失败，而实际内容是好的——
+        # 交给 _multipart_download 的降级逻辑处理（改用顺序下载）。
+        if getattr(exc, 'code', None) == 416:
+            raise _RangeUnsatisfiable(f'分片 {start}-{end} 越界（共 {expected} 字节）')
+        raise
+    with resp:
         status = getattr(resp, 'status', 200)
         if status != 206:
             raise RuntimeError(f'分片响应非 206: {status}')
@@ -1439,6 +1489,11 @@ def _multipart_download(url, dest_path, total_size, parts, headers, timeout):
     if errors:
         for _, _, pp in jobs:
             safe_unlink(pp)
+        # 只要有一片越界（416），说明切片用的 total_size 比实际内容大。
+        # 内容本身是好的，不该因此判整首失败：抛专用异常，
+        # 由 download_file 降级为顺序下载（顺序下载不依赖预知总大小）。
+        if any(isinstance(e, _RangeUnsatisfiable) for e in errors):
+            raise _RangeUnsatisfiable(str(errors[0]))
         raise RuntimeError(f'分片下载失败: {errors[0]}')
 
     # 按顺序合并各分片
@@ -1614,6 +1669,15 @@ class _QualityShortfall(RuntimeError):
     与「内容不合格」区分开，是为了让跨档位复用（download_with_candidates 的
     reuse 参数）能保留已下好的文件。它是 RuntimeError 的子类，
     调用方无需特殊处理，错误文案与语义和普通失败一致。
+    """
+
+
+class _RangeUnsatisfiable(RuntimeError):
+    """内部信号：分片请求的字节范围超出服务器实际内容（HTTP 416）。
+
+    成因通常是「探测到的总大小 > 实际大小」，例如链接被换成了更短的版本、
+    CDN 缓存了旧长度。内容本身是好的，只是切片算错了，
+    因此 _multipart_download 收到它应该降级为顺序下载，而不是判整首失败。
     """
 
 
