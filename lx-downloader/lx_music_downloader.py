@@ -2054,10 +2054,17 @@ def read_artist_tag(path):
 
 
 def artist_matches_downloaded(path, expected_singer):
-    """若文件带 artist 标签，校验是否与预期歌手**严格**匹配。
+    """若文件带 artist 标签，校验其中是否有与预期歌手匹配的项。
 
-    严格化点：不再吃掉括号内容与标点，避免「某某（feat. 谁）」被判成「某某」。
-    预期歌手为空或标签为空时仍不做判断（返回 True），避免误杀无标签文件。
+    匹配口径：两侧都按分隔符拆成歌手集合，**至少有一位完全相同**即通过。
+    不要求「预期里每位都出现」——合作曲的音频标签常只写主唱一人
+    （实测 `林俊杰、G.E.M. 邓紫棋` 的 FLAC 只有 `林俊杰` 标签，
+    时长 280.1s 与预期 280s 完全吻合，内容其实正确），
+    按「全都要有」会把这类正确文件大面积误判成翻唱版。
+
+    严格化点：不做括号内容剥离与标点忽略，避免「某某（feat. 谁）」
+    被判成「某某」后与真正的翻唱混淆。
+    预期歌手为空或标签为空时不做判断（返回 True），避免误杀无标签文件。
     """
     if not expected_singer:
         return True
@@ -2070,22 +2077,26 @@ def artist_matches_downloaded(path, expected_singer):
     for a in tags:
         if strict_song_key(a) == exp_n:
             return True
-    # 多歌手：预期按分隔符拆段后，每段都要能在标签里找到完全相等的一项。
+    # 多歌手：按分隔符拆成集合后比对。
     #
-    # 关键：标签侧**也必须拆**。很多文件把多位歌手放进同一个 artist 字段，
-    # 形如 `"水瀬いのり、久保ユリカ"`；若只拆预期、不拆标签，
-    # `tag_norms` 里就只有一个长串，两个单人都匹配不上，
-    # 于是同一首歌因「标签里歌手顺序不同」被判成翻唱版而拒收——
-    # 这是真实库里反复出现的误杀。
+    # 判定规则是「**至少有一位**歌手匹配」，而不是「预期里每一位都要出现」。
+    # 原因（真实案例，误杀非常严重）：合作曲的音频文件常只写主唱一个标签，
+    # 例如预期 `林俊杰、G.E.M. 邓紫棋`，文件标签只有 `林俊杰`——
+    # 内容其实完全正确（时长、码率都对），却因为「少一位歌手」被判成翻唱版。
+    # 实测这类误拒占了失败原因的很大比例。
+    #
+    # 安全性：仍然拒绝真正的翻唱（标签歌手与预期毫无交集），
+    # 而且时长校验、版本词校验、音质校验都还在，不会因此放进错歌。
     split_re = r'[、,，;&/]'
     exp_parts = [strict_song_key(x) for x in re.split(split_re, expected_singer) if x.strip()]
     tag_norms = []
     for a in tags:
         tag_norms.extend(strict_song_key(x) for x in re.split(split_re, str(a)) if x.strip())
     exp_parts = [e for e in exp_parts if e]
-    if exp_parts:
-        return all(any(e == t for t in tag_norms) for e in exp_parts)
-    return False
+    tag_norms = [t for t in tag_norms if t]
+    if not exp_parts or not tag_norms:
+        return False
+    return any(e == t for e in exp_parts for t in tag_norms)
 
 
 # ============ 设置持久化与命令行界面 ============

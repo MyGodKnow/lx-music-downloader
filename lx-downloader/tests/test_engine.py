@@ -1547,8 +1547,19 @@ class MultiArtistMatchTest(unittest.TestCase):
         self.assertTrue(self._match('水瀬いのり/久保ユリカ', '久保ユリカ、水瀬いのり'))
         self.assertTrue(self._match('水瀬いのり, 久保ユリカ', '久保ユリカ、水瀬いのり'))
 
-    def test_missing_expected_artist_is_rejected(self):
-        self.assertFalse(self._match('久保ユリカ', '久保ユリカ、水瀬いのり'))
+    def test_collab_with_single_main_artist_tag_is_accepted(self):
+        """合作曲只标主唱一人应通过。
+
+        实测样本：预期「林俊杰、G.E.M. 邓紫棋」，FLAC 文件标签只有「林俊杰」，
+        时长 280.1s 与预期 280s 完全吻合——内容正确，此前却因
+        「少一位歌手」被判成翻唱版而被拒。
+        """
+        self.assertTrue(self._match('林俊杰', '林俊杰、G.E.M. 邓紫棋'))
+
+    def test_unrelated_artist_is_rejected(self):
+        """与预期毫无交集仍要拒绝（真翻唱）。"""
+        self.assertFalse(self._match('RyaVocal', '周杰伦'))
+        self.assertFalse(self._match('某某翻唱', '久保ユリカ、水瀬いのり'))
 
     def test_completely_different_is_rejected(self):
         self.assertFalse(self._match('邓紫棋', '周杰伦'))
