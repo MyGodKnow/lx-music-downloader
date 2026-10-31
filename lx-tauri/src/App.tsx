@@ -373,7 +373,10 @@ function App() {
       addLog("info", `成功读取 ${pls.length} 个歌单`);
     } catch (err) {
       setPlaylists([]);
-      addLog("error", String(err));
+      // 带上上下文：空字符串错误（Tauri 侧 reject 无 payload 时会出现）
+      // 以前会打出一行只有 "error" 两个字、完全没有信息的日志，用户
+      // 和我们都没法判断是配置错误、引擎缺失还是数据库被占用。
+      addLog("error", `读取歌单失败: ${err instanceof Error ? err.message : String(err) || "未知原因"}`);
     } finally {
       setLoadingPl(false);
     }
@@ -391,7 +394,8 @@ function App() {
       setSourcesDir(dirPath);
       setLxApiPath(lxPath);
     } catch (err) {
-      addLog("error", String(err));
+      // 同样带上上下文，避免出现只有 "error" 一行、无法定位的日志
+      addLog("error", `读取音源列表失败: ${err instanceof Error ? err.message : String(err) || "未知原因"}`);
     }
   }, [addLog]);
 
@@ -476,7 +480,12 @@ function App() {
         if (typeof cfg.dir === "string") setDir(cfg.dir);
         if (typeof cfg.db === "string") setDbPath(cfg.db);
       })
-      .catch(() => { /* 读不到就用默认值 */ });
+      .catch((err) => {
+        // 静默回退到默认值即可，但要留一条可见记录：
+        // 设置读失败通常意味着引擎释放出了问题，完全不提示会让用户
+        // 下次发现「改了设置没保存」却毫无线索。
+        addLog("error", `读取设置失败（将使用默认值）: ${err instanceof Error ? err.message : String(err) || "未知原因"}`);
+      });
     return () => { cancelled = true; };
     // 只在挂载时读一次；pythonPath 变化不该重新覆盖用户当前选择
     // eslint-disable-next-line react-hooks/exhaustive-deps

@@ -96,10 +96,22 @@ fn engine_version() -> String {
     format!("{:x}", sha2::Digest::finalize(hasher))
 }
 
+/// 串行化引擎释放/升级。
+///
+/// 必须加锁：`resolve_engine` 会被**每个** Tauri 命令调用
+/// （list_playlists、read_settings、spawn_task…），而界面启动时会并发触发
+/// 多个命令。两个 `ensure_engine` 同时进入升级流程时，会各自
+/// `remove_dir_all(staging)` / `rename(dir → old)` / `rename(staging → dir)`，
+/// 互相删掉对方正在解压的目录，最终把 `engine.staging` 留在磁盘上、
+/// 甚至让刚释放好的引擎被挪走——表现为「一打开就报错」。
+/// 用一把进程级锁把它们排成一条队；拿到锁后先复查一遍 fresh，避免重复解压。
+static ENGINE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// 确保内置引擎已释放到本地；版本变化（内容哈希不同）时重新释放。
 /// 升级采用「解压到临时目录 → 目录交换」的方式：正在运行的旧引擎文件被占用时
 /// 也能完成升级，不会因为删不掉旧目录而卡在旧版本。
 fn ensure_engine() -> Result<std::path::PathBuf, String> {
+    let _guard = ENGINE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = engine_home().ok_or_else(|| "无法定位 LOCALAPPDATA".to_string())?;
     let exe = dir.join("lx_music_downloader.exe");
     let marker = dir.join(".engine_hash");
