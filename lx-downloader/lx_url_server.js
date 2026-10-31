@@ -287,6 +287,66 @@ function buildLx(apiInfo) {
 let requestHandlers = [];
 let initError = null;
 
+/**
+ * 最小 DOM 桩，供音源脚本在初始化阶段使用。
+ *
+ * 只实现「读环境」这一类操作：元素查找/创建、属性读写、appendChild、
+ * textContent、cookie。不做布局、不解析 HTML、不产生真实节点。
+ * 目的很明确：让依赖 `document` 的音源能完成注册，而不是加载失败。
+ */
+function makeDocumentStub() {
+  const el = (tag) => ({
+    tagName: String(tag || 'div').toUpperCase(),
+    style: {},
+    dataset: {},
+    children: [],
+    childNodes: [],
+    attributes: {},
+    innerHTML: '',
+    innerText: '',
+    textContent: '',
+    value: '',
+    checked: false,
+    setAttribute(k, v) { this.attributes[k] = v; },
+    getAttribute(k) { return this.attributes[k] ?? null; },
+    removeAttribute(k) { delete this.attributes[k]; },
+    appendChild(c) { this.children.push(c); return c; },
+    removeChild(c) { const i = this.children.indexOf(c); if (i >= 0) this.children.splice(i, 1); return c; },
+    insertBefore(c) { this.children.push(c); return c; },
+    addEventListener() {},
+    removeEventListener() {},
+    querySelector() { return null; },
+    querySelectorAll() { return []; },
+    getElementsByTagName() { return []; },
+    click() {},
+    focus() {},
+    blur() {},
+    getBoundingClientRect() { return { top: 0, left: 0, width: 0, height: 0, bottom: 0, right: 0 }; },
+  });
+  const head = el('head');
+  const body = el('body');
+  const doc = {
+    cookie: '',
+    readyState: 'complete',
+    title: '',
+    head,
+    body,
+    documentElement: el('html'),
+    createElement: (t) => el(t),
+    createElementNS: (_ns, t) => el(t),
+    createTextNode: (t) => ({ nodeType: 3, textContent: String(t) }),
+    getElementById: () => null,
+    getElementsByTagName: () => [],
+    getElementsByClassName: () => [],
+    querySelector: () => null,
+    querySelectorAll: () => [],
+    addEventListener: () => {},
+    removeEventListener: () => {},
+    appendChild: (c) => (body.appendChild(c), c),
+  };
+  return doc;
+}
+
 async function init() {
   // 注意：音源脚本是不可信第三方代码，但现实中的落雪音源大量依赖
   // globalThis.lx、new Function/eval 等能力，过度加固会直接加载失败
@@ -295,11 +355,28 @@ async function init() {
   // vm 不是强安全边界，不要加载来源不明的脚本。
   for (const api of scripts) {
     const { lx, handlers } = buildLx(api);
+    // 落雪桌面端基于 Electron：音源跑在渲染进程里，能拿到真实的
+    // document / navigator / location。不少音源（如六音 v1.0.7）初始化时
+    // 会直接访问 document 或 navigator.userAgent，我们的 vm 沙箱没有这些，
+    // 于是报 `document is not defined` 而**整个音源加载失败**——
+    // 实测六音 v1.0.7 就是这样，音源本身没坏，是环境缺东西。
+    // 这里补一组最小可用桩（只支持初始化期常见的读操作），不做真实渲染，
+    // 也不引入网络/文件能力。
+    const stubDoc = makeDocumentStub();
+    const stubNav = { userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) lx-music-desktop/2.0.0', platform: 'Win32', language: 'zh-CN' };
+    const stubLoc = { href: 'http://localhost/', protocol: 'http:', host: 'localhost', origin: 'http://localhost' };
     const context = {
-      lx, window: { lx },
+      lx,
+      window: { lx, document: stubDoc, navigator: stubNav, location: stubLoc },
+      document: stubDoc,
+      navigator: stubNav,
+      location: stubLoc,
       console: { log: () => {}, error: () => {}, warn: () => {} },
-      setTimeout, clearTimeout, Buffer,
+      setTimeout, clearTimeout, setInterval, clearInterval, Buffer,
       fetch, AbortSignal, URL, // 供音源做 URL 可下载性校验
+      TextEncoder, TextDecoder,
+      atob: (v) => Buffer.from(String(v), 'base64').toString('binary'),
+      btoa: (v) => Buffer.from(String(v), 'binary').toString('base64'),
     };
     vm.createContext(context);
     try {
