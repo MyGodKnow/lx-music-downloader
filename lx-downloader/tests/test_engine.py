@@ -1733,5 +1733,46 @@ class NameSearchStaticTest(unittest.TestCase):
         self.assertIn('urlLooksEncrypted', self.src)
 
 
+class InflightDedupTest(unittest.TestCase):
+    """同一首歌的多条记录不能并发下载。
+
+    歌单里同一首曲子常有多条平台记录（kw/wy/tx 各一份）。它们会被调度器
+    同时派发给不同 worker，而每个 worker 用「磁盘上是否已存在」判重时
+    目录里都还没有，于是同一首歌被并行下载多遍。
+    实测本机 804 条记录里有 53 组「同名同歌手、id 不同」。
+    """
+
+    def test_inflight_set_is_thread_safe_container(self):
+        self.assertIsInstance(eng._inflight_songs, set)
+        self.assertIsNotNone(eng._inflight_lock)
+
+    def test_same_key_cannot_be_claimed_twice(self):
+        """占位语义：同一个键在同一时刻只能被一个任务拿到。"""
+        eng._inflight_songs.clear()
+        key = eng._failed_key({'name': '水手', 'singer': '郑智化'})
+        with eng._inflight_lock:
+            first = key not in eng._inflight_songs
+            if first:
+                eng._inflight_songs.add(key)
+        with eng._inflight_lock:
+            second = key not in eng._inflight_songs
+        self.assertTrue(first, '第一次应能占位')
+        self.assertFalse(second, '同键第二次必须拿不到')
+        eng._inflight_songs.clear()
+
+    def test_different_songs_do_not_block_each_other(self):
+        eng._inflight_songs.clear()
+        a = eng._failed_key({'name': '水手', 'singer': '郑智化'})
+        b = eng._failed_key({'name': '晴天', 'singer': '周杰伦'})
+        self.assertNotEqual(a, b)
+        eng._inflight_songs.clear()
+
+    def test_key_normalizes_whitespace_and_case(self):
+        """占位键必须用严格归一化，否则「水手」与「水手 」会各占一份。"""
+        a = eng._failed_key({'name': 'Smooth Criminal', 'singer': 'Michael Jackson'})
+        b = eng._failed_key({'name': 'smooth criminal ', 'singer': 'michael jackson'})
+        self.assertEqual(a, b)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

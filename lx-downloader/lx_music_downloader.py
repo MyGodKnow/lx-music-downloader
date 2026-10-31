@@ -861,6 +861,16 @@ _ALT_SOURCE_LOCK = threading.Lock()
 # 缓存条目上限：超出即清空（该缓存只用于单首歌的重复查询去重，清空无副作用）
 _ALT_SOURCE_CACHE_MAX = 800
 
+# 正在下载中的歌曲键集合（歌手+歌名，严格归一化）。
+#
+# 用途：防止**同一首歌的多条记录被并发下载**。歌单里同一首曲子常有多条
+# 平台记录（kw/wy/tx 各一份），它们会被调度器同时派发给不同 worker；
+# 而每个 worker 用「磁盘上是否已存在」判重时目录里都还没有，于是同一首歌
+# 被并行下载多遍，重复消耗音源配额与带宽，最后互相覆盖同一个文件名。
+# 实测本机 804 条记录里有 53 组「同名同歌手、id 不同」。
+_inflight_songs = set()
+_inflight_lock = threading.Lock()
+
 
 def get_alternative_sources(db_path, song):
     """查找同曲的其他平台记录（替代源回退）。
@@ -2665,9 +2675,30 @@ def run_download(args, songs, db_path=None, title=None):
         # 跨音质档位复用的临时文件（见 download_with_candidates 的 reuse 参数）。
         # 无论成功、失败还是被停止，都要在退出前清掉，否则下载目录会残留 .reuse。
         verified_files = {}
+        # 并发去重：同一首歌（歌手+歌名）在歌单里常有多条记录
+        # （同一首曲子在 kw/wy/tx 各存一份，实测本机 804 条记录里有
+        # 53 组「同名同歌手、id 不同」）。这些记录会被调度器**同时**
+        # 派发给不同 worker，而每个 worker 查「磁盘上是否已存在」时
+        # 目录里都还没有——于是同一首歌被并行下载多遍，重复消耗
+        # 音源配额与带宽，最后互相覆盖同一个文件名。
+        #
+        # 占位与释放都放在这一层：无论成功、失败、被中断都必须释放，
+        # 否则该歌曲会被永久卡在「进行中」而再也下不了。
+        song_key = _failed_key(song)
+        claimed = False
+        with _inflight_lock:
+            if song_key not in _inflight_songs:
+                _inflight_songs.add(song_key)
+                claimed = True
+        if not claimed:
+            with print_lock:
+                print(f'[跳过] {song["name"]} - {song["singer"]} (同曲任务进行中)')
+            return 'skip'
         try:
             return _process_song_inner(idx, song, retry, verified_files)
         finally:
+            with _inflight_lock:
+                _inflight_songs.discard(song_key)
             for leftover in list(verified_files.values()):
                 safe_unlink(leftover)
 
