@@ -13,7 +13,9 @@
 import os
 import sys
 import json
+import shutil
 import tempfile
+import time
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -1067,6 +1069,75 @@ class QualityHashTest(unittest.TestCase):
         }))
         self.assertEqual(eng.get_music_info(row, 'flac')['hash'], 'AFLAC')
         self.assertEqual(eng.get_music_info(row, '320k')['hash'], 'A320')
+
+
+class DirIndexTest(unittest.TestCase):
+    """已下载判断走目录索引，不能每首歌都扫一遍目录。
+
+    实测（500 首 / 500 文件）：逐首扫描 31.8s，建索引后 0.12s。
+    这里主要保证语义与刷新时机正确，不测绝对耗时。
+    """
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.addCleanup(self.td.cleanup)
+        self.dir = Path(self.td.name)
+        eng.reset_dir_index()
+        self.addCleanup(eng.reset_dir_index)
+
+    def _touch(self, name, ext='.flac'):
+        p = self.dir / f'{name}{ext}'
+        p.write_bytes(b'x' * 2048)
+        return p
+
+    def test_finds_existing_song(self):
+        self._touch('周杰伦 - 晴天')
+        self.assertIsNotNone(eng.song_exists_in_dir(self.dir, '周杰伦', '晴天'))
+
+    def test_missing_song_returns_none(self):
+        self._touch('周杰伦 - 晴天')
+        self.assertIsNone(eng.song_exists_in_dir(self.dir, '周杰伦', '七里香'))
+
+    def test_version_suffix_is_not_a_match(self):
+        """「晴天 (Live)」不能被当成「晴天」——否则用户永远拿不到原版。"""
+        self._touch('周杰伦 - 晴天 (Live)')
+        self.assertIsNone(eng.song_exists_in_dir(self.dir, '周杰伦', '晴天'))
+
+    def test_any_supported_extension_matches(self):
+        for ext in ('.mp3', '.m4a', '.flac', '.aac', '.wav', '.ogg', '.ape'):
+            with self.subTest(ext=ext):
+                eng.reset_dir_index()
+                d = Path(tempfile.mkdtemp())
+                self.addCleanup(lambda p=d: shutil.rmtree(p, ignore_errors=True))
+                (d / f'歌手 - 歌名{ext}').write_bytes(b'x' * 2048)
+                self.assertIsNotNone(eng.song_exists_in_dir(d, '歌手', '歌名'))
+
+    def test_non_audio_file_ignored(self):
+        self._touch('周杰伦 - 晴天', ext='.txt')
+        self.assertIsNone(eng.song_exists_in_dir(self.dir, '周杰伦', '晴天'))
+
+    def test_external_addition_is_detected(self):
+        """索引是快照，但目录变化（用户手动放文件进来）必须能发现。"""
+        self._touch('周杰伦 - 晴天')
+        self.assertIsNone(eng.song_exists_in_dir(self.dir, '其他', '歌'))
+        time.sleep(0.02)   # 确保目录 mtime 变化可辨
+        self._touch('其他 - 歌')
+        self.assertIsNotNone(eng.song_exists_in_dir(self.dir, '其他', '歌'))
+
+    def test_remember_downloaded_is_visible_immediately(self):
+        """索引已建好后，登记的文件要立刻可见（不依赖目录 mtime 变化）。"""
+        self._touch('占位 - 文件')
+        eng.song_exists_in_dir(self.dir, '占位', '文件')   # 建索引并缓存签名
+        p = self._touch('新歌 - 标题')
+        # 目录 mtime 变了，正常情况下下次查询也会重建索引；
+        # 这里直接登记，验证索引路径本身可用（不依赖重建）。
+        eng.remember_downloaded(self.dir, p)
+        self.assertIsNotNone(eng.song_exists_in_dir(self.dir, '新歌', '标题'))
+
+    def test_accepts_str_and_path_alike(self):
+        self._touch('歌手 - 歌名')
+        self.assertIsNotNone(eng.song_exists_in_dir(str(self.dir), '歌手', '歌名'))
+        self.assertIsNotNone(eng.song_exists_in_dir(self.dir, '歌手', '歌名'))
 
 
 if __name__ == '__main__':

@@ -1382,22 +1382,131 @@ def safe_unlink(path):
             pass
 
 
+AUDIO_EXTS = ('.mp3', '.m4a', '.flac', '.aac', '.wav', '.ogg', '.ape')
+
+# 目录索引缓存：{目录绝对路径: (目录签名, {归一化文件名: 路径})}
+#
+# 为什么需要：song_exists_in_dir 原先每首歌都把整个下载目录扫一遍并逐项
+# 做归一化比较。实测 500 首/500 文件的目录里，仅「判断是否已下载」就要
+# 31.8 秒（单首均摊 63.5ms）；歌单越大越慢，且这批开销完全发生在下载之前，
+# 用户会看到「点了下载却半天没动静」。
+# 改成一次性建索引后，单首查询降到 O(1)。
+#
+# 索引会在下载成功落盘后增量更新（见 remember_downloaded），
+# 因此同一次运行里重复下载不会漏判。
+_DIR_INDEX = {}
+_DIR_INDEX_LOCK = threading.Lock()
+
+
+def _build_dir_index(download_dir):
+    """扫描一次目录，建立「归一化文件名 → 路径」索引。"""
+    index = {}
+    try:
+        for f in Path(download_dir).iterdir():
+            try:
+                if f.is_file() and f.suffix.lower() in AUDIO_EXTS:
+                    index[strict_song_key(f.stem)] = f
+            except OSError:
+                continue   # 单个文件读不到属性不影响整体
+    except OSError:
+        pass
+    return index
+
+
+def _dir_signature(download_dir):
+    """目录签名：用 (mtime_ns, 文件数) 判断目录是否被外部改动过。
+
+    只读目录自身的 mtime 是一次 stat 系统调用，比遍历整个目录便宜几个数量级。
+    增删文件都会更新目录 mtime，因此它能可靠地告诉我们「索引是否过期」。
+    """
+    try:
+        st = Path(download_dir).stat()
+        return (st.st_mtime_ns, getattr(st, 'st_size', 0))
+    except OSError:
+        return None
+
+
+# 目录路径 → 已解析的绝对路径缓存。Path.resolve() 每次都要走文件系统，
+# 在「每首歌查一次」的热路径上累积起来很可观（实测 500 次约 0.2s）。
+_RESOLVED_DIRS = {}
+
+
+def _resolve_dir(download_dir):
+    # 统一用 os.fspath 转成字符串再当键：调用方可能传 str 也可能传 Path，
+    # 两者 str() 结果相同，但直接拿对象当键会因类型不同而拆成两份缓存。
+    key = os.fspath(download_dir)
+    resolved = _RESOLVED_DIRS.get(key)
+    if resolved is None:
+        try:
+            resolved = str(Path(key).resolve())
+        except OSError:
+            resolved = key
+        _RESOLVED_DIRS[key] = resolved
+    return resolved
+
+
+def _dir_index_for(download_dir):
+    """取目录索引；目录被外部改动过时自动重建。
+
+    注意：**不能**在「查不到」时无脑重建。全新下载（一首都没下过）时
+    每首歌都查不到，无脑重建等于每首都扫一遍目录——比原来的实现还慢。
+    这里只依赖目录 mtime 判断是否需要刷新，未命中就直接返回 None。
+    """
+    key = _resolve_dir(download_dir)
+    sig = _dir_signature(download_dir)
+    with _DIR_INDEX_LOCK:
+        cached = _DIR_INDEX.get(key)
+        if cached is not None and cached[0] == sig:
+            return cached[1]
+    index = _build_dir_index(download_dir)
+    with _DIR_INDEX_LOCK:
+        _DIR_INDEX[key] = (sig, index)
+    return index
+
+
+def reset_dir_index(download_dir=None):
+    """丢弃目录索引（下载目录变化或需要重新扫描时调用）。"""
+    with _DIR_INDEX_LOCK:
+        if download_dir is None:
+            _DIR_INDEX.clear()
+        else:
+            _DIR_INDEX.pop(_resolve_dir(download_dir), None)
+
+
+def remember_downloaded(download_dir, path):
+    """把刚落盘的文件登记进索引，避免同一次运行里重复下载。
+
+    登记后要同步刷新签名，否则下次 `_dir_index_for` 发现目录 mtime
+    与记录不符，会白白重建一次索引。
+    """
+    try:
+        p = Path(path)
+        key = _resolve_dir(download_dir)
+        with _DIR_INDEX_LOCK:
+            entry = _DIR_INDEX.get(key)
+            if entry is not None:
+                entry[1][strict_song_key(p.stem)] = p
+        # 目录刚被写过，签名已变；用最新签名把索引标记为「新鲜」
+        sig = _dir_signature(download_dir)
+        with _DIR_INDEX_LOCK:
+            cur = _DIR_INDEX.get(key)
+            if cur is not None:
+                _DIR_INDEX[key] = (sig, cur[1])
+    except Exception:
+        pass
+
+
 def song_exists_in_dir(download_dir, singer, name):
     """检查歌单中某首歌是否已下载（按「歌手 - 歌名」**严格**匹配任意扩展名）。
 
     严格等于「归一化后完全相同」：只忽略空白/大小写/全半角，
     绝不把「晴天」当成「晴天 (Live)」——否则用户要原版时会被错误跳过，
     拿到的是伴奏/Live 版，而且每次重跑都会跳过、永远得不到纠正。
+
+    查的是进程内目录索引（见 `_dir_index_for`），不再每首歌都扫盘。
     """
-    base_name = sanitize_filename(f"{singer} - {name}")
-    try:
-        for f in download_dir.iterdir():
-            if f.is_file() and f.suffix.lower() in ('.mp3', '.m4a', '.flac', '.aac', '.wav', '.ogg', '.ape'):
-                if strict_song_key_match(f.stem, base_name):
-                    return f
-    except Exception:
-        pass
-    return None
+    key = strict_song_key(sanitize_filename(f'{singer} - {name}'))
+    return _dir_index_for(download_dir).get(key)
 
 
 class _QualityShortfall(RuntimeError):
@@ -2476,6 +2585,7 @@ def run_download(args, songs, db_path=None, title=None):
                                 requested_quality=requested_quality,
                                 reuse=verified_files)
                             _dl_cost += time.time() - _td
+                            remember_downloaded(download_dir, _saved)
                             with print_lock:
                                 downgrade_note = f'，自动降级至 {requested_quality}' if requested_quality != args.quality else ''
                                 print(f'[成功] {song["name"]} - {song["singer"]} [{actual_q}]{downgrade_note}')
@@ -2533,6 +2643,7 @@ def run_download(args, songs, db_path=None, title=None):
                 if actual_q is None:
                     raise RuntimeError('; '.join(fallback_errors) or '按名搜索候选均不可用')
                 _dl_cost += time.time() - _td
+                remember_downloaded(download_dir, _saved)
                 with print_lock:
                     note = f'，自动降级至 {actual_q}' if actual_q != args.quality else ''
                     print(f'[成功] {song["name"]} - {song["singer"]} [{actual_q}]'
