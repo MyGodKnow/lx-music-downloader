@@ -2049,5 +2049,26 @@ class RetryProgressTest(unittest.TestCase):
                 self.assertIn(field, self.src)
 
 
+class NodeBridgeEnhancedDownloadTest(unittest.TestCase):
+    """验证 Node 音源桥接中防假音质与兜底搜索的改进。"""
+
+    @classmethod
+    def setUpClass(cls):
+        js_path = Path(__file__).resolve().parent.parent / 'lx_url_server.js'
+        cls.js = js_path.read_text(encoding='utf-8')
+
+    def test_sub128_url_detection(self):
+        """必须能识别 C100/C200/C300 等超低码率流并过滤。"""
+        self.assertIn('urlLooksSub128', self.js)
+
+    def test_theme_subtitle_tolerance_in_name_match(self):
+        """nameMatch 必须容忍影视/推广副标题，使酷我/网易带后缀的原版歌曲可命中。"""
+        self.assertIn('stripThemeSubtitle', self.js)
+
+    def test_qq_search_smartbox_fallback(self):
+        """qqSearch 在旧 client_search_cp 接口 500 时必须有 smartbox 兜底。"""
+        self.assertIn('smartbox_new.fcg', self.js)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

@@ -527,13 +527,26 @@ function strictKey(s) {
   return out.replace(/\u3000/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
 }
 
+// 剥离常见的电视剧/电影/广告/游戏等主题曲、宣传曲后缀（不删 Live/伴奏/Remix 等音乐版本词）
+function stripThemeSubtitle(s) {
+  if (!s) return '';
+  return String(s)
+    .replace(/\s*[-——－~～]\s*.*?(?:主题曲|片尾曲|片头曲|插曲|推广曲|宣传曲|形象曲|概念曲|印象曲|原声带|战歌|形象主题曲|OST).*$/i, '')
+    .trim();
+}
+
 // 严格歌名匹配：归一化后必须完全相等。
 // 旧实现用「短名是长名前缀」放行，会让「萌妹进行曲」命中
 // 「萌妹进行曲（高阶萌妹成长指南）」，这正是下错歌的来源。
+// 特别放宽：酷我/网易等平台给原版歌名追加影视/品牌推广副标题时（如「关键词-Horae Beauté 韩媞形象主题曲」），
+// 剥离这类纯推广副标题后若完全相等亦予放行（时长校验与版本过滤兜底，不会误放伴奏/翻唱）。
 function nameMatch(a, b) {
   const na = strictKey(a), nb = strictKey(b);
   if (!na || !nb) return false;
-  return na === nb;
+  if (na === nb) return true;
+  const sa = stripThemeSubtitle(na), sb = stripThemeSubtitle(nb);
+  if (sa && sb && sa === sb) return true;
+  return false;
 }
 
 // 严格歌手匹配：完全相等；支持多歌手的顺序无关全匹配（不允许多余/缺失歌手）。
@@ -609,6 +622,14 @@ function urlLooks128k(url) {
   // 酷我：M500 段=128k、M800=320k、F000=flac；QQ：C400/M500=128k、M800=320k、F000/Q000=无损
   if (/(^|[/._-])M500[0-9A-Za-z]/.test(u)) return true;
   if (/(^|[/._-])C400[0-9A-Za-z]/.test(u)) return true;
+  return false;
+}
+// 根据 URL 判断是否疑似低于 128k 的超低码率流（酷我/QQ C100/C200/C300 为 24k~96k AAC，或显式带低码率参数）
+function urlLooksSub128(url) {
+  if (!url) return false;
+  const u = String(url);
+  if (/(^|[/._-])(C100|C200|C300)[0-9A-Za-z]/.test(u)) return true;
+  if (/bitrate\$?(?:24|32|48|64|96)|bitrate=(?:24|32|48|64|96)/i.test(u)) return true;
   return false;
 }
 // 根据 URL 判断是否疑似 320k（酷我 M800 段、QQ M800）
@@ -687,6 +708,8 @@ async function getUrlFromSourceEntry(entry, source, songInfo, quality) {
     if (url && /^https?:\/\//.test(url)) {
       // 加密容器下游必然解析失败，直接当作本候选不可用
       if (urlLooksEncrypted(url)) return null;
+      // 低于 128k 超低码率流直接放弃
+      if (urlLooksSub128(url)) return null;
       // 明确只要 320k+：返回的 URL 是已知 128k 时直接放弃，避免把低质当高质
       if (urlLooks128k(url) && !urlLooks320(url) && !urlLooksLossless(url)) return null;
       const valid = await checkUrl(url);
@@ -720,17 +743,32 @@ async function getUrlsForQualities(entry, source, songInfo, qOrder) {
   return settled.filter((x) => x.url);
 }
 
-// QQ 音乐搜索（带重试）：瞬时限流会返回空结果，重试几次通常能恢复
+// QQ 音乐搜索（带重试与多端兜底）：瞬时限流会返回空结果，重试几次通常能恢复；
+// client_search_cp 接口当前返回 500 时，自动降级到 smartbox_new.fcg 保证搜索可用。
 async function qqSearch(kw) {
   const url = `https://c.y.qq.com/soso/fcgi-bin/client_search_cp?p=1&n=10&w=${encodeURIComponent(kw)}&format=json&cr=1&t=0`;
   for (let i = 0; i < 2; i++) {
     try {
-      const r = await doRequest(url, { method: 'GET' }, 12000);
+      const r = await doRequest(url, { method: 'GET' }, 8000);
       const list = (r.body && r.body.data && r.body.data.song && r.body.data.song.list) || [];
       if (list.length) return list;
     } catch (e) { /* continue */ }
-    await new Promise((res) => setTimeout(res, 1000));
+    await new Promise((res) => setTimeout(res, 500));
   }
+  // 兜底：QQ 桌面端 smartbox 接口
+  try {
+    const smartUrl = `https://c.y.qq.com/splcloud/fcgi-bin/smartbox_new.fcg?key=${encodeURIComponent(kw)}`;
+    const r = await doRequest(smartUrl, { method: 'GET' }, 8000);
+    const list = (r.body && r.body.data && r.body.data.song && r.body.data.song.itemlist) || [];
+    if (list.length) {
+      return list.map((s) => ({
+        songmid: s.mid,
+        songname: s.name,
+        singer: [{ name: s.singer }],
+        interval: 0,
+      }));
+    }
+  } catch (e) { /* continue */ }
   return [];
 }
 
@@ -1647,6 +1685,13 @@ async function getMusicUrls(source, musicInfo, qualities, excludeUrls) {
         failures.push(`${entry.name}: 加密格式不可用`);
         return null;
       }
+      // 低于 128k 的超低码率流（如 C100/C200/C300 24k~96k AAC）：
+      // 无论请求什么档位，这类文件都通不过音质校验（128k 门槛亦不达标）。
+      // 过滤掉它，给真正的无损/高音质通道让路。
+      if (urlLooksSub128(url)) {
+        failures.push(`${entry.name}: 超低码率流(低于128k)`);
+        return null;
+      }
       // 只丢弃比请求档位更低的 128k 回退
       const wantRank = qualityRank(q);
       const resultQuality = result && typeof result === 'object'
@@ -1655,7 +1700,8 @@ async function getMusicUrls(source, musicInfo, qualities, excludeUrls) {
       const resultRank = resultQuality
         ? qualityRank(resultQuality.replace(/\s*k$/i, 'k'))
         : null;
-      if (wantRank > 0 && resultRank === 0) {
+      const is128 = resultRank === 0 || (urlLooks128k(url) && !urlLooks320(url) && !urlLooksLossless(url));
+      if (wantRank > 0 && is128) {
         failures.push(`${entry.name}: 低码率(128k)`);
         return null;
       }
