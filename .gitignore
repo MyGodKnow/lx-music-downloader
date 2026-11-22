@@ -43,6 +43,11 @@ lx-tauri/src-tauri/engine/engine.zip
 # ============ 发布二进制 ============
 落雪音乐下载器.exe
 LXMusicDownloader.exe
+lx-boot-trace.log
+
+# ============ 运行时数据目录（AppData 不可写时的回退位置） ============
+# 程序会把引擎副本、WebView2 profile 落到这里；属于本机运行状态，不入库
+落雪下载数据/
 
 # ============ 内部工作区（AI 记忆 / 设计系统，不属于项目本体） ============
 .workbuddy/

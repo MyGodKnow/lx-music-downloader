@@ -4,6 +4,193 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager, State};
 
+// ============ 启动诊断（WebView2 初始化失败时的唯一现场） ============
+//
+// 为什么需要：GUI 是 WebView2 撑起来的，一旦它初始化失败，窗口会在几百毫秒内
+// 被销毁，用户看到的就是「双击 → 闪屏 → 没了」。此时既没有控制台（windows_subsystem
+// = "windows"），也没有任何日志，`expect()` 的 panic 文本也无人可见。
+//
+// 因此把「WebView2 运行时版本 / 每次尝试的参数 / 最终错误码」全部落盘到
+// %LOCALAPPDATA%\落雪下载\startup.log，并在彻底失败时弹一个系统 MessageBox。
+// 这是唯一能让「闪退」变成「可诊断、可自助修复」的办法。
+
+#[cfg(windows)]
+#[repr(C)]
+struct WinSystemTime {
+    year: u16,
+    month: u16,
+    day_of_week: u16,
+    day: u16,
+    hour: u16,
+    minute: u16,
+    second: u16,
+    milliseconds: u16,
+}
+
+#[cfg(windows)]
+fn now_string() -> String {
+    extern "system" {
+        fn GetLocalTime(lp_system_time: *mut WinSystemTime);
+    }
+    let mut t = WinSystemTime {
+        year: 0, month: 0, day_of_week: 0, day: 0,
+        hour: 0, minute: 0, second: 0, milliseconds: 0,
+    };
+    unsafe { GetLocalTime(&mut t) };
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}",
+        t.year, t.month, t.day, t.hour, t.minute, t.second, t.milliseconds
+    )
+}
+
+#[cfg(not(windows))]
+fn now_string() -> String {
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => format!("unix:{}.{:03}", d.as_secs(), d.subsec_millis()),
+        Err(_) => "unknown".to_string(),
+    }
+}
+
+/// 启动日志文件路径（位于可写的数据根目录）。
+fn startup_log_path() -> Option<std::path::PathBuf> {
+    Some(data_root().join("startup.log"))
+}
+
+/// 数据根目录：**实测可写**之后才采用。
+///
+/// 为什么不能硬编码 `%LOCALAPPDATA%\落雪下载`：这条路径在真实机器上经常写不进去——
+/// 受限/漫游账户、组策略把 AppData 重定向、安全软件拦截未签名程序写入、
+/// 上一次崩溃留下属主异常的目录……一旦写不进去，后果是连锁的：
+/// 启动日志写不出（闪退无从排查）、WebView2 的 profile 建不出来
+/// （CreateCoreWebView2Controller 失败 → 窗口被销毁 → 用户看到「闪退」）。
+///
+/// 因此这里按顺序探测候选目录，用「真的创建一个探针文件」来判定，而不是
+/// 只看目录是否存在或者 try 一下 metadata。首个通过者被缓存，全进程一致。
+fn data_root() -> std::path::PathBuf {
+    use std::sync::OnceLock;
+    static ROOT: OnceLock<std::path::PathBuf> = OnceLock::new();
+    ROOT.get_or_init(|| {
+        let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+            candidates.push(std::path::PathBuf::from(local).join("落雪下载"));
+        }
+        // EXE 同级：适合便携版/绿色版，也是 AppData 被锁死时的第一备选
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                candidates.push(dir.join("落雪下载数据"));
+            }
+        }
+        if let Some(tmp) = std::env::var_os("TEMP") {
+            candidates.push(std::path::PathBuf::from(tmp).join("lx-downloader"));
+        }
+        if let Ok(cwd) = std::env::current_dir() {
+            candidates.push(cwd.join("lx-downloader-data"));
+        }
+
+        for dir in &candidates {
+            if dir_is_writable(dir) {
+                return dir.clone();
+            }
+        }
+        // 全都不行：仍然返回首选路径，让上层按「失败」处理（而不是 panic）
+        candidates.into_iter().next().unwrap_or_else(|| std::path::PathBuf::from("."))
+    })
+    .clone()
+}
+
+/// 目录是否**真的**可写：建目录 + 写一个探针文件 + 立刻删掉。
+fn dir_is_writable(dir: &std::path::Path) -> bool {
+    if std::fs::create_dir_all(dir).is_err() {
+        return false;
+    }
+    let probe = dir.join(".write-probe");
+    match std::fs::OpenOptions::new().create(true).write(true).truncate(true).open(&probe) {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// 追加一行启动日志。**任何失败都静默忽略**——诊断本身绝不能成为新的崩溃源。
+fn startup_log(msg: &str) {
+    let Some(path) = startup_log_path() else { return };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    // 超过 256KB 就轮转一次，避免长年累月无限增长
+    if let Ok(meta) = std::fs::metadata(&path) {
+        if meta.len() > 256 * 1024 {
+            let _ = std::fs::rename(&path, path.with_extension("log.old"));
+        }
+    }
+    let line = format!("[{}] {}\n", now_string(), msg);
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
+}
+
+/// 读取本机 WebView2 运行时的目录与版本（仅用于诊断日志，失败返回 "unknown"）。
+fn webview2_runtime_info() -> String {
+    let mut roots: Vec<std::path::PathBuf> = Vec::new();
+    for var in ["ProgramFiles(x86)", "ProgramFiles"] {
+        if let Some(p) = std::env::var_os(var) {
+            roots.push(std::path::PathBuf::from(p).join("Microsoft").join("EdgeWebView").join("Application"));
+        }
+    }
+    for root in roots {
+        let Ok(entries) = std::fs::read_dir(&root) else { continue };
+        let mut best: Option<(String, std::path::PathBuf)> = None;
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if !name.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+                continue;
+            }
+            if !e.path().join("msedgewebview2.exe").is_file() {
+                continue;
+            }
+            if best.as_ref().is_none_or(|(b, _)| name > *b) {
+                best = Some((name.clone(), e.path()));
+            }
+        }
+        if let Some((ver, path)) = best {
+            return format!("{ver} ({})", path.display());
+        }
+    }
+    "unknown".to_string()
+}
+
+/// 弹一个系统错误框。
+///
+/// 不走 Tauri 的 dialog 插件：WebView2 起不来时 Tauri 的窗口体系本身就是坏的，
+/// 只有 Win32 的 MessageBoxW 还能用。
+#[cfg(windows)]
+fn show_fatal_dialog(title: &str, message: &str) {
+    use std::os::windows::ffi::OsStrExt;
+    extern "system" {
+        fn MessageBoxW(
+            hwnd: *mut core::ffi::c_void,
+            text: *const u16,
+            caption: *const u16,
+            utype: u32,
+        ) -> i32;
+    }
+    let wide = |s: &str| -> Vec<u16> {
+        std::ffi::OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
+    };
+    let t = wide(message);
+    let c = wide(title);
+    unsafe {
+        MessageBoxW(std::ptr::null_mut(), t.as_ptr(), c.as_ptr(), 0x10 /* MB_ICONERROR */);
+    }
+}
+
+#[cfg(not(windows))]
+fn show_fatal_dialog(_title: &str, _message: &str) {}
+
 /// 全局状态：当前正在运行的子进程（下载或转换），每次只允许一个。
 ///
 /// child 用 `Arc<Mutex<..>>` 而不是直接 `Mutex`：优雅停止时后台线程需要在
@@ -81,10 +268,10 @@ fn default_script() -> String {
 const ENGINE_ZIP: &[u8] = include_bytes!("../engine/engine.zip");
 
 /// 引擎释放目录（稳定位置，只在版本变化时重新释放，避免每次启动解压）。
+/// 跟随 `data_root()`，这样 AppData 不可写时会自动落到可写位置，
+/// 而不是卡在「解压失败 → 引擎起不来 → 整个程序无用」。
 fn engine_home() -> Option<std::path::PathBuf> {
-    std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from).map(|base| {
-        base.join("落雪下载").join("engine")
-    })
+    Some(data_root().join("engine"))
 }
 
 /// 内嵌引擎包的版本标识：用内容哈希而非 zip 长度。
@@ -1864,8 +2051,100 @@ async fn save_settings(
     .map_err(|e| format!("任务执行失败: {e}"))?
 }
 
+/// 启动痕迹：在 `main()` 的第一行调用。
+///
+/// 存在的理由很具体：曾出现过「进程活着、窗口没了、连 startup.log 都没写」的
+/// 情况，无法判断到底是没进 `run()`，还是进了但写日志失败。这里用两条相互
+/// 独立的痕迹（EXE 同级 + %LOCALAPPDATA%）交叉验证，并且都只做「追加一行」，
+/// 不依赖任何第三方初始化。
+pub fn record_boot_trace() {
+    let stamp = now_string();
+    // 痕迹 1：EXE 同级目录（不依赖任何环境变量）
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let probe = startup_log_probe("main() 已进入");
+            let line = format!("[{stamp}] main() 已进入 | startup_log={probe}\n");
+            let _ = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join("lx-boot-trace.log"))
+                .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
+        }
+    }
+    // 痕迹 2：标准启动日志
+    startup_log("main() 已进入");
+}
+
+/// 诊断用：执行与 `startup_log` 相同的一串动作，但把每一步的结果串成文本返回，
+/// 供启动痕迹记录。只为定位「日志为什么没写出来」这类问题，正常路径不受影响。
+fn startup_log_probe(msg: &str) -> String {
+    let Some(path) = startup_log_path() else {
+        return "无法解析 LOCALAPPDATA".to_string();
+    };
+    let mut steps = vec![format!("path={}", path.display())];
+    if let Some(dir) = path.parent() {
+        match std::fs::create_dir_all(dir) {
+            Ok(()) => steps.push("mkdir=ok".to_string()),
+            Err(e) => steps.push(format!("mkdir=ERR({})", e.kind())),
+        }
+    }
+    let line = format!("[{}] {}\n", now_string(), msg);
+    match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        Ok(mut f) => match std::io::Write::write_all(&mut f, line.as_bytes()) {
+            Ok(()) => steps.push("write=ok".to_string()),
+            Err(e) => steps.push(format!("write=ERR({})", e.kind())),
+        },
+        Err(e) => steps.push(format!("open=ERR({})", e.kind())),
+    }
+    steps.join(" ")
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    startup_log(&format!(
+        "===== 启动 ===== exe={} WebView2={}",
+        std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "?".into()),
+        webview2_runtime_info(),
+    ));
+
+    let result = build_app().run(tauri::generate_context!());
+
+    // 走到这里说明事件循环已经结束。正常关窗时 Ok(())；WebView2 起不来时
+    // tauri 会把错误原样返回（窗口已在几百毫秒内被销毁），此时必须留下现场，
+    // 而不是像以前那样 panic 到一个没人看得见的地方。
+    if let Err(err) = result {
+        let msg = format!("{err}");
+        let detail = format!("{err:?}");
+        startup_log(&format!("[致命] 应用启动失败: {msg}"));
+        startup_log(&format!("[致命] 详细: {detail}"));
+        startup_log(&format!("[致命] WebView2 运行时: {}", webview2_runtime_info()));
+        show_fatal_dialog(
+            "落雪音乐下载器 启动失败",
+            &format!(
+                "界面内核（Microsoft Edge WebView2）初始化失败，程序无法显示窗口。\n\n\
+                 错误信息：{msg}\n\n\
+                 常见原因与处理：\n\
+                 1) WebView2 运行时缺失或损坏 —— 打开 https://developer.microsoft.com/microsoft-edge/webview2/ \
+                 下载「Evergreen Standalone Installer」安装后重试；\n\
+                 2) 安全软件（火绒/卡巴斯基等）拦截了 WebView2 子进程 —— 将本程序与 msedgewebview2.exe 加入信任区；\n\
+                 3) 系统时间异常或用户配置目录无写权限。\n\n\
+                 诊断日志：{}",
+                startup_log_path().map(|p| p.display().to_string()).unwrap_or_else(|| "（无法定位）".into())
+            ),
+        );
+        // 显式退出：此时已经没有窗口，继续挂着只会变成一个「任务管理器里能看到、
+        // 但界面上怎么点都没反应」的僵尸进程。
+        std::process::exit(1);
+    }
+    startup_log("===== 正常退出 =====");
+}
+
+/// 组装 Tauri 应用。
+///
+/// 主窗口**不**在 tauri.conf.json 里创建（那里是 `"create": false`），
+/// 而是放到 setup 里手工建：只有这样，WebView2 初始化失败才能被这里捕获、
+/// 写进 startup.log 并弹框，而不是在启动阶段把窗口建一半又拆掉。
+fn build_app() -> tauri::Builder<tauri::Wry> {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
@@ -1899,8 +2178,181 @@ pub fn run() {
             read_settings,
             save_settings
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .setup(|app| {
+            create_main_window(app)?;
+            spawn_startup_watchdog(app.handle().clone());
+            Ok(())
+        })
+}
+
+/// 启动看门狗：把「窗口悄悄消失、进程却还活着」这个最恶心的故障变成明确报错。
+///
+/// 为什么光靠 `run()` 的返回值不够：WebView2 的初始化是**异步**的。
+/// `WebviewWindowBuilder::build()` 会在几百毫秒内返回 Ok（窗口确实建出来了），
+/// 之后浏览器进程才在后台启动并失败。wry 收到失败回调后销毁窗口，但 Tauri 的
+/// 事件循环并不会因此退出——于是进程就带着 0 个窗口无限空转：
+/// 任务管理器里看得到，界面上什么都没有，用户称之为「闪退」。
+///
+/// 这个线程在窗口建好之后启动，若在超时内发现主窗口不见了，就直接
+/// 写日志 + 弹框 + 退出。宁可给一个明确错误，也不要留一个看不见的僵尸进程。
+fn spawn_startup_watchdog(app: AppHandle) {
+    std::thread::spawn(move || {
+        // 正常机器上 WebView2 首帧通常 < 1s；给足 10s 兼容冷启动与慢盘。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            if app.get_webview_window("main").is_some() {
+                if std::time::Instant::now() >= deadline {
+                    // 窗口一直在，交给正常交互，看门狗退场。
+                    startup_log("看门狗：主窗口稳定存在，退出监控");
+                    return;
+                }
+                continue;
+            }
+            // 窗口没了：说明 WebView2 在异步初始化阶段挂掉了。
+            startup_log("[致命] 看门狗：主窗口在启动后消失（WebView2 初始化失败）");
+            startup_log(&format!("[致命] WebView2 运行时: {}", webview2_runtime_info()));
+            show_fatal_dialog(
+                "落雪音乐下载器 启动失败",
+                &format!(
+                    "窗口没能显示出来：界面内核（Microsoft Edge WebView2）初始化失败。\n\n\
+                     请按下面顺序排查：\n\
+                     1) 修复 WebView2 运行时：到 https://developer.microsoft.com/microsoft-edge/webview2/ \
+                     下载「Evergreen Standalone Installer」安装后重启本程序；\n\
+                     2) 安全软件（火绒 / 卡巴斯基 / ReasonLabs 等）拦截了 msedgewebview2.exe —— \
+                     把本程序与 msedgewebview2.exe 加入信任区；\n\
+                     3) 若上面都无效，请把诊断日志发给开发者：\n{}\n\n\
+                     （程序会保留日志并自动退出，不会在后台残留进程。）",
+                    startup_log_path().map(|p| p.display().to_string()).unwrap_or_else(|| "（无法定位）".into())
+                ),
+            );
+            std::process::exit(1);
+        }
+    });
+}
+
+/// 创建主窗口（含 WebView2）。
+///
+/// 相比「让 tauri.conf.json 自动建窗」，这里多了两条救命逻辑：
+///
+/// 1. **失败可诊断**：错误原样向上抛，由 `run()` 写日志 + 弹框；
+/// 2. **失败可自愈**：WebView2 的用户数据目录（EBWebView）一旦损坏或残留了
+///    半死的状态，后续每次启动都会在 CreateCoreWebView2Controller 阶段失败，
+///    表现为「窗口闪一下就消失」。这里检测到首次建窗失败后，把该目录改名备份，
+///    再用一个全新的干净目录重试一次——用户无感，也不需要手动删缓存。
+fn create_main_window(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
+    let config = app
+        .config()
+        .app
+        .windows
+        .iter()
+        .find(|w| w.label == "main")
+        .or_else(|| app.config().app.windows.first())
+        .cloned()
+        .ok_or("tauri.conf.json 里没有配置任何窗口")?;
+
+    // WebView2 的数据目录也必须可写，否则浏览器进程起不来、窗口会在
+    // 几百毫秒后被销毁（表现即「闪退」）。默认位置在 AppData 下，若实测
+    // 不可写就显式改到可写的数据根目录去。
+    let data_dir = webview2_data_dir();
+    startup_log(&format!("WebView2 数据目录: {}", data_dir.display()));
+
+    // 第一次：正常路径
+    match tauri::WebviewWindowBuilder::from_config(app.handle(), &config)?
+        .data_directory(data_dir.clone())
+        .build()
+    {
+        Ok(_) => {
+            startup_log("主窗口创建成功");
+            return Ok(());
+        }
+        Err(err) => {
+            startup_log(&format!("[警告] 首次创建主窗口失败: {err}（详细: {err:?}）"));
+            let msg = format!("{err}");
+            // 只有「WebView2 层面」的失败才值得清缓存重试；窗口标签重复之类的
+            // 配置错误重试多少次都一样。
+            if !is_webview_recoverable(&msg) {
+                return Err(Box::new(err));
+            }
+            reset_webview_data_dir()?;
+        }
+    }
+
+    // 第二次：换一个干净的数据目录重试
+    let retry_dir = data_root().join(format!(
+        "webview2-retry-{}",
+        now_string().replace([' ', ':', '-', '.'], "")
+    ));
+    match tauri::WebviewWindowBuilder::from_config(app.handle(), &config)?
+        .data_directory(retry_dir)
+        .build()
+    {
+        Ok(_) => {
+            startup_log("主窗口创建成功（已自动重置 WebView2 数据目录）");
+            Ok(())
+        }
+        Err(err) => {
+            startup_log(&format!("[致命] 重置后仍无法创建主窗口: {err}（详细: {err:?}）"));
+            Err(Box::new(err))
+        }
+    }
+}
+
+/// 这个错误是否属于「清掉 WebView2 用户数据目录后可能自愈」的那一类。
+fn is_webview_recoverable(msg: &str) -> bool {
+    const HINTS: [&str; 6] = [
+        "0x800700AA", // ERROR_BUSY：用户数据目录被上一个半死进程占着
+        "0x8007000D", // ERROR_INVALID_DATA：目录里的 profile 已损坏
+        "0x80070005", // ERROR_ACCESS_DENIED：残留文件的 ACL 坏了
+        "0x8007139F", // ERROR_INVALID_STATE
+        "WebView2",
+        "webview",
+    ];
+    HINTS.iter().any(|h| msg.to_ascii_lowercase().contains(&h.to_ascii_lowercase()))
+}
+
+/// 选择 WebView2 的数据目录（profile 存放处）。
+///
+/// 默认沿用 Tauri 的位置（`%LOCALAPPDATA%\<identifier>\EBWebView`），
+/// 但**先实测可写**：不可写就直接换到 `data_root()/webview2`。
+/// 这一步是「闪退」的关键防线——profile 建不出来时，
+/// CreateCoreWebView2Controller 必然失败，窗口随即被销毁。
+fn webview2_data_dir() -> std::path::PathBuf {
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        let app_dir = std::path::PathBuf::from(local).join("com.lxmusic.downloader");
+        if dir_is_writable(&app_dir) {
+            return app_dir.join("EBWebView");
+        }
+    }
+    data_root().join("webview2")
+}
+
+/// 把 WebView2 用户数据目录挪走（不删除，留作排查），下次启动会自动重建。
+///
+/// 目录位置固定为 `%LOCALAPPDATA%\<identifier>\EBWebView`，其中 identifier
+/// 取自 tauri.conf.json（com.lxmusic.downloader）。改名而不是删除：万一是
+/// 我们判断错了，用户还能把备份目录改回来。
+fn reset_webview_data_dir() -> Result<(), Box<dyn std::error::Error>> {
+    let target = webview2_data_dir();
+    if !target.exists() {
+        startup_log("WebView2 数据目录不存在，无需重置");
+        return Ok(());
+    }
+    let stamp = now_string().replace([' ', ':', '-', '.'], "");
+    let backup = target.with_file_name(format!("EBWebView.bak-{stamp}"));
+    match std::fs::rename(&target, &backup) {
+        Ok(()) => {
+            startup_log(&format!("已重置 WebView2 数据目录 → {}", backup.display()));
+            let _ = std::fs::create_dir_all(&target);
+            Ok(())
+        }
+        Err(err) => {
+            // 挪不动通常是还有 msedgewebview2.exe 占着。此时把「挪不走」本身
+            // 记下来，仍然继续重试一次——万一只是个别文件被占用也可能成功。
+            startup_log(&format!("[警告] 重置 WebView2 数据目录失败: {err}"));
+            Ok(())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2164,6 +2616,78 @@ mod tests {
         let a = st.child.clone();
         let b = st.child.clone();
         assert!(Arc::ptr_eq(&a, &b));
+    }
+
+    // ===== 数据目录与启动容错 =====
+
+    #[test]
+    fn dir_is_writable_detects_write_capability() {
+        // 正向：数据根目录下的新子目录应判为可写
+        let ok_dir = data_root().join("writable-probe");
+        assert!(dir_is_writable(&ok_dir), "应判定为可写: {}", ok_dir.display());
+        let _ = std::fs::remove_dir_all(&ok_dir);
+
+        // 反向：拿一个「普通文件」当目录用，create_dir_all 必然失败，
+        // 此时必须判为不可写——否则程序会把 WebView2 的数据目录
+        // 指向一个永远建不出来的位置，又变成「闪退」。
+        let blocker = data_root().join("blocker-file");
+        let _ = std::fs::write(&blocker, b"x");
+        assert!(
+            !dir_is_writable(&blocker.join("child")),
+            "文件之下的路径必须判为不可写"
+        );
+        let _ = std::fs::remove_file(&blocker);
+    }
+
+    #[test]
+    fn data_root_points_to_a_writable_directory() {
+        // 回归重点：data_root 一旦落到不可写位置，启动日志写不出、
+        // WebView2 的 profile 也建不出来，直接表现为「闪退」。
+        let root = data_root();
+        assert!(
+            dir_is_writable(&root),
+            "data_root 必须是实测可写的目录，实际为 {}",
+            root.display()
+        );
+    }
+
+    #[test]
+    fn data_root_is_stable_between_calls() {
+        assert_eq!(data_root(), data_root(), "数据根目录必须缓存一致");
+    }
+
+    #[test]
+    fn startup_log_path_lives_under_data_root() {
+        let p = startup_log_path().expect("应能定位启动日志路径");
+        assert_eq!(p.parent().unwrap(), data_root());
+        assert_eq!(p.file_name().unwrap(), "startup.log");
+    }
+
+    #[test]
+    fn webview2_data_dir_is_writable() {
+        // WebView2 的 controller 创建失败大多源于 profile 目录不可写，
+        // 因此这里断言选出来的目录确实可写。
+        let dir = webview2_data_dir();
+        assert!(dir_is_writable(&dir), "WebView2 数据目录不可写: {}", dir.display());
+        let _ = std::fs::remove_dir(dir.join(".write-probe"));
+    }
+
+    #[test]
+    fn recoverable_errors_cover_the_known_webview2_failures() {
+        for msg in [
+            "WebView2 error: 0x800700AA",
+            "0x8007000D invalid data",
+            "failed to create webview",
+            "CreateCoreWebView2Controller failed",
+        ] {
+            assert!(is_webview_recoverable(msg), "应判定为可重试: {msg}");
+        }
+        for msg in [
+            "window label main already exists",
+            "tauri.conf.json 里没有配置任何窗口",
+        ] {
+            assert!(!is_webview_recoverable(msg), "不应重试: {msg}");
+        }
     }
 
     // ===== 引擎版本标记 =====

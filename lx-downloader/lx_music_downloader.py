@@ -34,6 +34,7 @@ import argparse
 import contextlib
 import ipaddress
 import json
+import io
 import os
 import re
 import shutil
@@ -3763,7 +3764,39 @@ def _write_crash_log(exc):
         return None
 
 
+def _ensure_utf8_stdio():
+    """把 stdout/stderr 切到 UTF-8 并容错，避免 OSError [Errno 22]。
+
+    真实故障：GUI 用 `--check-update` 调用引擎时，stdout 是管道且编码为
+    cp936 一类的本地代码页；一旦输出里出现本地代码页无法编码的字符，
+    `print(..., flush=True)` 会抛 `OSError: [Errno 22] Invalid argument`，
+    整个进程随即崩溃，GUI 只看到「检查更新失败」甚至「未收到响应」。
+
+    这里不依赖「猜对编码」：直接把标准流重开为 UTF-8 + errors='replace'，
+    即使真有无法编码的字符也只会变成替换符，不会让进程挂掉。
+    """
+    for name in ('stdout', 'stderr'):
+        stream = getattr(sys, name, None)
+        if stream is None:
+            continue
+        try:
+            stream.reconfigure(encoding='utf-8', errors='replace')
+            continue
+        except Exception:
+            pass
+        # PyInstaller 的窗口版没有 reconfigure 时，退回到缓冲包装
+        try:
+            buf = getattr(stream, 'buffer', None)
+            if buf is not None:
+                wrapper = io.TextIOWrapper(buf, encoding='utf-8', errors='replace',
+                                           line_buffering=True)
+                setattr(sys, name, wrapper)
+        except Exception:
+            pass
+
+
 if __name__ == '__main__':
+    _ensure_utf8_stdio()
     try:
         run()
     except KeyboardInterrupt:

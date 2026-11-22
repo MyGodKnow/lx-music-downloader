@@ -12,6 +12,8 @@
   "app": {
     "windows": [
       {
+        "label": "main",
+        "create": false,
         "title": "落雪音乐下载器",
         "width": 1080,
         "height": 760,
