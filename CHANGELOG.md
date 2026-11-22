@@ -2,6 +2,46 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.1.1] - 2026-11-22
+
+### 修复
+
+- **启动闪退（重要）**：部分机器上双击后窗口闪一下就消失，任务管理器里却还能看到进程。
+  根因是 WebView2 的用户数据目录（profile）建不出来，`CreateCoreWebView2Controller`
+  失败后 wry 销毁窗口，而 Tauri 的事件循环不会因窗口被销毁而退出，进程就变成
+  「看不见的僵尸」。现从四个层面解决：
+  - **数据目录自适应**：按 `%LOCALAPPDATA%` → EXE 同级 → `%TEMP%` → 当前目录
+    顺序**实测可写性**（真建探针文件），引擎、日志、WebView2 profile 全部跟随。
+    AppData 被组策略重定向或安全软件拦写时不再直接报废。
+  - **失败自愈**：建窗失败且错误属于 WebView2 类时，把损坏的 profile 改名备份，
+    换全新目录自动重试一次，用户无感。
+  - **启动看门狗**：WebView2 是异步初始化，`build()` 返回 Ok 之后浏览器进程才可能
+    在后台挂掉。看门狗盯 10 秒，主窗口消失即弹系统框说明原因并退出，不再残留隐形进程。
+  - **主窗口改在 setup 里创建**（`tauri.conf.json` 设 `create: false`），
+    建窗失败可被捕获，而不是建一半又拆掉。
+- **启动失败可见可诊断**：新增 `%LOCALAPPDATA%\落雪下载\startup.log`，记录 exe 路径、
+  WebView2 运行时版本、每次尝试的数据目录与错误详情。彻底失败时把日志路径
+  直接显示在错误弹框里。此前用 `.expect()` 收尾，panic 文本进了没有控制台的虚空，
+  用户和开发者都拿不到任何现场。
+- **`--check-update` / `--dump-config` 崩溃**：stdout 为本地代码页管道时，
+  输出含该代码页无法编码的字符会抛 `OSError: [Errno 22] Invalid argument`，
+  引擎直接退出（见 `lx-downloader-crash.log`）。新增 `_ensure_utf8_stdio()`，
+  强制 UTF-8 + `errors='replace'`。
+
+### 文档
+
+- README 补充「Windows 已保护你的电脑」提示的说明与 SHA-256 校验方式：
+  程序未做代码签名，首次运行会被 SmartScreen 拦截，这是信任机制而非病毒警告。
+- BUILD.md 新增「运行数据目录」章节，说明四级回退顺序；
+  补充两条构建 FAQ：`cargo build --release` 不含前端资源（会显示
+  `localhost 拒绝连接`，正式包必须用 `npx tauri build`）、
+  窗口闪退时的排查入口。
+
+### 测试
+
+- 新增 6 项回归测试：数据目录可写性双向判定、路径稳定性、启动日志路径、
+  WebView2 目录可写性、可恢复错误判定。Rust 共 48 项全通过。
+
 ## [未发布] - 2026-11-01
 
 ### 优化与修复
