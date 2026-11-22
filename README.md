@@ -60,6 +60,26 @@
 
 **直接下载 EXE**：从 [GitHub Releases](https://github.com/MyGodKnow/lx-music-downloader/releases) 下载最新 `lx-music-downloader-*.exe`，双击即用（首次运行自动释放内置引擎，免装 Python / Node）。
 
+> **⚠️ 关于「Windows 已保护你的电脑」提示**
+>
+> 本程序**未购买代码签名证书**，所以首次运行时 Windows SmartScreen 会拦截并提示
+> 「无法识别的应用」。这不是病毒警告，只是「微软没见过这个文件」。
+>
+> 处理方法：点提示里的 **「更多信息」→「仍要运行」** 即可正常使用。
+>
+> ### 校验下载完整性（建议）
+>
+> 每个 Release 的说明里都附有该版本的 **SHA-256**。下载后可以自己核对，
+> 确认文件在传输过程中没有被篡改或替换：
+>
+> ```powershell
+> Get-FileHash .\落雪音乐下载器.exe -Algorithm SHA256
+> ```
+>
+> 输出里的 `Hash` 一栏应与 Release 说明中的值**完全一致**。不一致就不要运行。
+>
+> 如果不想运行来历不明的程序，也可以直接[从源码构建](BUILD.md)——完整步骤都在里面。
+
 **源码运行**（开发者）：
 
 ```bash
