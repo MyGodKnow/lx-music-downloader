@@ -1169,6 +1169,23 @@ let path: string | null = null;
     }
   }
 
+  /**
+   * 复制诊断信息到剪贴板。
+   *
+   * 为什么要这个按钮：用户报障时最需要的是 startup.log 与引擎状态，但此前要他自己
+   * 去 %LOCALAPPDATA%\落雪下载\ 里翻文件，结果绝大多数工单没有任何现场信息。
+   * 复制失败（剪贴板被拦）时退回复制失败提示，仍把内容写进日志区。
+   */
+  async function copyDiagnostics() {
+    try {
+      const report = await invoke<string>("diagnostics_report");
+      await navigator.clipboard.writeText(report);
+      addLog("ok", "诊断信息已复制到剪贴板，粘贴到反馈里即可");
+    } catch (err) {
+      addLog("error", `复制诊断信息失败: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
   async function openExternal(url: string) {
     try {
       await openUrl(url);
@@ -2175,6 +2192,8 @@ let path: string | null = null;
                   遇到问题或有建议，欢迎通过<strong>邮箱</strong>或
                   <strong>GitHub Issues</strong> 反馈。提交问题时请附上：操作步骤、
                   日志区的报错内容、以及使用的音源名称。
+                  点下方「<strong>复制诊断信息</strong>」可一次性带上版本、WebView2 版本、
+                  引擎状态与启动日志尾部——这些正是远程定位问题的关键。
                 </p>
                 <div className="about-actions">
                   <button
@@ -2191,6 +2210,9 @@ let path: string | null = null;
                   </button>
                   <button className="ghost-btn" onClick={() => openExternal(AUTHOR.repo)}>
                     项目仓库
+                  </button>
+                  <button className="ghost-btn" onClick={copyDiagnostics}>
+                    <CopyIcon size={15} /> 复制诊断信息
                   </button>
                   <button
                     className="ghost-btn"

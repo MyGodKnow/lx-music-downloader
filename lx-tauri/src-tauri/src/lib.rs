@@ -304,17 +304,22 @@ static ENGINE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// 确保内置引擎已释放到本地；版本变化（内容哈希不同）时重新释放。
 /// 升级采用「解压到临时目录 → 目录交换」的方式：正在运行的旧引擎文件被占用时
 /// 也能完成升级，不会因为删不掉旧目录而卡在旧版本。
+/// 引擎目录是否已经是最新版本（只读文件判断，**不解压**）。
+/// 抽出来是给诊断信息用的：诊断不能顺手触发一次 43MB 解压。
+fn engine_is_fresh(dir: &std::path::Path) -> bool {
+    let exe = dir.join("lx_music_downloader.exe");
+    let marker = dir.join(".engine_hash");
+    exe.is_file()
+        && std::fs::read_to_string(&marker)
+            .map(|v| v.trim() == engine_version())
+            .unwrap_or(false)
+}
+
 fn ensure_engine() -> Result<std::path::PathBuf, String> {
     let _guard = ENGINE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = engine_home().ok_or_else(|| "无法定位 LOCALAPPDATA".to_string())?;
     let exe = dir.join("lx_music_downloader.exe");
-    let marker = dir.join(".engine_hash");
-    let ver = engine_version();
-    let fresh = exe.is_file()
-        && std::fs::read_to_string(&marker)
-            .map(|v| v.trim() == ver)
-            .unwrap_or(false);
-    if fresh {
+    if engine_is_fresh(&dir) {
         return Ok(exe);
     }
 
@@ -328,7 +333,7 @@ fn ensure_engine() -> Result<std::path::PathBuf, String> {
     archive
         .extract(&staging)
         .map_err(|e| format!("释放内置引擎失败: {e}"))?;
-    std::fs::write(staging.join(".engine_hash"), &ver)
+    std::fs::write(staging.join(".engine_hash"), engine_version())
         .map_err(|e| format!("写入引擎版本标记失败: {e}"))?;
 
     // 目录交换：旧目录先挪开，再把新目录改名到位；最后尽力清理旧目录。
@@ -529,6 +534,62 @@ fn spawn_orphan_engine_cleanup() {
             ));
         }
     });
+}
+
+/// 收集诊断信息，拼成一段可直接粘贴给开发者的纯文本。
+///
+/// 为什么做成「一段文本」而不是结构化 JSON：用户的操作路径是「复制 → 贴到 issue/邮件」，
+/// 中间任何一步需要他自己拼装信息都会让诊断失败。此前用户要自己翻
+/// %LOCALAPPDATA%\落雪下载\startup.log，绝大多数工单因此缺现场。
+///
+/// 注意：这里**不做任何解压/子进程调用**，只读文件和内存里的已知状态，
+/// 保证点一下就能立刻出结果（首次启动解压中也不卡界面）。
+fn build_diagnostics_report() -> String {
+    let mut lines: Vec<String> = Vec::new();
+    lines.push("落雪音乐下载器 诊断信息".to_string());
+    lines.push(format!("版本: v{}", env!("CARGO_PKG_VERSION")));
+    lines.push(format!("EXE: {}", std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "?".into())));
+    lines.push(format!("WebView2 运行时: {}", webview2_runtime_info()));
+    lines.push(format!("操作系统: {}", std::env::consts::OS));
+    lines.push(String::new());
+
+    let root = data_root();
+    lines.push(format!("数据目录: {}", root.display()));
+    lines.push(format!("启动日志: {}", startup_log_path().map(|p| p.display().to_string()).unwrap_or_else(|| "（无法定位）".into())));
+    lines.push(format!("WebView2 数据目录: {}", webview2_data_dir().display()));
+    lines.push(String::new());
+
+    // 引擎状态：只读判断，不触发解压
+    let dir = engine_home();
+    let fresh = dir.as_deref().map(engine_is_fresh).unwrap_or(false);
+    lines.push("内置引擎:".to_string());
+    lines.push(format!("  目录: {}", dir.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "（无法定位）".into())));
+    lines.push(format!("  状态: {}", if fresh { "已就绪（版本匹配）" } else { "未就绪（需重新释放）" }));
+    if let Some(reason) = ENGINE_FALLBACK.get() {
+        lines.push(format!("  降级原因: {reason}"));
+    }
+    lines.push(format!("  内嵌引擎包版本: {}", &engine_version()[..16]));
+    lines.push(String::new());
+
+    // 最近一次启动日志尾部：这是排查启动类问题的核心现场
+    lines.push("startup.log 尾部（最近 40 行）:".to_string());
+    match startup_log_path().map(|p| std::fs::read_to_string(&p)) {
+        Some(Ok(text)) => {
+            let tail: Vec<&str> = text.lines().rev().take(40).collect();
+            for l in tail.into_iter().rev() {
+                lines.push(format!("  {l}"));
+            }
+        }
+        Some(Err(e)) => lines.push(format!("  （读取失败: {e}）")),
+        None => lines.push("  （无法定位日志文件）".to_string()),
+    }
+    lines.join("\n")
+}
+
+/// 供前端「关于」页一键复制诊断信息。
+#[tauri::command]
+fn diagnostics_report() -> String {
+    build_diagnostics_report()
 }
 
 /// 解析下载引擎命令，返回 (程序, 前置参数)：
@@ -2393,7 +2454,8 @@ fn build_app() -> tauri::Builder<tauri::Wry> {
             save_text_file,
             read_settings,
             save_settings,
-            engine_status
+            engine_status,
+            diagnostics_report
         ])
         .setup(|app| {
             create_main_window(app)?;
@@ -3212,6 +3274,30 @@ mod tests {
                        "interval":"04:29","id":"kw_1"}]"#;
         let list: Vec<SongItem> = serde_json::from_str(json).unwrap();
         assert_eq!(list[0].interval, "04:29");
+    }
+
+    // ===== 诊断信息 =====
+
+    #[test]
+    fn diagnostics_report_contains_key_fields() {
+        // 回归重点：这份文本是用户唯一会贴给我们的现场，字段缺一个就等于没现场。
+        let report = build_diagnostics_report();
+        for needle in [
+            "落雪音乐下载器 诊断信息",
+            "版本: v",
+            "WebView2 运行时:",
+            "数据目录:",
+            "启动日志:",
+            "内置引擎:",
+            "startup.log 尾部",
+        ] {
+            assert!(report.contains(needle), "诊断信息缺少字段: {needle}\n---\n{report}");
+        }
+        // 引擎段必须给出「已就绪 / 未就绪」之一，不能留空
+        assert!(
+            report.contains("已就绪") || report.contains("未就绪"),
+            "引擎状态缺失"
+        );
     }
 
     // ===== 孤儿引擎副本清理 =====
