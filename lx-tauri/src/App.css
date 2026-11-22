@@ -1175,6 +1175,31 @@ nav {
   font-size: 12.5px;
 }
 
+/* 内置引擎不可用：用告警色（红/橙）与「发现新版本」的绿色明确区分开，
+   避免用户把「引擎坏了」看成「有新版本」。 */
+.engine-banner {
+  border-color: rgba(220, 38, 38, 0.35);
+  background: linear-gradient(135deg, rgba(254, 242, 242, 0.97), rgba(254, 226, 226, 0.8));
+  box-shadow: 0 2px 9px rgba(220, 38, 38, 0.12);
+}
+
+.engine-banner .update-banner-text strong {
+  color: #991b1b;
+}
+
+.engine-banner .update-banner-text span {
+  color: #7f1d1d;
+  line-height: 1.55;
+  /* 长路径允许断行，避免一条超长字符串把横幅撑出界 */
+  overflow-wrap: anywhere;
+}
+
+/* 处置建议比原因更次要，字号再小一档 */
+.engine-banner .update-banner-text .engine-banner-hint {
+  opacity: 0.82;
+  font-size: 11.5px;
+}
+
 /* ===== Star 引导 ===== */
 .star-card {
   display: flex;

@@ -340,6 +340,78 @@ fn ensure_engine() -> Result<std::path::PathBuf, String> {
     Ok(dir.join("lx_music_downloader.exe"))
 }
 
+/// 内置引擎不可用的原因（进程内只记录第一次失败）。
+///
+/// 为什么要留这一份：resolve_engine 会被**每条** Tauri 命令调用，若每次失败都写日志，
+/// startup.log 会被刷爆；但完全不记又会丢掉唯一的现场信息 —— 用户机器上没装 Python 时，
+/// 最终报的是「启动子进程失败: 系统找不到指定的文件」，而真正原因（engine.zip 损坏 /
+/// 磁盘满 / 目录无权限）永远不出现，这类工单没法远程诊断。
+static ENGINE_FALLBACK: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// 记录一次「内置引擎不可用」并落盘（只在首次调用时真正写日志）。
+fn note_engine_fallback(err: &str) {
+    if ENGINE_FALLBACK.set(err.to_string()).is_ok() {
+        startup_log(&format!("[警告] 内置引擎不可用: {err}"));
+        startup_log(&format!(
+            "[警告] 已降级到系统 Python（仅开发环境可用）。引擎目录: {}，启动日志: {}",
+            engine_home()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "（无法定位）".into()),
+            startup_log_path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "（无法定位）".into())
+        ));
+    }
+}
+
+/// 引擎解析结果（供前端展示可读提示）。
+#[derive(Serialize, Clone)]
+struct EngineStatus {
+    /// 内置引擎是否可用
+    ok: bool,
+    /// 不可用时的具体原因（解压失败 / 磁盘满 / 无权限…）
+    reason: Option<String>,
+    /// 引擎释放目录
+    #[serde(rename = "engineDir")]
+    engine_dir: Option<String>,
+    /// 启动日志路径（让用户/开发者能直接找到现场）
+    #[serde(rename = "logPath")]
+    log_path: Option<String>,
+}
+
+/// 查询内置引擎状态。
+///
+/// 前端启动时调用一次：引擎不可用就在界面上给一句人话，而不是让用户对着
+/// 空列表或「启动子进程失败」猜。必须 async + spawn_blocking：首次运行会
+/// 同步解压 43MB 引擎包，不能占住主线程。
+#[tauri::command]
+async fn engine_status() -> EngineStatus {
+    tauri::async_runtime::spawn_blocking(|| match ensure_engine() {
+        Ok(_) => EngineStatus {
+            ok: true,
+            reason: ENGINE_FALLBACK.get().cloned(),
+            engine_dir: engine_home().map(|p| p.display().to_string()),
+            log_path: startup_log_path().map(|p| p.display().to_string()),
+        },
+        Err(err) => {
+            note_engine_fallback(&err);
+            EngineStatus {
+                ok: false,
+                reason: Some(err),
+                engine_dir: engine_home().map(|p| p.display().to_string()),
+                log_path: startup_log_path().map(|p| p.display().to_string()),
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|e| EngineStatus {
+        ok: false,
+        reason: Some(format!("引擎状态检查失败: {e}")),
+        engine_dir: engine_home().map(|p| p.display().to_string()),
+        log_path: startup_log_path().map(|p| p.display().to_string()),
+    })
+}
+
 /// 解析下载引擎命令，返回 (程序, 前置参数)：
 ///   1. 用户显式指定了 python 路径 → 开发模式：python + 脚本
 ///   2. 内置引擎可用（默认） → 冻结 EXE，无前置参数
@@ -351,10 +423,14 @@ fn resolve_engine(python: Option<&String>) -> (String, Vec<String>) {
             return (t.to_string(), vec![default_script()]);
         }
     }
-    if let Ok(exe) = ensure_engine() {
-        return (exe.to_string_lossy().to_string(), Vec::new());
+    match ensure_engine() {
+        Ok(exe) => (exe.to_string_lossy().to_string(), Vec::new()),
+        Err(err) => {
+            // 降级前必须留痕：这是「为什么下载不了」的唯一现场。
+            note_engine_fallback(&err);
+            ("python".to_string(), vec![default_script()])
+        }
     }
-    ("python".to_string(), vec![default_script()])
 }
 
 /// 结束子进程并连带清理其子孙进程（Python 会派生 node）。
@@ -2145,7 +2221,28 @@ pub fn run() {
 /// 而是放到 setup 里手工建：只有这样，WebView2 初始化失败才能被这里捕获、
 /// 写进 startup.log 并弹框，而不是在启动阶段把窗口建一半又拆掉。
 fn build_app() -> tauri::Builder<tauri::Wry> {
+    // 单实例保护必须**第一个**注册：
+    // 插件在自己的 setup 里抢占命名互斥体，抢不到就说明已有实例在跑——
+    // 它会把命令行转发给已有实例，然后立刻 process::exit(0)。
+    // 这个时机早于本应用的 setup，所以第二个进程既不会建窗口，也不会碰
+    // WebView2 profile（那正是 ERROR_BUSY 0x800700AA 与「两个实例同时下载、
+    // 互相覆盖输出文件」的来源）。
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            // 走到这里说明用户又双击了一次：把已有窗口叫到前台即可。
+            match app.get_webview_window("main") {
+                Some(w) => {
+                    let _ = w.unminimize();
+                    let _ = w.show();
+                    let _ = w.set_focus();
+                    startup_log("单实例：检测到重复启动，已聚焦现有窗口");
+                }
+                None => {
+                    // 首个实例可能还在建窗（setup 尚未完成），此时只留痕，不弹框。
+                    startup_log("[警告] 单实例：检测到重复启动，但主窗口尚不存在");
+                }
+            }
+        }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(TaskState::default())
@@ -2176,11 +2273,21 @@ fn build_app() -> tauri::Builder<tauri::Wry> {
             export_songs,
             save_text_file,
             read_settings,
-            save_settings
+            save_settings,
+            engine_status
         ])
         .setup(|app| {
             create_main_window(app)?;
-            spawn_startup_watchdog(app.handle().clone());
+            // 先把主窗口的 HWND 缓存下来（此刻窗口刚建好、句柄有效），
+            // 看门狗后续只用 Win32 直查它，不再经过 Tauri 的消息往返。
+            let main_hwnd = app
+                .get_webview_window("main")
+                .and_then(|w| w.hwnd().ok())
+                .map(|h| h.0 as isize);
+            if main_hwnd.is_none() {
+                startup_log("[警告] 无法获取主窗口 HWND，看门狗退化为按窗口表判断");
+            }
+            spawn_startup_watchdog(app.handle().clone(), main_hwnd);
             Ok(())
         })
 }
@@ -2195,42 +2302,171 @@ fn build_app() -> tauri::Builder<tauri::Wry> {
 ///
 /// 这个线程在窗口建好之后启动，若在超时内发现主窗口不见了，就直接
 /// 写日志 + 弹框 + 退出。宁可给一个明确错误，也不要留一个看不见的僵尸进程。
-fn spawn_startup_watchdog(app: AppHandle) {
+fn spawn_startup_watchdog(app: AppHandle, main_hwnd: Option<isize>) {
+    // 期限：正常机器上 WebView2 首帧通常 < 1s；给足 10s 兼容冷启动与慢盘。
+    // （debug 构建允许用环境变量缩短，仅为自动化验证服务，正式包不受影响）
+    let budget = {
+        #[cfg(debug_assertions)]
+        {
+            std::env::var("LX_WATCHDOG_MS")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .map(std::time::Duration::from_millis)
+                .unwrap_or(std::time::Duration::from_secs(10))
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            std::time::Duration::from_secs(10)
+        }
+    };
+    startup_log(&format!(
+        "看门狗：开始监控（期限 {}ms，主窗口 HWND={}）",
+        budget.as_millis(),
+        main_hwnd.map(|h| format!("0x{h:x}")).unwrap_or_else(|| "未知".into())
+    ));
+
     std::thread::spawn(move || {
-        // 正常机器上 WebView2 首帧通常 < 1s；给足 10s 兼容冷启动与慢盘。
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let start = std::time::Instant::now();
+        let mut seen_visible = false;
         loop {
             std::thread::sleep(std::time::Duration::from_millis(250));
-            if app.get_webview_window("main").is_some() {
-                if std::time::Instant::now() >= deadline {
-                    // 窗口一直在，交给正常交互，看门狗退场。
-                    startup_log("看门狗：主窗口稳定存在，退出监控");
+            // 只用 Win32 直查句柄：不发消息、不阻塞、不依赖 tao 的窗口表。
+            // Tauri 的 is_visible()/hwnd() 都会往事件循环发消息并无超时地等回包，
+            // 窗口真的消失时那条消息永远没有应答，会把看门狗线程本身卡死。
+            let observation = WatchdogObservation {
+                hwnd_known: main_hwnd.is_some(),
+                hwnd_alive: main_hwnd.map(hwnd_is_alive).unwrap_or(true),
+                hwnd_visible: main_hwnd.map(hwnd_is_visible).unwrap_or(false),
+                registered: app.get_webview_window("main").is_some(),
+                seen_visible,
+                deadline_passed: start.elapsed() >= budget,
+            };
+            match judge_watchdog(observation) {
+                WatchdogVerdict::KeepWatching => continue,
+                WatchdogVerdict::Healthy => {
+                    seen_visible = true;
+                    if observation.deadline_passed {
+                        startup_log(&format!(
+                            "看门狗：主窗口稳定存在（已观察 {}ms，可见），退出监控",
+                            start.elapsed().as_millis()
+                        ));
+                        return;
+                    }
+                }
+                WatchdogVerdict::ClosedByUser => {
+                    // 窗口曾经正常显示过，之后不可见/消失 —— 这是用户自己关窗，
+                    // 属于正常退出路径，绝不能弹「启动失败」。
+                    startup_log(&format!(
+                        "看门狗：主窗口在可见之后消失（用户关闭），不判定为启动失败（已观察 {}ms）",
+                        start.elapsed().as_millis()
+                    ));
                     return;
                 }
-                continue;
+                WatchdogVerdict::StartupFailed => {
+                    startup_log(&format!(
+                        "[致命] 看门狗：主窗口从未可见（已观察 {}ms，registered={} hwnd_alive={} hwnd_visible={}）",
+                        start.elapsed().as_millis(),
+                        observation.registered,
+                        observation.hwnd_alive,
+                        observation.hwnd_visible
+                    ));
+                    startup_log(&format!("[致命] WebView2 运行时: {}", webview2_runtime_info()));
+                    show_fatal_dialog(
+                        "落雪音乐下载器 启动失败",
+                        &format!(
+                            "窗口没能显示出来：界面内核（Microsoft Edge WebView2）初始化失败。\n\n\
+                             请按下面顺序排查：\n\
+                             1) 修复 WebView2 运行时：到 https://developer.microsoft.com/microsoft-edge/webview2/ \
+                             下载「Evergreen Standalone Installer」安装后重启本程序；\n\
+                             2) 安全软件（火绒 / 卡巴斯基 / ReasonLabs 等）拦截了 msedgewebview2.exe —— \
+                             把本程序与 msedgewebview2.exe 加入信任区；\n\
+                             3) 若上面都无效，请把诊断日志发给开发者：\n{}\n\n\
+                             （程序会保留日志并自动退出，不会在后台残留进程。）",
+                            startup_log_path().map(|p| p.display().to_string()).unwrap_or_else(|| "（无法定位）".into())
+                        ),
+                    );
+                    std::process::exit(1);
+                }
             }
-            // 窗口没了：说明 WebView2 在异步初始化阶段挂掉了。
-            startup_log("[致命] 看门狗：主窗口在启动后消失（WebView2 初始化失败）");
-            startup_log(&format!("[致命] WebView2 运行时: {}", webview2_runtime_info()));
-            show_fatal_dialog(
-                "落雪音乐下载器 启动失败",
-                &format!(
-                    "窗口没能显示出来：界面内核（Microsoft Edge WebView2）初始化失败。\n\n\
-                     请按下面顺序排查：\n\
-                     1) 修复 WebView2 运行时：到 https://developer.microsoft.com/microsoft-edge/webview2/ \
-                     下载「Evergreen Standalone Installer」安装后重启本程序；\n\
-                     2) 安全软件（火绒 / 卡巴斯基 / ReasonLabs 等）拦截了 msedgewebview2.exe —— \
-                     把本程序与 msedgewebview2.exe 加入信任区；\n\
-                     3) 若上面都无效，请把诊断日志发给开发者：\n{}\n\n\
-                     （程序会保留日志并自动退出，不会在后台残留进程。）",
-                    startup_log_path().map(|p| p.display().to_string()).unwrap_or_else(|| "（无法定位）".into())
-                ),
-            );
-            std::process::exit(1);
         }
     });
 }
 
+/// 看门狗一次采样的观察结果（纯数据，不含任何 Tauri 类型，便于单测）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WatchdogObservation {
+    /// 启动时是否成功拿到主窗口 HWND（拿不到就只能退化为按窗口表判断）
+    hwnd_known: bool,
+    /// 该 HWND 是否仍指向本进程的有效窗口（IsWindow + 属主进程校验）
+    hwnd_alive: bool,
+    /// 该 HWND 当前是否可见（IsWindowVisible；最小化仍算可见）
+    hwnd_visible: bool,
+    /// Tauri 窗口表里是否还有 "main"（旧判据，已证明不可信，仅用于日志与退化模式）
+    registered: bool,
+    /// 此前是否已经观察到过窗口可见
+    seen_visible: bool,
+    /// 是否已到监控期限
+    deadline_passed: bool,
+}
+
+/// 看门狗的判定结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WatchdogVerdict {
+    /// 还不能下结论，继续监控
+    KeepWatching,
+    /// 窗口确实可见：健康
+    Healthy,
+    /// 窗口曾经可见、现在不可见/已消失 → 用户关窗，正常退出，**不许报错**
+    ClosedByUser,
+    /// 窗口从未可见 → 启动失败（弹框 + 退出码 1）
+    StartupFailed,
+}
+
+/// 看门狗的核心判据（纯函数，可单测）。
+///
+/// 设计依据来自 2026-11-22 的最小复现实测（一次性 debug 探针在 HWND 销毁的同一帧
+/// 采样，结论落地后探针已删除）：
+///
+/// | 现场                        | get_webview_window | IsWindow | IsWindowVisible |
+/// |-----------------------------|--------------------|----------|-----------------|
+/// | 窗口健在且可见              | Some               | true     | true            |
+/// | 窗口被销毁（WebView2 失败） | Some（陈旧记录）   | false    | false           |
+/// | 窗口还在但不可见            | Some               | true     | false           |
+///
+/// 结论：get_webview_window("main").is_some() 完全无法区分这三种情况，
+/// 它只能回答「窗口表里有没有这条记录」；真正可信的是句柄本身的状态。
+/// 2026-11-22 的复现里，旧判据在「窗口不可见」时会打印「主窗口稳定存在，退出监控」，
+/// 这正是现场「进程活着、窗口没了、却不报错」的直接原因。
+///
+/// 防误报：只要**曾经**看到过窗口可见，之后消失就一律按「用户关窗」处理，
+/// 绝不弹「启动失败」——用户 10 秒内主动关窗是很常见的动作。
+fn judge_watchdog(o: WatchdogObservation) -> WatchdogVerdict {
+    if !o.hwnd_known {
+        // 退化模式：拿不到 HWND 时只能沿用窗口表判据。只有明确「窗口表里也没了」
+        // 且期限已到才判失败，避免因为一条未知信息就误报。
+        if o.registered {
+            // 表里还在：无法进一步判断，期限到了就当健康退出（不误报为先）
+            return if o.deadline_passed { WatchdogVerdict::Healthy } else { WatchdogVerdict::KeepWatching };
+        }
+        return if o.deadline_passed { WatchdogVerdict::StartupFailed } else { WatchdogVerdict::KeepWatching };
+    }
+    if o.hwnd_alive && o.hwnd_visible {
+        return WatchdogVerdict::Healthy;
+    }
+    if o.seen_visible {
+        // 曾经可见 → 用户关窗/隐藏，正常路径
+        return WatchdogVerdict::ClosedByUser;
+    }
+    if !o.hwnd_alive {
+        // 句柄已死且从未可见 → WebView2 在异步初始化阶段挂掉，立即判失败
+        return WatchdogVerdict::StartupFailed;
+    }
+    if o.deadline_passed {
+        // 窗口活着但从来没显示出来 → 同样是启动失败
+        return WatchdogVerdict::StartupFailed;
+    }
+    WatchdogVerdict::KeepWatching
+}
 /// 创建主窗口（含 WebView2）。
 ///
 /// 相比「让 tauri.conf.json 自动建窗」，这里多了两条救命逻辑：
@@ -2353,6 +2589,63 @@ fn reset_webview_data_dir() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
     }
+}
+
+// ============ 原生窗口句柄探测（看门狗判据的基础） ============
+//
+// 为什么不用 Tauri 的 is_visible() / hwnd() 做看门狗判据：
+// 这两个方法在 tauri-runtime-wry 里都是 window_getter!，也就是「往事件循环
+// 发一条消息，然后 rx.recv() 无超时地等回包」。一旦窗口已经从 tao 的窗口表里
+// 消失，事件循环会直接跳过这条消息（没有窗口可处理），**永远不回包** ——
+// 在后台线程里调用它的结果不是「返回 false」，而是「永久阻塞」。
+// 看门狗线程一旦卡在这里，就再也不会弹框、不会退出进程，比原来的 bug 更糟。
+//
+// 因此判据只用 Win32 直查句柄：不发消息、不阻塞、不依赖 tao 的内部状态。
+
+/// 句柄是否仍然指向本进程中的一个真实窗口。
+///
+/// 只判 IsWindow 不够：HWND 会被系统回收复用，窗口销毁后同一个数值
+/// 可能已经被别的窗口占用。所以再核对一次属主进程 ID。
+#[cfg(windows)]
+fn hwnd_is_alive(hwnd: isize) -> bool {
+    extern "system" {
+        fn IsWindow(hwnd: *mut core::ffi::c_void) -> i32;
+        fn GetWindowThreadProcessId(hwnd: *mut core::ffi::c_void, pid: *mut u32) -> u32;
+    }
+    if hwnd == 0 {
+        return false;
+    }
+    let h = hwnd as *mut core::ffi::c_void;
+    unsafe {
+        if IsWindow(h) == 0 {
+            return false;
+        }
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(h, &mut pid);
+        pid == std::process::id()
+    }
+}
+
+#[cfg(not(windows))]
+fn hwnd_is_alive(_hwnd: isize) -> bool {
+    true
+}
+
+/// 句柄是否存在且当前可见（最小化时 WS_VISIBLE 仍在，仍算「可见」）。
+#[cfg(windows)]
+fn hwnd_is_visible(hwnd: isize) -> bool {
+    extern "system" {
+        fn IsWindowVisible(hwnd: *mut core::ffi::c_void) -> i32;
+    }
+    if hwnd == 0 {
+        return false;
+    }
+    unsafe { IsWindowVisible(hwnd as *mut core::ffi::c_void) != 0 }
+}
+
+#[cfg(not(windows))]
+fn hwnd_is_visible(_hwnd: isize) -> bool {
+    true
 }
 
 #[cfg(test)]
@@ -2798,5 +3091,124 @@ mod tests {
                        "interval":"04:29","id":"kw_1"}]"#;
         let list: Vec<SongItem> = serde_json::from_str(json).unwrap();
         assert_eq!(list[0].interval, "04:29");
+    }
+
+    // ===== 启动看门狗判据（P0-1）=====
+    //
+    // 这些用例锁定的正是 2026-11-11 那次漏报：窗口已经不可见、进程却还活着，
+    // 而旧判据 get_webview_window("main").is_some() 依然返回 true，
+    // 于是看门狗打印「主窗口稳定存在」后静静退场，用户永远等不到那个错误框。
+
+    fn obs(
+        hwnd_known: bool,
+        hwnd_alive: bool,
+        hwnd_visible: bool,
+        registered: bool,
+        seen_visible: bool,
+        deadline_passed: bool,
+    ) -> WatchdogObservation {
+        WatchdogObservation {
+            hwnd_known,
+            hwnd_alive,
+            hwnd_visible,
+            registered,
+            seen_visible,
+            deadline_passed,
+        }
+    }
+
+    #[test]
+    fn watchdog_healthy_when_window_visible() {
+        // Healthy 表示「此刻窗口确实可见」这个事实；是否结束监控由调用方看期限决定。
+        assert_eq!(
+            judge_watchdog(obs(true, true, true, true, false, false)),
+            WatchdogVerdict::Healthy
+        );
+        // 到期时窗口仍可见：同样是 Healthy，调用方据此记录「稳定存在」并退场
+        assert_eq!(
+            judge_watchdog(obs(true, true, true, true, true, true)),
+            WatchdogVerdict::Healthy
+        );
+    }
+
+    #[test]
+    fn watchdog_fails_fast_when_hwnd_destroyed_and_never_visible() {
+        // 复现实测场景 A：DestroyWindow 之后 get_webview_window 仍返回 Some，
+        // 但句柄已死、且窗口从未显示过 —— 必须立即判失败，而不是等满 10 秒。
+        assert_eq!(
+            judge_watchdog(obs(true, false, false, true, false, false)),
+            WatchdogVerdict::StartupFailed
+        );
+    }
+
+    #[test]
+    fn watchdog_reports_startup_failure_for_never_visible_window() {
+        // 复现实测场景 B（旧判据漏报的那一种）：窗口还活着但不可见、从未显示过，
+        // 旧判据会说「稳定存在」，新判据在期限到达后判失败。
+        assert_eq!(
+            judge_watchdog(obs(true, true, false, true, false, false)),
+            WatchdogVerdict::KeepWatching,
+            "期限内还不能下结论"
+        );
+        assert_eq!(
+            judge_watchdog(obs(true, true, false, true, false, true)),
+            WatchdogVerdict::StartupFailed,
+            "从未可见即启动失败"
+        );
+    }
+
+    #[test]
+    fn watchdog_never_reports_failure_after_user_closed_window() {
+        // 用户 10 秒内主动关窗：曾经可见 → 之后消失只能是用户操作，绝不能弹框。
+        assert_eq!(
+            judge_watchdog(obs(true, false, false, true, true, false)),
+            WatchdogVerdict::ClosedByUser
+        );
+        // 关窗后 Tauri 可能顺手把记录也摘掉，同样不许报错
+        assert_eq!(
+            judge_watchdog(obs(true, false, false, false, true, true)),
+            WatchdogVerdict::ClosedByUser
+        );
+        // 窗口被隐藏（最小化到托盘这类情况）也不许报错
+        assert_eq!(
+            judge_watchdog(obs(true, true, false, true, true, true)),
+            WatchdogVerdict::ClosedByUser
+        );
+    }
+
+    #[test]
+    fn watchdog_degrades_when_hwnd_unknown() {
+        // 拿不到 HWND（极端情况）时退化：表里还在就不误报
+        assert_eq!(
+            judge_watchdog(obs(false, true, false, true, false, false)),
+            WatchdogVerdict::KeepWatching
+        );
+        assert_eq!(
+            judge_watchdog(obs(false, true, false, true, false, true)),
+            WatchdogVerdict::Healthy
+        );
+        // 表里也没了、期限已到：仍然判失败
+        assert_eq!(
+            judge_watchdog(obs(false, true, false, false, false, true)),
+            WatchdogVerdict::StartupFailed
+        );
+        // 表里也没了但期限未到：继续等，可能建窗尚未完成
+        assert_eq!(
+            judge_watchdog(obs(false, true, false, false, false, false)),
+            WatchdogVerdict::KeepWatching
+        );
+    }
+
+    #[test]
+    fn watchdog_ignores_window_registry_presence_alone() {
+        // 核心回归：只凭「窗口表里有记录」这一个信号，任何组合都不能判健康。
+        for &(alive, visible) in &[(false, false), (true, false)] {
+            let v = judge_watchdog(obs(true, alive, visible, true, false, true));
+            assert_eq!(
+                v,
+                WatchdogVerdict::StartupFailed,
+                "alive={alive} visible={visible} 时不得不报，否则就是漏报"
+            );
+        }
     }
 }

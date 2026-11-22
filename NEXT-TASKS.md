@@ -39,9 +39,12 @@
 
 ---
 
-## 二、P0：三件事，按顺序做
+## 二、P0：三件事（✅ 已于 2026-11-22 全部完成并验证）
 
 > 原则：**先证明问题存在，再改代码**。上一轮的教训是「加了防护但没验证防护本身是否有效」。
+>
+> 三项目前状态：P0-1 / P0-2 / P0-3 均已落地，验证记录见每节末尾的「验证结果」。
+> 版本号尚未改动（仍为 1.1.1），发版由作者决定。
 
 ### P0-1　看门狗判据可能完全无效（最优先）
 
@@ -83,6 +86,42 @@ let alive = app
 - 启动后 2 秒内关闭窗口 → **不弹任何错误框**，正常退出。
 - 新增单测覆盖判定函数。
 
+**实测结论（2026-11-22，一次性 debug 探针，结论落地后探针已删除）**
+
+在「窗口刚被 DestroyWindow、Tauri 还没来得及处理销毁事件」的同一帧采样：
+
+| 现场 | get_webview_window | IsWindow | IsWindowVisible | hwnd() | is_visible() |
+|---|---|---|---|---|---|
+| 窗口健在可见 | Some | true | true | Ok(句柄) | Ok(true) |
+| 窗口被销毁 | **Some（陈旧）** | false | false | Ok(旧句柄) | Ok(false) |
+| 窗口在但不可见 | Some | true | false | Ok(句柄) | Ok(false) |
+
+三条结论：
+
+1. `get_webview_window("main").is_some()` **完全无法区分这三种情况**，它只回答「窗口表里有没有记录」，
+   这就是漏报的直接原因；复现时旧判据在「窗口不可见」状态下照样打印「主窗口稳定存在，退出监控」。
+2. `hwnd()` 单独用不可靠（返回的是陈旧句柄），必须对它调 `IsWindow`。
+3. `is_visible()` / `hwnd()` 都是 `window_getter!`，即「发消息给事件循环 + `rx.recv()` 无超时等回包」；
+   窗口从 tao 窗口表里消失后那条消息**永远没人应答**，在后台线程调用会永久阻塞——
+   所以看门狗**不能用**这两个 API 轮询，只能用缓存的 HWND + Win32 直查。
+
+**落地实现**
+
+- `hwnd_is_alive()` / `hwnd_is_visible()`：Win32 `IsWindow` + `GetWindowThreadProcessId`（防 HWND 复用）与
+  `IsWindowVisible`，不发消息、不阻塞。
+- `WatchdogObservation` + `judge_watchdog()`：判定逻辑抽成**纯函数**，6 个单测覆盖
+  （健康 / 句柄死亡 / 从未可见 / 用户关窗 / 取不到句柄的退化模式 / 「仅凭窗口表不得判健康」的回归）。
+- 防误报靠 `seen_visible`：只要曾经看到过窗口可见，之后消失一律判「用户关窗」，不弹框。
+
+**验证结果**
+
+| 场景 | 手段 | 结果 |
+|---|---|---|
+| 从未可见 | `SW_HIDE` 在首个采样前隐藏窗口（期限缩短到 2s） | 弹框「落雪音乐下载器 启动失败」+ 日志 `[致命] 看门狗：主窗口从未可见` + **退出码 1** + 进程退出 |
+| 正常启动 | 正式包连跑 14s | 日志「看门狗：主窗口稳定存在（已观察 10014ms，可见），退出监控」，无弹框 |
+| 2 秒内关窗 | WM_CLOSE 关掉主窗口 | 进程正常退出 exitCode=0，**无任何错误框**、无 `[致命]` 日志 |
+| 单元测试 | `cargo test` | 54 项全通过（新增 6 项） |
+
 ---
 
 ### P0-2　没有单实例保护
@@ -109,6 +148,31 @@ let alive = app
 
 连续双击两次 → 只有一个主窗口、只有一个 `lx-tauri.exe` 进程；
 第二次启动在 1 秒内退出，且不产生新的 WebView2 profile 目录。
+
+**落地实现**
+
+- `Cargo.toml`：`tauri-plugin-single-instance = "=2.4.5"`（**精确锁定**，原因见下）。
+- `build_app()` 里**第一个**注册该插件；回调里 `unminimize() + show() + set_focus()`。
+- 插件在自身 setup 阶段抢命名互斥体，抢不到就转发命令行给已有实例并 `process::exit(0)`——
+  这个时机早于本应用的 setup，因此第二个进程**不会建窗、不会碰 WebView2 profile**。
+
+**为什么锁 2.4.5 而不是最新版**
+
+`tauri-plugin-single-instance` 2.5.x 要求 `tauri = ^2.12`，会连带把
+`wry 0.55 → 0.57`、`tao 0.35 → 0.37`、`webview2-com 0.38 → 0.39` 一起升上去
+（实测 Cargo.lock 变动 487 增 / 247 删）。GUI 核心栈整体跃迁对一次单实例加固来说风险过大，
+而 2.4.5 只要求 `^2.10`，与当前 tauri 2.11.5 完全兼容，lock 仅新增 17 行。
+**升级 tauri 到 2.12 应作为独立改动单独验证，不要和本项混在一起。**
+
+**验证结果（正式包）**
+
+| 指标 | 结果 |
+|---|---|
+| 第二次启动退出耗时 | 79 ms（要求 < 1000 ms） |
+| 退出码 | 0 |
+| `lx-tauri.exe` 进程数 | 1 |
+| `webview2*` profile 目录数 | 1 → 1（没有新建） |
+| 首个实例日志 | `单实例：检测到重复启动，已聚焦现有窗口` |
 
 ---
 
@@ -140,6 +204,31 @@ if let Ok(exe) = ensure_engine() { return (exe.to_string_lossy().to_string(), Ve
 
 故意破坏 `%LOCALAPPDATA%\落雪下载\engine\`（例如把 `lx_music_downloader.exe` 改名）→
 `startup.log` 必须出现具体错误原因；界面给出可读提示。
+
+**落地实现**
+
+- `resolve_engine()` 改为 `match ensure_engine()`，失败分支调 `note_engine_fallback(&err)`：
+  用 `OnceLock<String>` 保证**只在首次失败时写日志**（`resolve_engine` 被每条命令调用，
+  每次写会把 startup.log 刷爆），日志内容为 `[警告] 内置引擎不可用: <原因>` + 引擎目录 + 日志路径。
+- 新增 `engine_status` 命令（async + `spawn_blocking`，首次运行要解压 43MB）返回
+  `{ ok, reason, engineDir, logPath }`；前端挂载时查一次。
+- 前端：不可用时在顶部显示红色横幅（原因 + 日志路径 + 处置建议），并往日志区补一条 error。
+
+**验证结果（正式包）**
+
+构造方式：把引擎目录整体删除，并在同级的 `engine.staging` 位置放一个普通文件
+（`create_dir_all` 必然失败，等价于磁盘异常/残留文件把解压堵死）。
+
+- `startup.log` 出现：
+  `[警告] 内置引擎不可用: 创建引擎目录失败: 当文件已存在时，无法创建该文件。 (os error 183)`
+  `[警告] 已降级到系统 Python（仅开发环境可用）。引擎目录: …\engine，启动日志: …\startup.log`
+- 界面顶部出现红色横幅「内置下载引擎不可用，已退回系统 Python」，含原因、日志路径与处置建议，
+  另有「知道了」可关闭（截图见 `.probe/engine-banner2.png`）。
+- 移除破坏物后重启：引擎自动重新解压，横幅不再出现。
+
+**注意**：验收文档里「把 `lx_music_downloader.exe` 改名」这种破坏方式其实**验不出问题**——
+`ensure_engine()` 发现 `.engine_hash` 与 EXE 都不匹配时会自动重新解压，属于自愈路径。
+要复现「解压失败」，得让解压本身失败（占位文件、只读目录、磁盘满）。
 
 ---
 

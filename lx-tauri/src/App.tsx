@@ -57,6 +57,15 @@ interface UpdateInfo {
   error: string;
 }
 
+/** 内置引擎状态（与 Rust EngineStatus 对应） */
+interface EngineStatus {
+  ok: boolean;
+  /** 不可用时的具体原因（解压失败 / 磁盘满 / 无权限…） */
+  reason: string | null;
+  engineDir: string | null;
+  logPath: string | null;
+}
+
 interface LogLine {
   kind: "info" | "ok" | "error" | "done";
   data: string;
@@ -315,6 +324,12 @@ function App() {
   /** 应用版本号（启动时从 Tauri 读，唯一来源 tauri.conf.json） */
   const [appVersion, setAppVersion] = useState("…");
 
+  // ===== 内置引擎状态 =====
+  // 引擎包解压失败（zip 损坏 / 磁盘满 / 目录无权限）时，后端会降级到系统 Python，
+  // 用户最终看到的只是「启动子进程失败」。这里把真实原因显示出来，并给出日志路径，
+  // 否则这类工单完全没法远程诊断。
+  const [engineIssue, setEngineIssue] = useState<EngineStatus | null>(null);
+
   // ===== 检查更新 =====
   const [checkingUpdate, setCheckingUpdate] = useState(false);
   const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
@@ -432,6 +447,20 @@ function App() {
   // 注意依赖**故意为空**：版本号、更新检查、体检缓存都只该在启动时做一次。
   // 歌曲列表的加载由下面的 effect 单独负责（它才需要跟随 dbPath/pythonPath 变化）。
   useEffect(() => {
+    // 内置引擎体检：解压失败必须让用户看见原因（见 engine_status 的注释）
+    invoke<EngineStatus>("engine_status")
+      .then((st) => {
+        if (!st.ok) {
+          setEngineIssue(st);
+          addLog(
+            "error",
+            `内置引擎不可用：${st.reason ?? "未知原因"}（已退回使用系统 Python，未安装时无法下载）`,
+          );
+        }
+      })
+      .catch(() => {
+        /* 状态查询本身失败不打扰用户，下载时仍会给出错误 */
+      });
     // 载入上次的体检缓存：不必每次进页面都等一两分钟
     invoke<ProbeReport | null>("load_probe_cache")
       .then((r) => { if (r) setProbeReport(r); })
@@ -1268,6 +1297,28 @@ let path: string | null = null;
               </button>
               <button className="ghost-btn small" onClick={() => setUpdateDismissed(true)}>
                 稍后
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* ===== 内置引擎不可用提示条 ===== */}
+        {engineIssue && !engineIssue.ok && (
+          <div className="update-banner engine-banner">
+            <div className="update-banner-text">
+              <strong>内置下载引擎不可用，已退回系统 Python</strong>
+              <span>
+                原因：{engineIssue.reason ?? "未知"}
+                {engineIssue.logPath ? `（详情见 ${engineIssue.logPath}）` : ""}
+              </span>
+              <span className="engine-banner-hint">
+                若本机没装 Python，搜索和下载都用不了。删掉引擎目录后重启程序会自动重新解压
+                {engineIssue.engineDir ? `：${engineIssue.engineDir}` : ""}
+              </span>
+            </div>
+            <div className="update-banner-actions">
+              <button className="ghost-btn small" onClick={() => setEngineIssue(null)}>
+                知道了
               </button>
             </div>
           </div>

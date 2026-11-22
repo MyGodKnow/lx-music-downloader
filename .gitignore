@@ -56,3 +56,6 @@ design-system/
 _*.py
 lx-tauri/_*.py
 lx-downloader/_*.py
+
+# 临时验证产物（截图 / 抓包等，不入库）
+.probe/
