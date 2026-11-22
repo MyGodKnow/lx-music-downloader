@@ -41,7 +41,7 @@ python lx_music_downloader.py --help
 ## 提交前自检
 
 ```bash
-# 引擎单元测试
+# 引擎单元测试（需 Python 3.13 + mutagen，否则会有假失败）
 cd lx-downloader && python -m unittest discover -s tests
 
 # Rust 测试 + lint
@@ -51,7 +51,11 @@ cd lx-tauri/src-tauri && cargo test && cargo clippy --all-targets -- -D warnings
 cd lx-tauri && npx tsc --noEmit
 ```
 
-四项全绿再提 PR。
+三项全绿再提 PR。
+
+> 引擎测试依赖 `mutagen`（用于音质检测）。用没装 mutagen 的解释器跑，
+> `test_engine.ActualQualityTest` 等 6 项会假失败（`detect_actual_quality` 返回 `''`），
+> 那不是回归，先 `pip install mutagen` 再试。
 
 ## 代码约定
 
