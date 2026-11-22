@@ -1821,7 +1821,7 @@ def detect_actual_quality(path):
     return ''
 
 
-def lower_quality_options(quality, min_quality='320k'):
+def lower_quality_options(quality, min_quality='128k'):
     """返回当前音质及其以下音质，按优先级从高到低排列；最低不降到 min_quality 以下。
     min_quality 可取任意档位（128k/192k/320k/flac/flac24bit），表示允许的最低档位。
     例：quality=flac, min_quality=192k → [flac, 320k, 192k]"""
@@ -2295,8 +2295,9 @@ def load_config():
         'quality': '320k',
         'fallback_quality': False,
         # 降级时允许的最低音质。GUI 里是可选项，必须持久化，
-        # 否则用户每次改完、下次启动又回到默认 320k。
-        'min_quality': '320k',
+        # 否则用户每次改完、下次启动又回到默认 128k（1.1.1 之后从 320k 下调，
+        # 面向「能听就行」场景：320k 起降级在缺源时常常直接失败收场）。
+        'min_quality': '128k',
         # 默认并发 6。
         #
         # 实测（12 首 320k，取链接已改为「并行竞速」后）：
@@ -2484,7 +2485,7 @@ def run():
                         help='音质代码（默认使用设置值；设置菜单使用 1-5）')
     parser.add_argument('--fallback-quality', action='store_true', default=config['fallback_quality'],
                         help='下载失败时自动逐级降低音质')
-    parser.add_argument('--min-quality', default=config.get('min_quality', '320k'),
+    parser.add_argument('--min-quality', default=config.get('min_quality', '128k'),
                         choices=['128k', '192k', '320k', 'flac', 'flac24bit'],
                         help='降级时允许的最低音质（默认使用设置值）')
     # 设置持久化：GUI 用这两个命令读写同一个配置文件，
@@ -2907,7 +2908,7 @@ def run_download(args, songs, db_path=None, title=None):
                 try:
                     source = cand['source']
                     # 开启降级时，获取链接、下载和严格时长校验都失败后才切换低音质。
-                    quality_levels = lower_quality_options(args.quality, args.min_quality if hasattr(args, 'min_quality') else '320k') if args.fallback_quality else [args.quality]
+                    quality_levels = lower_quality_options(args.quality, args.min_quality if hasattr(args, 'min_quality') else '128k') if args.fallback_quality else [args.quality]
                     quality_errors = []
                     # 该源是否「连链接都拿不到」。一旦成立，就没必要再试更低档位：
                     # 降档只是把「要 flac」改成「要 320k」，而这里失败的原因是

@@ -254,7 +254,10 @@ function App() {
 
   const [quality, setQuality] = useState("flac");
   const [fallback, setFallback] = useState(true);
-  const [minQuality, setMinQuality] = useState("320k");
+  // 默认允许降到 128k：目标场景是「能听就行」，320k 起降级常常直接失败收场。
+  // 注意这是**新用户**的默认值；老用户设置里已存的 min_quality 会被原样读回，
+  // 不会被这里的默认值覆盖。
+  const [minQuality, setMinQuality] = useState("128k");
   const [workers, setWorkers] = useState(0);
   const [dir, setDir] = useState("");
   const [selected, setSelected] = useState<string>("");
@@ -329,6 +332,16 @@ function App() {
   // 用户最终看到的只是「启动子进程失败」。这里把真实原因显示出来，并给出日志路径，
   // 否则这类工单完全没法远程诊断。
   const [engineIssue, setEngineIssue] = useState<EngineStatus | null>(null);
+
+  /**
+   * 首次启动的引擎释放进度。
+   *
+   * 引擎包 43MB → 解压后 103MB，冷机要十几秒。这段时间界面原本只有一个空列表，
+   * 用户以为程序卡死了（本项目收到过多次「双击后没反应」的反馈）。
+   * 这里轮询后端进度，解压期间显示明确说明与百分比。
+   * null 表示没在释放（绝大多数启动都是这种情况，不显示任何东西）。
+   */
+  const [enginePrep, setEnginePrep] = useState<{ done: number; total: number } | null>(null);
 
   // ===== 检查更新 =====
   const [checkingUpdate, setCheckingUpdate] = useState(false);
@@ -447,7 +460,23 @@ function App() {
   // 注意依赖**故意为空**：版本号、更新检查、体检缓存都只该在启动时做一次。
   // 歌曲列表的加载由下面的 effect 单独负责（它才需要跟随 dbPath/pythonPath 变化）。
   useEffect(() => {
-    // 内置引擎体检：解压失败必须让用户看见原因（见 engine_status 的注释）
+    // 内置引擎体检：解压失败必须让用户看见原因（见 engine_status 的注释）。
+    // 同时轮询释放进度 —— engine_status 本身就会触发首次解压，所以两件事必须并行：
+    // 一个在等结果，一个在报告「进度到哪了」。
+    let prepDone = false;
+    let prepTimer: number | undefined;
+    const pollPrep = async () => {
+      if (prepDone) return;
+      try {
+        const pr = await invoke<{ active: boolean; done: number; total: number }>("engine_progress");
+        if (prepDone) return;
+        setEnginePrep(pr.active && pr.total > 0 ? { done: pr.done, total: pr.total } : null);
+        prepTimer = window.setTimeout(() => void pollPrep(), 400);
+      } catch {
+        // 查询失败就停止轮询，不要让异常循环刷屏
+      }
+    };
+    void pollPrep();
     invoke<EngineStatus>("engine_status")
       .then((st) => {
         if (!st.ok) {
@@ -460,6 +489,11 @@ function App() {
       })
       .catch(() => {
         /* 状态查询本身失败不打扰用户，下载时仍会给出错误 */
+      })
+      .finally(() => {
+        prepDone = true;
+        if (prepTimer) window.clearTimeout(prepTimer);
+        setEnginePrep(null);
       });
     // 载入上次的体检缓存：不必每次进页面都等一两分钟
     invoke<ProbeReport | null>("load_probe_cache")
@@ -1319,6 +1353,24 @@ let path: string | null = null;
           </div>
         )}
 
+        {/* ===== 首次启动：正在释放内置引擎 ===== */}
+        {enginePrep && (
+          <div className="engine-prep">
+            <div className="engine-prep-title">首次启动，正在释放内置引擎…</div>
+            <div className="engine-prep-bar">
+              <div
+                className="engine-prep-bar-fill"
+                style={{ width: `${Math.min(100, Math.round((enginePrep.done / enginePrep.total) * 100))}%` }}
+              />
+            </div>
+            <div className="engine-prep-meta">
+              {enginePrep.done} / {enginePrep.total} 个文件
+              {enginePrep.done === 0 ? "（正在准备）" : ""}
+              ｜只需这一次，之后启动是秒开
+            </div>
+          </div>
+        )}
+
         {/* ===== 内置引擎不可用提示条 ===== */}
         {engineIssue && !engineIssue.ok && (
           <div className="update-banner engine-banner">
@@ -1631,14 +1683,14 @@ let path: string | null = null;
                   />
                   <span>失败时自动降级音质</span>
                 </label>
-                <label className="field slim">
+                <label className="field slim" title="目标音质拿不到时，最多降到哪一档">
                   <span>最低降级到</span>
                   <select
                     value={minQuality}
                     onChange={(e) => setMinQuality(e.target.value)}
                     disabled={!fallback}
                   >
-                    <option value="128k">128k (标准)</option>
+                    <option value="128k">128k (标准，推荐)</option>
                     <option value="192k">192k (较高)</option>
                     <option value="320k">320k (高品质)</option>
                     <option value="flac">flac (无损)</option>

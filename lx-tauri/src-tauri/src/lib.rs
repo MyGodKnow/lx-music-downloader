@@ -301,9 +301,6 @@ fn engine_version() -> String {
 /// 用一把进程级锁把它们排成一条队；拿到锁后先复查一遍 fresh，避免重复解压。
 static ENGINE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// 确保内置引擎已释放到本地；版本变化（内容哈希不同）时重新释放。
-/// 升级采用「解压到临时目录 → 目录交换」的方式：正在运行的旧引擎文件被占用时
-/// 也能完成升级，不会因为删不掉旧目录而卡在旧版本。
 /// 引擎目录是否已经是最新版本（只读文件判断，**不解压**）。
 /// 抽出来是给诊断信息用的：诊断不能顺手触发一次 43MB 解压。
 fn engine_is_fresh(dir: &std::path::Path) -> bool {
@@ -315,6 +312,60 @@ fn engine_is_fresh(dir: &std::path::Path) -> bool {
             .unwrap_or(false)
 }
 
+/// 引擎释放进度（首次启动解压 43MB → 103MB，需要十几秒）。
+///
+/// 为什么需要它：解压发生在后台线程，界面此时只有一个空列表——用户以为程序卡死了。
+/// 用「条目总数 / 已完成条目」而不是字节数：zip 条目数在打开压缩包时就已知，
+/// 进度条不会因为单个大文件而长时间停在 7%。
+#[derive(Default)]
+struct EngineProgress {
+    /// 是否正在释放
+    active: bool,
+    /// 已处理条目数
+    done: usize,
+    /// 总条目数（0 表示尚未开始）
+    total: usize,
+}
+
+static ENGINE_PROGRESS: std::sync::Mutex<EngineProgress> = std::sync::Mutex::new(EngineProgress {
+    active: false,
+    done: 0,
+    total: 0,
+});
+
+/// 更新进度；锁中毒也照常覆盖（进度只是展示用的，绝不能因此 panic）。
+fn set_engine_progress(active: bool, done: usize, total: usize) {
+    let mut g = ENGINE_PROGRESS.lock().unwrap_or_else(|e| e.into_inner());
+    g.active = active;
+    g.done = done;
+    g.total = total;
+}
+
+/// 引擎释放进度（供前端轮询）。
+#[derive(Serialize, Clone)]
+struct EngineProgressInfo {
+    /// 正在解压中
+    active: bool,
+    done: usize,
+    total: usize,
+}
+
+#[tauri::command]
+fn engine_progress() -> EngineProgressInfo {
+    let g = ENGINE_PROGRESS.lock().unwrap_or_else(|e| e.into_inner());
+    EngineProgressInfo {
+        active: g.active,
+        done: g.done,
+        total: g.total,
+    }
+}
+
+/// 确保内置引擎已释放到本地；版本变化（内容哈希不同）时重新释放。
+/// 升级采用「解压到临时目录 → 目录交换」的方式：正在运行的旧引擎文件被占用时
+/// 也能完成升级，不会因为删不掉旧目录而卡在旧版本。
+///
+/// 解压过程会更新 ENGINE_PROGRESS：43MB → 103MB 的解压要十几秒，
+/// 期间界面必须能说明「在干什么」，否则用户看到的就是一个假死窗口。
 fn ensure_engine() -> Result<std::path::PathBuf, String> {
     let _guard = ENGINE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = engine_home().ok_or_else(|| "无法定位 LOCALAPPDATA".to_string())?;
@@ -330,9 +381,40 @@ fn ensure_engine() -> Result<std::path::PathBuf, String> {
     std::fs::create_dir_all(&staging).map_err(|e| format!("创建引擎目录失败: {e}"))?;
     let cursor = std::io::Cursor::new(ENGINE_ZIP);
     let mut archive = zip::ZipArchive::new(cursor).map_err(|e| format!("内置引擎包损坏: {e}"))?;
-    archive
-        .extract(&staging)
-        .map_err(|e| format!("释放内置引擎失败: {e}"))?;
+    let total = archive.len();
+    set_engine_progress(true, 0, total);
+    // 手工逐条目解压（而不是 archive.extract()）：只有这样才能报告进度。
+    // 解压失败时也要把进度复位，否则界面会永远停在「正在释放」。
+    let extract_result = (|| -> Result<(), String> {
+        for i in 0..total {
+            let mut entry = archive
+                .by_index(i)
+                .map_err(|e| format!("释放内置引擎失败（条目 {i}）: {e}"))?;
+            let Some(path) = entry.enclosed_name() else {
+                // 带 .. 的恶意/损坏条目：直接跳过，绝不写到目标目录之外
+                continue;
+            };
+            let out_path = staging.join(path);
+            if entry.is_dir() {
+                std::fs::create_dir_all(&out_path)
+                    .map_err(|e| format!("创建引擎子目录失败: {e}"))?;
+            } else {
+                if let Some(parent) = out_path.parent() {
+                    std::fs::create_dir_all(parent)
+                        .map_err(|e| format!("创建引擎子目录失败: {e}"))?;
+                }
+                let mut out = std::fs::File::create(&out_path)
+                    .map_err(|e| format!("写入引擎文件失败: {e}"))?;
+                std::io::copy(&mut entry, &mut out).map_err(|e| format!("释放内置引擎失败: {e}"))?;
+            }
+            set_engine_progress(true, i + 1, total);
+        }
+        Ok(())
+    })();
+    if let Err(e) = extract_result {
+        set_engine_progress(false, 0, 0);
+        return Err(e);
+    }
     std::fs::write(staging.join(".engine_hash"), engine_version())
         .map_err(|e| format!("写入引擎版本标记失败: {e}"))?;
 
@@ -348,6 +430,8 @@ fn ensure_engine() -> Result<std::path::PathBuf, String> {
     })?;
     // 旧引擎可能仍被正在运行的进程占用，删不掉也无妨（下次启动会再试）
     let _ = std::fs::remove_dir_all(&backup);
+    // 释放完成：收起进度条
+    set_engine_progress(false, 0, 0);
 
     Ok(dir.join("lx_music_downloader.exe"))
 }
@@ -2455,6 +2539,7 @@ fn build_app() -> tauri::Builder<tauri::Wry> {
             read_settings,
             save_settings,
             engine_status,
+            engine_progress,
             diagnostics_report
         ])
         .setup(|app| {
@@ -3274,6 +3359,26 @@ mod tests {
                        "interval":"04:29","id":"kw_1"}]"#;
         let list: Vec<SongItem> = serde_json::from_str(json).unwrap();
         assert_eq!(list[0].interval, "04:29");
+    }
+
+    // ===== 引擎释放进度 =====
+
+    #[test]
+    fn engine_progress_roundtrip() {
+        // 进度只是展示用，但必须能正确读写，且失败后能复位
+        set_engine_progress(true, 0, 100);
+        let p = engine_progress();
+        assert!(p.active);
+        assert_eq!((p.done, p.total), (0, 100));
+
+        set_engine_progress(true, 42, 100);
+        let p = engine_progress();
+        assert_eq!(p.done, 42);
+
+        set_engine_progress(false, 0, 0);
+        let p = engine_progress();
+        assert!(!p.active, "释放结束后必须收起进度，否则界面永远停在「正在释放」");
+        assert_eq!(p.total, 0);
     }
 
     // ===== 诊断信息 =====

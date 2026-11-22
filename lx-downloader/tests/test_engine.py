@@ -67,9 +67,13 @@ class QualityTierTest(unittest.TestCase):
             ['flac', '320k', '192k'],
         )
 
-    def test_lower_quality_options_default_floor_is_320k(self):
-        # 默认底线 320k：从 flac 降级不允许掉到 192k/128k
-        self.assertEqual(eng.lower_quality_options('flac'), ['flac', '320k'])
+    def test_lower_quality_options_default_floor_is_128k(self):
+        # 默认底线 128k（1.1.1 之后从 320k 调整）：目标是「能听就行」，
+        # 320k 起降级经常直接失败收场。显式传 min_quality 仍可收紧到 320k。
+        self.assertEqual(
+            eng.lower_quality_options('flac'),
+            ['flac', '320k', '192k', '128k'],
+        )
 
     def test_lower_quality_options_128k(self):
         self.assertEqual(eng.lower_quality_options('128k', '128k'), ['128k'])

@@ -1131,6 +1131,45 @@ nav {
   padding-top: 12px;
 }
 
+/* ===== 首次启动：引擎释放进度 ===== */
+/* 解压要十几秒，期间必须让用户看到「在干活」，否则就是「双击没反应」。 */
+.engine-prep {
+  margin: 0 0 14px;
+  padding: 16px 18px;
+  border-radius: var(--radius);
+  border: 1px solid rgba(5, 150, 105, 0.3);
+  background: linear-gradient(135deg, rgba(236, 253, 245, 0.97), rgba(209, 250, 229, 0.8));
+}
+
+.engine-prep-title {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: #065f46;
+  margin-bottom: 10px;
+}
+
+.engine-prep-bar {
+  height: 6px;
+  border-radius: 999px;
+  background: rgba(5, 150, 105, 0.16);
+  overflow: hidden;
+}
+
+.engine-prep-bar-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #059669, #10b981);
+  transition: width 0.3s ease;
+  /* 条目数还在统计（total 为 0）时不显示条，避免闪一下 0% */
+  min-width: 2px;
+}
+
+.engine-prep-meta {
+  margin-top: 8px;
+  font-size: 11.5px;
+  color: var(--text-dim);
+}
+
 /* ===== 新版本提示条 ===== */
 .update-banner {
   display: flex;
