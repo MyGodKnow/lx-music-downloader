@@ -70,23 +70,7 @@ fn data_root() -> std::path::PathBuf {
     use std::sync::OnceLock;
     static ROOT: OnceLock<std::path::PathBuf> = OnceLock::new();
     ROOT.get_or_init(|| {
-        let mut candidates: Vec<std::path::PathBuf> = Vec::new();
-        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
-            candidates.push(std::path::PathBuf::from(local).join("落雪下载"));
-        }
-        // EXE 同级：适合便携版/绿色版，也是 AppData 被锁死时的第一备选
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(dir) = exe.parent() {
-                candidates.push(dir.join("落雪下载数据"));
-            }
-        }
-        if let Some(tmp) = std::env::var_os("TEMP") {
-            candidates.push(std::path::PathBuf::from(tmp).join("lx-downloader"));
-        }
-        if let Ok(cwd) = std::env::current_dir() {
-            candidates.push(cwd.join("lx-downloader-data"));
-        }
-
+        let candidates = data_root_candidates();
         for dir in &candidates {
             if dir_is_writable(dir) {
                 return dir.clone();
@@ -96,6 +80,29 @@ fn data_root() -> std::path::PathBuf {
         candidates.into_iter().next().unwrap_or_else(|| std::path::PathBuf::from("."))
     })
     .clone()
+}
+
+/// 数据根目录的候选列表（按优先级）。抽出来是为了让「孤儿引擎清理」知道
+/// 上一次可能落在哪些位置——data_root() 只会选中第一个可写的，其余位置的
+/// 旧引擎副本（约 100MB）不会自己消失。
+fn data_root_candidates() -> Vec<std::path::PathBuf> {
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        candidates.push(std::path::PathBuf::from(local).join("落雪下载"));
+    }
+    // EXE 同级：适合便携版/绿色版，也是 AppData 被锁死时的第一备选
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join("落雪下载数据"));
+        }
+    }
+    if let Some(tmp) = std::env::var_os("TEMP") {
+        candidates.push(std::path::PathBuf::from(tmp).join("lx-downloader"));
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.join("lx-downloader-data"));
+    }
+    candidates
 }
 
 /// 目录是否**真的**可写：建目录 + 写一个探针文件 + 立刻删掉。
@@ -410,6 +417,118 @@ async fn engine_status() -> EngineStatus {
         engine_dir: engine_home().map(|p| p.display().to_string()),
         log_path: startup_log_path().map(|p| p.display().to_string()),
     })
+}
+
+/// 从候选数据根里挑出「孤儿引擎目录」：除当前正在用的 root 之外，
+/// 其它候选位置下确实由我们释放过（带 .engine_hash 标记）的 engine/ 目录。
+///
+/// 为什么需要：data_root() 是可写性探测的结果，一旦从 AppData 回退到 EXE 同级，
+/// 旧位置的引擎副本（约 100MB）就再也没人删除了。用户磁盘上会静悄悄多占一份。
+///
+/// 为什么敢删：
+///   1. 只认 .engine_hash 标记，用户目录里碰巧叫 engine 的文件夹不会被误伤；
+///   2. 只删 engine/ 子目录，不动同级的数据库/日志/音源；
+///   3. 单实例保护（P0-2）保证同一时刻只有一个实例在跑，不会删掉别的实例正在用的引擎。
+fn orphan_engine_dirs(current: &std::path::Path, candidates: &[std::path::PathBuf]) -> Vec<std::path::PathBuf> {
+    let mut out: Vec<std::path::PathBuf> = Vec::new();
+    for c in candidates {
+        if c.as_path() == current {
+            continue;
+        }
+        let engine = c.join("engine");
+        if engine.join(".engine_hash").is_file() && !out.contains(&engine) {
+            out.push(engine);
+        }
+    }
+    out
+}
+
+/// 递归统计目录占用（仅用于日志里报「释放了多少」）。
+fn dir_size(path: &std::path::Path) -> u64 {
+    let mut total = 0u64;
+    let Ok(entries) = std::fs::read_dir(path) else { return 0 };
+    for e in entries.flatten() {
+        let Ok(meta) = e.metadata() else { continue };
+        if meta.is_dir() {
+            total += dir_size(&e.path());
+        } else {
+            total += meta.len();
+        }
+    }
+    total
+}
+
+/// 清理孤儿引擎目录的实际动作（抽出来便于单测：删除路径必须被真实覆盖，
+/// 否则「清理逻辑」又是一段没人验证过的代码）。
+///
+/// 返回 (成功删除的目录及字节数, 失败的目录及原因)。删不掉通常是文件仍被占用
+/// （另一个版本正在跑）或权限不足——记一条警告留给下次启动，绝不影响启动流程。
+fn cleanup_orphan_engines_for(
+    current: &std::path::Path,
+    candidates: &[std::path::PathBuf],
+) -> CleanupReport {
+    let mut removed = Vec::new();
+    let mut failed = Vec::new();
+    for dir in orphan_engine_dirs(current, candidates) {
+        let bytes = dir_size(&dir);
+        match std::fs::remove_dir_all(&dir) {
+            Ok(()) => removed.push(RemovedEngine { dir, bytes }),
+            Err(err) => failed.push(FailedEngine {
+                dir,
+                reason: err.to_string(),
+            }),
+        }
+    }
+    CleanupReport { removed, failed }
+}
+
+/// 一个被成功删除的孤儿引擎目录。
+struct RemovedEngine {
+    dir: std::path::PathBuf,
+    bytes: u64,
+}
+
+/// 一个删除失败的孤儿引擎目录及其原因。
+struct FailedEngine {
+    dir: std::path::PathBuf,
+    reason: String,
+}
+
+/// 孤儿引擎清理结果。
+struct CleanupReport {
+    removed: Vec<RemovedEngine>,
+    failed: Vec<FailedEngine>,
+}
+
+impl CleanupReport {
+    /// 释放的总字节数。
+    fn freed_bytes(&self) -> u64 {
+        self.removed.iter().map(|r| r.bytes).sum()
+    }
+}
+
+/// 启动后台清理孤儿引擎副本。必须放到独立线程：删几十 MB 文件不能卡住建窗。
+fn spawn_orphan_engine_cleanup() {
+    std::thread::spawn(|| {
+        let current = data_root();
+        let report = cleanup_orphan_engines_for(&current, &data_root_candidates());
+        for r in &report.removed {
+            startup_log(&format!(
+                "已清理孤儿引擎副本: {}（约 {} MB）",
+                r.dir.display(),
+                r.bytes / (1024 * 1024)
+            ));
+        }
+        for f in &report.failed {
+            startup_log(&format!("[警告] 清理孤儿引擎失败: {}: {}", f.dir.display(), f.reason));
+        }
+        if !report.removed.is_empty() || !report.failed.is_empty() {
+            startup_log(&format!(
+                "孤儿引擎清理完成，共释放约 {} MB",
+                report.freed_bytes() / (1024 * 1024)
+            ));
+        }
+    });
 }
 
 /// 解析下载引擎命令，返回 (程序, 前置参数)：
@@ -2288,6 +2407,8 @@ fn build_app() -> tauri::Builder<tauri::Wry> {
                 startup_log("[警告] 无法获取主窗口 HWND，看门狗退化为按窗口表判断");
             }
             spawn_startup_watchdog(app.handle().clone(), main_hwnd);
+            // 后台顺手清掉「上一次落在别的数据目录」遗留的引擎副本（约 100MB）
+            spawn_orphan_engine_cleanup();
             Ok(())
         })
 }
@@ -3091,6 +3212,97 @@ mod tests {
                        "interval":"04:29","id":"kw_1"}]"#;
         let list: Vec<SongItem> = serde_json::from_str(json).unwrap();
         assert_eq!(list[0].interval, "04:29");
+    }
+
+    // ===== 孤儿引擎副本清理 =====
+
+    /// 测试用临时目录：放在数据根目录下（已验证可写），每个用例用独立名字，
+    /// 避免并行执行时互相删目录。%TEMP% 在某些账户/沙箱下不可写，不能用。
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir = data_root().join(format!("test-{tag}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn orphan_engine_dirs_skips_current_root() {
+        let base = scratch("orphan-current");
+        let cur = base.join("cur");
+        let other = base.join("other");
+        std::fs::create_dir_all(other.join("engine")).unwrap();
+        std::fs::write(other.join("engine").join(".engine_hash"), "h").unwrap();
+        std::fs::create_dir_all(cur.join("engine")).unwrap();
+        std::fs::write(cur.join("engine").join(".engine_hash"), "h").unwrap();
+
+        let out = orphan_engine_dirs(&cur, &[cur.clone(), other.clone()]);
+        assert_eq!(out, vec![other.join("engine")], "当前 root 不能被清理");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn orphan_engine_dirs_requires_marker() {
+        let base = scratch("orphan-marker");
+        let cur = base.join("cur");
+        let decoy = base.join("decoy");
+        // 用户目录里碰巧叫 engine 的文件夹：没有 .engine_hash，绝不能被删
+        std::fs::create_dir_all(decoy.join("engine")).unwrap();
+        let out = orphan_engine_dirs(&cur, &[cur.clone(), decoy.clone()]);
+        assert!(out.is_empty(), "没有标记文件就不能认定是我们的引擎");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn orphan_engine_dirs_dedups_and_tolerates_missing() {
+        let base = scratch("orphan-dedup");
+        let cur = base.join("cur");
+        let a = base.join("a");
+        std::fs::create_dir_all(a.join("engine")).unwrap();
+        std::fs::write(a.join("engine").join(".engine_hash"), "h").unwrap();
+        let missing = base.join("missing");
+        // 同一路径重复出现只应清理一次；不存在的候选直接跳过
+        let out = orphan_engine_dirs(&cur, &[cur.clone(), a.clone(), a.clone(), missing]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0], a.join("engine"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn cleanup_orphan_engines_removes_marked_dir_only() {
+        // 真实删除路径的覆盖：孤儿（带标记）被删掉，兄弟目录与当前 root 原样保留。
+        let base = scratch("cleanup-real");
+        let cur = base.join("cur");
+        let orphan = base.join("orphan");
+        std::fs::create_dir_all(cur.join("engine")).unwrap();
+        std::fs::write(cur.join("engine").join(".engine_hash"), "h").unwrap();
+        std::fs::create_dir_all(orphan.join("engine").join("_internal")).unwrap();
+        std::fs::write(orphan.join("engine").join(".engine_hash"), "h").unwrap();
+        std::fs::write(orphan.join("engine").join("_internal").join("big.bin"), vec![0u8; 4096])
+            .unwrap();
+        // 同级的「别的数据」不在清理范围内
+        std::fs::write(orphan.join("settings.json"), b"{}").unwrap();
+
+        let report = cleanup_orphan_engines_for(&cur, &[cur.clone(), orphan.clone()]);
+        assert!(report.failed.is_empty());
+        assert_eq!(report.removed.len(), 1);
+        assert_eq!(report.removed[0].dir, orphan.join("engine"));
+        assert!(report.removed[0].bytes >= 4096, "应统计出释放的字节数");
+        assert!(report.freed_bytes() >= 4096);
+        assert!(!orphan.join("engine").exists(), "孤儿引擎目录必须被删除");
+        assert!(orphan.join("settings.json").exists(), "同级其它文件不能动");
+        assert!(cur.join("engine").join(".engine_hash").exists(), "当前引擎不能动");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn dir_size_sums_nested_files() {
+        let base = scratch("dir-size");
+        std::fs::create_dir_all(base.join("sub")).unwrap();
+        std::fs::write(base.join("a.bin"), vec![0u8; 100]).unwrap();
+        std::fs::write(base.join("sub").join("b.bin"), vec![0u8; 250]).unwrap();
+        assert_eq!(dir_size(&base), 350);
+        assert_eq!(dir_size(&base.join("nope")), 0);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     // ===== 启动看门狗判据（P0-1）=====
